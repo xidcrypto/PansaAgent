@@ -32,7 +32,6 @@ Report security issues related to:
 - Private key / mnemonic handling
 - Keystore encryption
 - Transaction signing
-- Gateway authentication
 - Secret storage
 - Policy enforcement
 
@@ -49,7 +48,6 @@ Report security issues related to:
 4. **Enable spending limits in config**
 5. **Keep your `~/.pansa/` directory secure**
 6. **Use a strong passphrase for keystore**
-7. **Review gateway allowlist regularly**
 
 ## Bug Bounty
 

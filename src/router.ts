@@ -1,45 +1,48 @@
-import { spawn } from "node:child_process";
+import { spawn, exec } from "node:child_process";
 import { execPath } from "node:process";
 import { createInterface } from "node:readline";
+import net from "node:net";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 const DEFAULT_PORT = 17070;
 const PORT_MIN = 17070;
 const PORT_MAX = 17090;
 
+// Resolve the bansos-router CLI without hardcoded absolute paths: walk up
+// from this module looking for a project-local install, and fall back to
+// the PATH name (global install) when none is found.
 function resolveBansosRouter(): string {
-  // Try local bansos-router first
-  try {
-    const fs = require("fs");
-    const pkgPath = "/root/pansaagent/node_modules/bansos-router/package.json";
-    if (fs.existsSync(pkgPath)) {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-      const bin = pkg.bin;
-      if (typeof bin === "string") return bin;
-      if (bin && typeof bin === "object") {
-        const entry = bin.main ?? (bin as any)?.bin ?? "";
-        if (typeof entry === "string" && entry.length > 0) return entry;
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    const pkgDir = join(dir, "node_modules", "bansos-router");
+    const pkgPath = join(pkgDir, "package.json");
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { bin?: string | Record<string, string> };
+        const bin = pkg.bin;
+        const entry = typeof bin === "string" ? bin : bin && typeof bin === "object" ? Object.values(bin)[0] : undefined;
+        if (typeof entry === "string" && entry.length > 0) return join(pkgDir, entry);
+      } catch {
+        // fall through to the PATH name
       }
     }
-  } catch {
-    // fallback
-}
-  // Check global installation
-  try {
-    require.resolve("bansos-router");
-    return "bansos-router";
-  } catch {
-    throw new Error("bansos-router not found");
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
+  return "bansos-router";
 }
 
 export function spawnDaemon(port: number = DEFAULT_PORT): Promise<void> {
   return new Promise((resolve, reject) => {
     const routerPath = resolveBansosRouter();
     const args = ["start", `--port=${port}`, "--bg"];
-    const proc = spawn(execPath, [routerPath, ...args], {
-      stdio: "ignore",
-      detached: true,
-    });
+    // A bare name runs from PATH; a resolved file path runs under node.
+    const proc = routerPath === "bansos-router"
+      ? spawn(routerPath, args, { stdio: "ignore", detached: true })
+      : spawn(execPath, [routerPath, ...args], { stdio: "ignore", detached: true });
     proc.unref();
 
     const deadline = Date.now() + 5000;
@@ -47,7 +50,6 @@ export function spawnDaemon(port: number = DEFAULT_PORT): Promise<void> {
     const check = setInterval(() => {
       if (resolved) return;
       try {
-        const net = require("node:net");
         const socket = new net.Socket();
         socket.connect(port, "127.0.0.1", () => {
           socket.destroy();
@@ -78,7 +80,6 @@ export function consentedInstall(): void {
     "Install bansos-router globally? (y/N): ",
     (answer: string) => {
       if (answer.toLowerCase() === "y") {
-        const { exec } = require("child_process");
         exec("npm i -g bansos-router", (err: unknown) => {
           if (err) process.stderr.write(`Install failed: ${String(err)}\n`);
           else process.stdout.write("Installed bansos-router globally.\n");
@@ -92,32 +93,29 @@ export function consentedInstall(): void {
   );
 }
 
+// True when the port is FREE (bindable). The old implementation called
+// .listen() on a Socket, which has no such method.
 export async function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const net = require("node:net");
-    const socket = new net.Socket();
-    socket.on("error", () => resolve(true));
-    socket.on("listening", () => {
-      socket.destroy();
-      resolve(false);
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.once("listening", () => {
+      server.close(() => resolve(true));
     });
-    socket.listen(port, "127.0.0.1");
+    server.listen(port, "127.0.0.1");
   });
 }
 
-export async function startWithPortBump(startPort: number = DEFAULT_PORT): Promise<number> {
+// First free port in [startPort, PORT_MAX], or null when none is free.
+export async function startWithPortBump(startPort: number = DEFAULT_PORT): Promise<number | null> {
   for (let port = startPort; port <= PORT_MAX; port++) {
     try {
-      const available = await isPortAvailable(port);
-      if (available) {
-        return port;
-      }
+      if (await isPortAvailable(port)) return port;
     } catch {
       // port in use, try next
     }
   }
-  // Default: return MAX port + 1 if none available
-  return PORT_MAX + 1;
+  return null;
 }
 
 export interface RouterConfig {
@@ -127,25 +125,9 @@ export interface RouterConfig {
 
 export async function startDaemonWithConfig(config: RouterConfig = {}): Promise<number> {
   const port = config.port ?? DEFAULT_PORT;
-  let selectedPort: number = port;
-
-  const bumped = await startWithPortBump(selectedPort);
-  if (bumped !== null) selectedPort = bumped;
-  if (selectedPort === port) {
-    for (let p = PORT_MIN; p <= PORT_MAX; p++) {
-      const bumped2 = await startWithPortBump(p);
-      if (bumped2 !== null && bumped2 !== selectedPort) {
-        selectedPort = bumped2;
-        break;
-      }
-    }
-  }
-
-  if (selectedPort === port && config.consent !== false) {
-    consentedInstall();
-    const bumped3 = await startWithPortBump(port);
-    if (bumped3 !== null) selectedPort = bumped3;
-  }
-
-  return selectedPort as number;
+  const bumped = await startWithPortBump(port);
+  if (bumped !== null) return bumped;
+  const full = await startWithPortBump(PORT_MIN);
+  if (full !== null) return full;
+  throw new Error(`No free port in ${PORT_MIN}-${PORT_MAX} for bansos-router`);
 }

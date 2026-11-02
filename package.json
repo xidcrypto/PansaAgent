@@ -1,7 +1,7 @@
 {
   "name": "pansa",
   "version": "0.1.0",
-  "description": "PANSA - lightweight CLI + gateway AI agent focused on crypto airdrops",
+  "description": "PANSA - lightweight CLI + TUI AI agent focused on crypto airdrops",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -9,7 +9,7 @@
   },
   "main": "dist/cli.js",
   "exports": {
-    ".": "./dist/cli.mjs"
+    ".": "./dist/cli.js"
   },
   "engines": {
     "node": ">=22"
@@ -17,7 +17,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "PANSA_TEST=1 tsx --test test/*.test.ts",
-    "build": "esbuild src/cli.ts --bundle --platform=node --target=node22 --format=esm --outdir=dist --external:viem --external:@scure/bip39 --external:@noble/hashes --external:bansos-router --sourcemap",
+    "build": "esbuild src/cli.ts --bundle --platform=node --target=node22 --format=esm --outdir=dist --external:viem --external:@scure/bip39 --external:@noble/hashes --external:bansos-router --external:better-sqlite3 --sourcemap",
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {

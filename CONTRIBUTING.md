@@ -12,14 +12,14 @@ Thank you for considering contributing to PANSA! This document provides guidelin
 
 1. Fork the repository
 2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/PansaAgent.git`
-3. Install dependencies: `npm install`
+3. Install dependencies: `npm ci`
 4. Create a branch: `git checkout -b feature/your-feature`
 
 ## Development Setup
 
 ```bash
 # Install dependencies
-npm install
+npm ci
 
 # Run typecheck
 npm run typecheck
@@ -36,7 +36,13 @@ npm run dev
 
 ## Coding Standards
 
-- **TypeScript strict mode** — no `any` unless absolutely necessary
+- **TypeScript strict mode** — `strict` and `noUnusedLocals` are on and
+  must stay clean. `as any` is not banned outright, but it is confined
+  to narrow, justified spots (13 occurrences at last count: CLI
+  string-to-chain-family casts, the untyped `defaultWallets` config
+  extension, untyped viem option shapes, tracker enum casts). A new
+  `as any` needs a justification in review; a cast that hides a real
+  type error is a review failure.
 - **ESM modules** — use `import`/`export`, not CommonJS
 - **Node >= 22** — can use modern APIs
 - **No install scripts** — avoid `postinstall`, `preinstall`
@@ -59,9 +65,14 @@ Optional (lazy-loaded):
 ## Testing
 
 - Write tests for new features
-- Maintain >80% coverage for core modules
+- Core modules must have tests that pass: keystore, policy,
+  transactions, tracker, agent, llm, cli, signer server/client, skills,
+  secrets, and crypto primitives. There is no coverage gate and no
+  coverage tooling configured — do not claim a coverage percentage.
 - Test both TTY and non-TTY modes
 - Include security-focused tests (redaction, confirmation flow)
+- Isolate HOME to a tmp dir in tests so they never touch the user's
+  real `~/.pansa`
 
 ```bash
 # Run all tests
@@ -112,7 +123,7 @@ All PRs are scanned for secrets. Violations will be rejected immediately.
 
 ## Questions?
 
-Open an issue with the `question` label, or join our Discord (link in README).
+Open an issue with the `question` label.
 
 ## License
 

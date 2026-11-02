@@ -5,22 +5,27 @@ description: Track airdrop tasks, progress, and deadlines
 
 # Tracker Skill
 
-Manages airdrop farming tasks with deadlines and progress tracking.
+Manages airdrop farming tasks in the local SQLite database. All ids are
+real (`task_` + random suffix); nothing is hardcoded.
 
 ## Parameters
 
 - `action` (string): create, update, list, get, remove
-- `task_id` (string): Task identifier
+- `task_id` (string): Task identifier (for update, get, remove)
 - `title` (string): Task description
-- `status` (string): pending, in_progress, completed, failed
-- `deadline` (string): ISO 8601 deadline
+- `description` (string): Longer description
+- `status` (string): pending, in_progress, completed, failed, cancelled
+- `priority` (string): low, medium, high
+- `chain` (string): evm, solana, sui, aptos
+- `campaign` (string): Campaign name
+- `deadline` (string): ISO 8601 deadline (tasks without a deadline sort
+  last)
 
-## Output
+## Notes
 
-- Task list with status
-- Progress summary
-- Upcoming deadlines
-- Completed tasks count
+- Updates validate `status` and `priority` against the enums above and
+  reject invalid values instead of storing them.
+- Unknown fields are ignored, never interpolated into SQL.
 
 ## Example
 

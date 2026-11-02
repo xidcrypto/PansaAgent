@@ -1,28 +1,44 @@
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { matchCommand } from "./commands.js";
-import { loadConfig, saveConfig } from "./config.js";
+import { loadConfig, saveConfig, PANSA_DIR, CONFIG_FILE, POLICY_FILE } from "./config.js";
 import { ensureDaemon, fetchLiveModels } from "./llm.js";
 import { ContextManager } from "./context.js";
+import { loadContextFiles } from "./context.js";
 import { Agent } from "./agent.js";
 import { generateMnemonic } from "./mnemonic.js";
 import { SignerClient } from "./signer/client.js";
-import { keystoreUnlock } from "./signer/keystore.js";
+import { keystoreUnlock, ensureKeystoreDir, keystorePath } from "./signer/keystore.js";
+import { walletRegistryLoad } from "./signer/keystore.js";
+import { getPolicy, savePolicy } from "./signer/policy.js";
+import { secretsLoad, secretsSave } from "./secrets.js";
+import { runDoctor, formatDoctor } from "./doctor.js";
+import { resolveEvmRpc, getEvmBalance, formatEth } from "./evm-rpc.js";
+import { buildAgentTools } from "./tools.js";
+import { humanConfirm, humanReject } from "./human-confirm.js";
 import { TUI } from "./ui/index.js";
 
-const HELP = `PANSA - crypto airdrop agent (lightweight CLI + gateway)
+const HELP = `PANSA - crypto airdrop agent (CLI + TUI)
 
 Usage:
-  pansa                    REPL interaktif
+  pansa                    TUI interaktif
   pansa run "<prompt>"     Jalankan satu prompt
-  pansa setup              Setup wizard
-  pansa setup gateway      Setup gateway (telegram)
-  pansa gateway <cmd>      Gateway control (start|stop|status|test|logout)
-  pansa daemon             Jalankan gateway daemon
-  pansa backup <nama>      Backup mnemonik (hanya TTY)
+  pansa setup              Buat direktori + config/policy default
+  pansa daemon             Status LLM daemon
+  pansa backup <nama>      Ekspor backup terenkripsi ke file
   pansa doctor             Pemeriksaan kesehatan
   pansa models             Lihat model live
-  pansa policy show|edit   Lihat/edit kebijakan
+  pansa policy show        Lihat kebijakan
+  pansa policy set <field> <value>  Ubah kebijakan
+  pansa wallet list|create <rantai> <nama>|use <nama>|unlock <nama>|lock <nama>
+  pansa evm|solana|sui|aptos wallet [nama]
+  pansa balance [evm]      Saldo dompet default (EVM via RPC)
+  pansa confirm <id>       Konfirmasi manusia + eksekusi transaksi
+  pansa reject <id>        Tolak konfirmasi
+  pansa secrets list|set <key> <value>|get <key>  Simpan/ambil secret terenkripsi
   pansa --help             Bantuan ini
 
 Contoh:
@@ -34,11 +50,33 @@ Contoh:
 
 let signerClient: SignerClient | null = null;
 
+// Resolve the signer server entry point. In production this is the bundle
+// itself; in dev (tsx src/cli.ts) the raw .ts file cannot be executed by
+// node, so it is run through the tsx CLI instead (B14).
+export function resolveSignerEntry(): { file: string; args: string[] } {
+  const entry = fileURLToPath(import.meta.url);
+  if (!entry.endsWith(".ts")) return { file: entry, args: [] };
+  const tsxCli = join(dirname(entry), "..", "node_modules", "tsx", "dist", "cli.mjs");
+  if (existsSync(tsxCli)) return { file: tsxCli, args: [entry] };
+  return { file: "tsx", args: [entry] };
+}
+
 function getSigner(): SignerClient {
   if (!signerClient) {
-    signerClient = new SignerClient(process.argv[1], process.env.PANSA_PASSPHRASE);
+    const { file, args } = resolveSignerEntry();
+    signerClient = new SignerClient(file, process.env.PANSA_PASSPHRASE, args);
   }
   return signerClient;
+}
+
+// Close the signer child if one was created. One-shot commands must call
+// this before returning, otherwise the child keeps the event loop alive and
+// the CLI never exits.
+function closeSigner(): void {
+  if (signerClient) {
+    try { signerClient.close(); } catch { /* ignore */ }
+    signerClient = null;
+  }
 }
 
 function defaultPath(chain: string): string {
@@ -67,13 +105,15 @@ export async function main(argv: string[]): Promise<number> {
 
   const parsed = parseArgs({
     args: argv,
-    boolean: ["help", "h"],
+    boolean: ["help", "h", "plain"],
     string: ["prompt"],
     allowNegatives: false,
     strict: false,
   });
-  const values = parsed.values as { help?: boolean; h?: boolean; prompt?: string };
+  const values = parsed.values as { help?: boolean; h?: boolean; prompt?: string; plain?: boolean };
   const positionals: string[] = parsed.positionals as string[];
+
+  if (values.plain) process.env.PLAIN = "1";
 
   if (values.help || values.h) {
     process.stdout.write(HELP);
@@ -98,18 +138,39 @@ export async function main(argv: string[]): Promise<number> {
     case "solana":
     case "sui":
     case "aptos": {
-      if (rest[0] === "wallet") return chainWallet(cmd, rest.slice(1));
+      if (rest[0] === "wallet") {
+        const code = await chainWallet(cmd, rest.slice(1));
+        closeSigner();
+        return code;
+      }
       process.stderr.write(`Usage: pansa ${cmd} wallet [name]\n`);
       return 1;
     }
-    case "wallet":
-      return walletCmd(rest);
+    case "wallet": {
+      const code = await walletCmd(rest);
+      closeSigner();
+      return code;
+    }
+    case "confirm": {
+      if (!rest[0]) {
+        process.stderr.write("Usage: pansa confirm <confirmation_id>\n");
+        return 1;
+      }
+      return humanConfirm(rest[0]);
+    }
+    case "reject": {
+      if (!rest[0]) {
+        process.stderr.write("Usage: pansa reject <confirmation_id>\n");
+        return 1;
+      }
+      return humanReject(rest[0]);
+    }
+    case "secrets":
+      return secretsCmd(rest);
     case "balance":
       return balanceCmd(rest);
     case "setup":
       return setupCmd(rest);
-    case "gateway":
-      return gatewayCmd(rest);
     case "daemon":
       return daemonCmd();
     case "backup":
@@ -127,11 +188,8 @@ export async function main(argv: string[]): Promise<number> {
 }
 
 async function chainWallet(chain: string, rest: string[]): Promise<number> {
-  if (rest[0] !== "wallet") {
-    process.stderr.write(`Usage: pansa ${chain} wallet [name]\n`);
-    return 1;
-  }
-  const name = rest[1] ?? "default";
+  // main() already stripped the "wallet" word, so rest[0] is the name (B2).
+  const name = rest[0] ?? "default";
   const mnemonic = generateMnemonic(128);
   try {
     await getSigner().request("keystore.create", {
@@ -190,7 +248,37 @@ async function walletCmd(rest: string[]): Promise<number> {
     process.stdout.write(`Dompet default = "${name}".\n`);
     return 0;
   }
-  process.stderr.write("Usage: pansa wallet list|create <rantai> <nama>|use <nama>\n");
+  if (sub === "unlock" && rest2.length >= 1) {
+    const name = rest2[0];
+    if (!process.env.PANSA_PASSPHRASE) {
+      process.stderr.write("PANSA_PASSPHRASE diperlukan untuk unlock\n");
+      return 1;
+    }
+    try {
+      const res = await getSigner().request("wallet.unlock", { name, passphrase: process.env.PANSA_PASSPHRASE });
+      if (!res.ok) throw new Error(res.error);
+      const addr = (res.result as { address: string }).address;
+      process.stdout.write(`Dompet "${name}" di-unlock: ${addr}\n`);
+      process.stdout.write("Catatan: unlock sesi hanya berlaku di REPL/TUI; command satu-tembak ini memverifikasi passphrase tanpa menyimpan state unlock.\n");
+    } catch (err) {
+      process.stderr.write(`Gagal unlock: ${err instanceof Error ? err.message : String(err)}\n`);
+      return 1;
+    }
+    return 0;
+  }
+  if (sub === "lock" && rest2.length >= 1) {
+    const name = rest2[0];
+    try {
+      const res = await getSigner().request("wallet.lock", { name });
+      if (!res.ok) throw new Error(res.error);
+      process.stdout.write(`Dompet "${name}" di-lock.\n`);
+    } catch (err) {
+      process.stderr.write(`Gagal lock: ${err instanceof Error ? err.message : String(err)}\n`);
+      return 1;
+    }
+    return 0;
+  }
+  process.stderr.write("Usage: pansa wallet list|create <rantai> <nama>|use <nama>|unlock <nama>|lock <nama>\n");
   return 1;
 }
 
@@ -211,13 +299,28 @@ async function balanceCmd(rest: string[]): Promise<number> {
     process.stdout.write(`Belum ada dompet default untuk ${chain}. Buat dengan: pansa ${chain} wallet <nama>\n`);
     return 0;
   }
+  // Address lookup uses the public registry: no unlock needed (B3).
+  const record = walletRegistryLoad().find((w) => w.name === name && w.family === chain);
+  if (!record) {
+    process.stderr.write(`Dompet "${name}" tidak ditemukan di registry untuk ${chain}.\n`);
+    return 1;
+  }
+  if (chain !== "evm") {
+    process.stderr.write(`Balance lookup belum didukung untuk ${chain} (hanya EVM via RPC).\n`);
+    process.stdout.write(`${chain} ${name}: ${record.address}\n`);
+    return 1;
+  }
+  const rpcUrl = resolveEvmRpc();
+  if (!rpcUrl) {
+    process.stderr.write("Tidak ada endpoint EVM RPC. Set PANSA_EVM_RPC atau evmRpc di ~/.pansa/config.json.\n");
+    process.stdout.write(`${chain} ${name}: ${record.address}\n`);
+    return 1;
+  }
   try {
-    const res = await getSigner().request("wallet.address", { name });
-    if (!res.ok) throw new Error(res.error);
-    const address = (res.result as { address: string }).address;
-    process.stdout.write(`${chain} ${name}: ${address}\n(saldo RPC fase P3)\n`);
+    const balance = await getEvmBalance(record.address, rpcUrl);
+    process.stdout.write(`${chain} ${name}: ${record.address}\nSaldo: ${formatEth(balance)} ETH\n`);
   } catch (err) {
-    process.stderr.write(`Gagal alamat: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(`Gagal ambil saldo: ${err instanceof Error ? err.message : String(err)}\n`);
     return 1;
   }
   return 0;
@@ -225,38 +328,67 @@ async function balanceCmd(rest: string[]): Promise<number> {
 
 async function runPrompt(prompt: string): Promise<number> {
   const cfg = loadConfig();
-  await ensureDaemon();
+  try {
+    await ensureDaemon();
+  } catch (err) {
+    process.stderr.write(`LLM daemon tidak tersedia: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
   const live = await fetchLiveModels().catch((): string[] => []);
   const ctx = new ContextManager();
+  for (const f of loadContextFiles()) ctx.appendFileContext(f);
+  let streamed = "";
   const agent = new Agent({
     context: ctx,
-    tools: new Map(),
+    tools: buildAgentTools(),
     liveModels: live,
     cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models },
-    onChunk: (t) => process.stdout.write(t),
+    onChunk: (t) => { streamed += t; process.stdout.write(t); },
   });
   const out = await agent.run(prompt);
-  process.stdout.write(out + "\n");
+  // The final message was already streamed chunk-by-chunk in the common
+  // case; only print it when nothing was streamed (error paths).
+  if (!streamed) process.stdout.write(out + "\n");
+  else process.stdout.write("\n");
   return 0;
 }
 
 async function repl(): Promise<number> {
   const cfg = loadConfig();
-  await ensureDaemon();
+  try {
+    await ensureDaemon();
+  } catch (err) {
+    process.stdout.write(`Peringatan: LLM daemon tidak tersedia (${err instanceof Error ? err.message : String(err)}); perintah dompet tetap jalan.\n`);
+  }
   const live = await fetchLiveModels().catch((): string[] => []);
   const ctx = new ContextManager();
+  for (const f of loadContextFiles()) ctx.appendFileContext(f);
+  let streamed = "";
   const agent = new Agent({
     context: ctx,
-    tools: new Map(),
+    tools: buildAgentTools(),
     liveModels: live,
     cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models },
-    onChunk: (t) => process.stdout.write(t),
+    onChunk: (t) => { streamed += t; process.stdout.write(t); },
   });
   const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: "pansa> " });
   process.stdout.write("PANSA REPL. Ketik 'exit' untuk keluar.\n");
   rl.on("line", async (line: string) => {
     const input = line.trim();
     if (input === "exit" || input === "quit") { rl.close(); return; }
+    // Human-only confirmation: intercepted before the agent ever sees it.
+    const confirmMatch = input.match(/^CONFIRM\s+(\S+)$/i);
+    if (confirmMatch) {
+      await humanConfirm(confirmMatch[1]);
+      rl.prompt();
+      return;
+    }
+    const rejectMatch = input.match(/^REJECT\s+(\S+)$/i);
+    if (rejectMatch) {
+      humanReject(rejectMatch[1]);
+      rl.prompt();
+      return;
+    }
     const cmd = matchCommand(input);
     try {
       switch (cmd.kind) {
@@ -293,14 +425,30 @@ async function repl(): Promise<number> {
           process.stdout.write(`Default diatur.\n`);
           break;
         }
+        case "wallet_unlock": {
+          if (!process.env.PANSA_PASSPHRASE) throw new Error("PANSA_PASSPHRASE diperlukan untuk unlock");
+          const res = await getSigner().request("wallet.unlock", { name: cmd.name, passphrase: process.env.PANSA_PASSPHRASE });
+          if (!res.ok) throw new Error(res.error);
+          const addr = (res.result as { address: string }).address;
+          process.stdout.write(`Dompet "${cmd.name}" di-unlock untuk sesi ini (15 menit): ${addr}\n`);
+          break;
+        }
+        case "wallet_lock": {
+          const res = await getSigner().request("wallet.lock", { name: cmd.name });
+          if (!res.ok) throw new Error(res.error);
+          process.stdout.write(`Dompet "${cmd.name}" di-lock.\n`);
+          break;
+        }
         case "balance": {
           const bc = cmd.kind === "balance" ? (cmd.chain ?? "evm") : "evm";
           await balanceCmd([bc]);
           break;
         }
         case "unknown": {
+          streamed = "";
           const out = await agent.run(input);
-          process.stdout.write(out + "\n");
+          if (!streamed) process.stdout.write(out + "\n");
+          else process.stdout.write("\n");
           break;
         }
       }
@@ -309,30 +457,52 @@ async function repl(): Promise<number> {
     }
     rl.prompt();
   });
-  rl.on("close", () => process.stdout.write("\nSelamat tinggal.\n"));
+  rl.on("close", () => {
+    closeSigner();
+    process.stdout.write("\nSelamat tinggal.\n");
+  });
   return 0;
 }
 
-async function setupCmd(_rest: string[]): Promise<number> {
-  process.stdout.write("setup wizard (detail di fase P7)\n");
-  return 0;
-}
-async function gatewayCmd(_rest: string[]): Promise<number> {
-  process.stdout.write("gateway (detail di fase P7)\n");
+async function setupCmd(rest: string[]): Promise<number> {
+  // The Telegram gateway is not implemented and is no longer promised:
+  // `pansa setup gateway` fails honestly instead of printing a stub.
+  if (rest[0] === "gateway") {
+    process.stderr.write("Gateway (Telegram) tidak tersedia di PANSA dan tidak lagi dijanjikan.\n");
+    return 1;
+  }
+  mkdirSync(PANSA_DIR, { recursive: true, mode: 0o700 });
+  ensureKeystoreDir();
+  let created = false;
+  if (!existsSync(CONFIG_FILE)) {
+    saveConfig(loadConfig());
+    created = true;
+  }
+  if (!existsSync(POLICY_FILE)) {
+    savePolicy(getPolicy());
+    created = true;
+  }
+  process.stdout.write(`PANSA dir: ${PANSA_DIR}\n`);
+  process.stdout.write(`Config: ${CONFIG_FILE}${created ? " (dibuat)" : ""}\n`);
+  process.stdout.write(`Policy: ${POLICY_FILE}\n`);
+  process.stdout.write("Setup selesai. Jalankan `pansa doctor` untuk pemeriksaan.\n");
   return 0;
 }
 async function daemonCmd(): Promise<number> {
-  process.stdout.write("daemon (detail di fase P6)\n");
-  return 0;
+  try {
+    await ensureDaemon();
+    const live = await fetchLiveModels();
+    process.stdout.write(`LLM daemon jalan: ${live.length} model live\n`);
+    return 0;
+  } catch (err) {
+    process.stderr.write(`LLM daemon tidak jalan: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
 }
 async function backupCmd(rest: string[]): Promise<number> {
   const name = rest[0];
   if (!name) {
     process.stderr.write("Usage: pansa backup <nama>\n");
-    return 1;
-  }
-  if (!process.stdout.isTTY) {
-    process.stderr.write("backup menolak: stdout bukan TTY\n");
     return 1;
   }
   const passphrase = process.env.PANSA_PASSPHRASE;
@@ -341,28 +511,136 @@ async function backupCmd(rest: string[]): Promise<number> {
     return 1;
   }
   try {
-    const payload = keystoreUnlock(name, passphrase);
-    process.stdout.write(`Mnemonik untuk "${name}": ${payload.mnemonic}\n`);
-    process.stdout.write(`Path: ${payload.path}\n`);
+    // Validates the passphrase and that the wallet exists. The mnemonic
+    // is NEVER printed: the export contains only the encrypted keystore
+    // blob, which is useless without the passphrase.
+    keystoreUnlock(name, passphrase);
+    const content = readFileSync(keystorePath(name), "utf8");
+    const record = walletRegistryLoad().find((w) => w.name === name) ?? null;
+    const out = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      wallet: name,
+      keystore: JSON.parse(content),
+      registry: record,
+    };
+    mkdirSync(PANSA_DIR, { recursive: true, mode: 0o700 });
+    const file = `${PANSA_DIR}/backup-${name}-${Date.now()}.json`;
+    writeFileSync(file, JSON.stringify(out, null, 2), { mode: 0o600 });
+    process.stdout.write(`Backup terenkripsi tersimpan: ${file}\n`);
+    process.stdout.write("Catatan: file ini berisi keystore terenkripsi (bukan mnemonik plaintext). Simpan passphrase Anda secara terpisah.\n");
   } catch (err) {
-    process.stderr.write(`Gagal membuka dompet: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(`Gagal backup: ${err instanceof Error ? err.message : String(err)}\n`);
     return 1;
   }
   return 0;
 }
 async function doctorCmd(): Promise<number> {
-  process.stdout.write("doctor: node " + process.version + "\n");
-  return 0;
+  const checks = await runDoctor();
+  process.stdout.write(formatDoctor(checks) + "\n");
+  return checks.every((c) => c.ok) ? 0 : 1;
 }
 async function modelsCmd(): Promise<number> {
-  await ensureDaemon();
-  const live = await fetchLiveModels();
-  process.stdout.write(live.join("\n") + "\n");
-  return 0;
+  try {
+    await ensureDaemon();
+    const live = await fetchLiveModels();
+    process.stdout.write(live.join("\n") + "\n");
+    return 0;
+  } catch (err) {
+    process.stderr.write(`Gagal ambil model: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
 }
-async function policyCmd(_rest: string[]): Promise<number> {
-  process.stdout.write("policy (detail di fase P3)\n");
-  return 0;
+async function secretsCmd(rest: string[]): Promise<number> {
+  const passphrase = process.env.PANSA_PASSPHRASE;
+  if (!passphrase) {
+    process.stderr.write("PANSA_PASSPHRASE diperlukan untuk secrets\n");
+    return 1;
+  }
+  const sub = rest[0];
+  try {
+    if (sub === "list") {
+      const store = secretsLoad(passphrase);
+      const keys = Object.keys(store);
+      process.stdout.write(keys.length ? keys.join("\n") + "\n" : "(kosong)\n");
+      return 0;
+    }
+    if (sub === "set" && rest.length >= 3) {
+      const store = secretsLoad(passphrase);
+      store[rest[1]] = rest.slice(2).join(" ");
+      secretsSave(store, passphrase);
+      process.stdout.write(`Secret "${rest[1]}" disimpan (terenkripsi).\n`);
+      return 0;
+    }
+    if (sub === "get" && rest[1]) {
+      const store = secretsLoad(passphrase);
+      const v = store[rest[1]];
+      if (v === undefined) {
+        process.stderr.write(`Secret tidak ditemukan: ${rest[1]}\n`);
+        return 1;
+      }
+      process.stdout.write(v + "\n");
+      return 0;
+    }
+  } catch (err) {
+    process.stderr.write(`Gagal secrets: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
+  process.stderr.write("Usage: pansa secrets list|set <key> <value>|get <key>\n");
+  return 1;
+}
+
+async function policyCmd(rest: string[]): Promise<number> {  const sub = rest[0];
+  if (sub === "show" || !sub) {
+    process.stdout.write(JSON.stringify(getPolicy(), null, 2) + "\n");
+    return 0;
+  }
+  if (sub === "set" && rest.length >= 3) {
+    const field = rest[1];
+    const raw = rest[2];
+    const policy = getPolicy();
+    switch (field) {
+      case "spendCapPerTx":
+      case "spendCapPerDay": {
+        const v = Number(raw);
+        if (!Number.isFinite(v) || v < 0) {
+          process.stderr.write(`Nilai tidak valid untuk ${field}: ${raw} (harus angka >= 0)\n`);
+          return 1;
+        }
+        if (field === "spendCapPerTx") policy.spendCapPerTx = v;
+        else policy.spendCapPerDay = v;
+        break;
+      }
+      case "requireConfirmation":
+      case "testnetOnly": {
+        if (raw !== "true" && raw !== "false") {
+          process.stderr.write(`Nilai tidak valid untuk ${field}: ${raw} (harus true/false)\n`);
+          return 1;
+        }
+        if (field === "requireConfirmation") policy.requireConfirmation = raw === "true";
+        else policy.testnetOnly = raw === "true";
+        break;
+      }
+      case "allowedChains": {
+        const chains = raw.split(",").map((c) => c.trim()).filter(Boolean);
+        const valid = ["evm", "solana", "sui", "aptos"];
+        if (chains.length === 0 || !chains.every((c) => valid.includes(c))) {
+          process.stderr.write(`Rantai tidak valid: ${raw} (pilih dari ${valid.join(",")})\n`);
+          return 1;
+        }
+        policy.allowedChains = chains as typeof policy.allowedChains;
+        break;
+      }
+      default:
+        process.stderr.write(`Field tidak dikenal: ${field} (spendCapPerTx, spendCapPerDay, requireConfirmation, testnetOnly, allowedChains)\n`);
+        return 1;
+    }
+    savePolicy(policy);
+    process.stdout.write(`Policy ${field} = ${raw}\n`);
+    return 0;
+  }
+  process.stderr.write("Usage: pansa policy show|set <field> <value>\n");
+  return 1;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -10,6 +10,8 @@ import {
   openSync,
   writeSync,
   closeSync,
+  statSync,
+  fsyncSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { encrypt, decrypt } from "../crypto.js";
@@ -105,24 +107,65 @@ export function keystoreUnlock(name: string, passphrase: string): {
 
 export function keystoreList(): string[] {
   ensureKeystoreDir();
-  return readdirSync(KEYSTORE_DIR)
-    .filter((f) => f.endsWith(".json"))
-    .map((f) => f.slice(0, -5));
+  // A .json file counts as a wallet only if it parses AND matches the
+  // keystore shape (name == filename, known family, encrypted blob).
+  // Stray .json files in the directory are ignored (D4).
+  const families: ChainFamily[] = ["evm", "solana", "sui", "aptos"];
+  const out: string[] = [];
+  for (const f of readdirSync(KEYSTORE_DIR)) {
+    if (!f.endsWith(".json")) continue;
+    const name = f.slice(0, -5);
+    if (!NAME_RE.test(name)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(join(KEYSTORE_DIR, f), "utf8")) as Partial<KeystoreEntry>;
+      if (parsed.name !== name) continue;
+      if (!parsed.family || !families.includes(parsed.family)) continue;
+      const enc = parsed.encrypted;
+      if (!enc || typeof enc.ciphertext !== "string" || typeof enc.iv !== "string" ||
+          typeof enc.tag !== "string" || typeof enc.salt !== "string") continue;
+      out.push(name);
+    } catch {
+      // Unparseable files are not wallets.
+    }
+  }
+  return out;
 }
 
 export function keystoreRemove(name: string): void {
   validateName(name);
-  if (!existsSync(keystorePath(name))) return;
-  const fd = openSync(keystorePath(name), "r+");
-  const buf = Buffer.alloc(256, 0);
+  const path = keystorePath(name);
+  if (!existsSync(path)) return;
+  // Best-effort overwrite of the ENTIRE file (not just the first 256
+  // bytes), then unlink. This is not a secure-erase guarantee: on SSDs,
+  // journaling filesystems and copy-on-write stores, old blocks may
+  // survive. The old code's 256-byte overwrite claimed more than it did.
   try {
-    writeSync(fd, buf, 0, buf.length, 0);
+    const size = statSync(path).size;
+    const fd = openSync(path, "r+");
+    try {
+      const chunk = Buffer.alloc(Math.min(size, 65536), 0);
+      let written = 0;
+      while (written < size) {
+        const n = Math.min(chunk.length, size - written);
+        writeSync(fd, chunk, 0, n, written);
+        written += n;
+      }
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
   } catch {
-    // ignore
-  } finally {
-    closeSync(fd);
+    // Overwrite is best-effort; unlink still proceeds.
   }
-  unlinkSync(keystorePath(name));
+  unlinkSync(path);
+  // Drop the public registry record too, so a removed wallet does not
+  // linger in listings.
+  try {
+    const remaining = walletRegistryLoad().filter((w) => w.name !== name);
+    walletRegistrySave(remaining);
+  } catch {
+    // ignore registry cleanup failures
+  }
 }
 
 export function walletRegistryLoad(): WalletRecord[] {
@@ -144,7 +187,9 @@ export function walletRegistrySave(wallets: WalletRecord[]): void {
 
 export function walletRegistryAdd(record: WalletRecord): void {
   const existing = walletRegistryLoad();
-  if (existing.find((w) => w.name === record.name)) return;
+  // Dedupe by name OR by family+address: the same wallet must not appear
+  // twice under two names, and a name must not be reused for another wallet.
+  if (existing.find((w) => w.name === record.name || (w.family === record.family && w.address === record.address))) return;
   existing.push(record);
   walletRegistrySave(existing);
 }

@@ -63,10 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install gitleaks
-        run: |
-          wget -q https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -O gitleaks
-          chmod +x gitleaks
-          sudo mv gitleaks /usr/local/bin/
-      - name: Scan for secrets
-        run: gitleaks detect --source . --verbose
+      # Pinned official action (major version) instead of downloading an
+      # unpinned "latest" binary without a checksum (D12).
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

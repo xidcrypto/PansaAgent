@@ -2,7 +2,6 @@ import { Tool } from "../agent.js";
 
 interface BAWConfig {
   apiKey?: string;
-  apiSecret?: string;
   baseUrl: string;
 }
 
@@ -34,7 +33,12 @@ interface BAWSwapParams {
 class BAWClient {
   private config: BAWConfig;
 
-  constructor(config: BAWConfig = { baseUrl: "https://api.agenticwallet.binance.com/v1" }) {
+  // Config comes from the environment (M12): PANSA_BAW_API_KEY and
+  // PANSA_BAW_BASE_URL. No key is ever hardcoded or read from a file.
+  constructor(config: BAWConfig = {
+    apiKey: process.env.PANSA_BAW_API_KEY,
+    baseUrl: process.env.PANSA_BAW_BASE_URL ?? "https://api.agenticwallet.binance.com/v1",
+  }) {
     this.config = config;
   }
 
@@ -67,7 +71,7 @@ class BAWClient {
   }
 
   async getWallet(walletId: string): Promise<BAWWallet> {
-    return this.request<BAWWallet>("GET", `/wallets/${walletId}`);
+    return this.request<BAWWallet>("GET", `/wallets/${encodeURIComponent(walletId)}`);
   }
 
   // Transfer
@@ -82,7 +86,7 @@ class BAWClient {
 
   // Balance
   async getBalance(walletId: string, token: string): Promise<{ balance: string }> {
-    return this.request("GET", `/wallets/${walletId}/balance?token=${token}`);
+    return this.request("GET", `/wallets/${encodeURIComponent(walletId)}/balance?token=${encodeURIComponent(token)}`);
   }
 
   // Claims (airdrops)
@@ -91,7 +95,7 @@ class BAWClient {
   }
 
   async claim(claimId: string): Promise<{ txId: string; status: string }> {
-    return this.request("POST", `/claims/${claimId}/claim`);
+    return this.request("POST", `/claims/${encodeURIComponent(claimId)}/claim`);
   }
 }
 
@@ -99,6 +103,11 @@ class BAWClient {
 let bawClient: BAWClient | null = null;
 
 export function getBAWClient(): BAWClient {
+  // Fail fast here too, not just in the tool: a client without a key
+  // would otherwise send unauthenticated requests (M12).
+  if (!process.env.PANSA_BAW_API_KEY) {
+    throw new Error("BAW not configured: set PANSA_BAW_API_KEY (and optionally PANSA_BAW_BASE_URL)");
+  }
   if (!bawClient) {
     bawClient = new BAWClient();
   }
@@ -137,6 +146,12 @@ export function createBAWTool(): Tool {
         slippage?: number;
         claim_id?: string;
       };
+
+      // Fail fast with a clear message instead of sending unauthenticated
+      // requests that fail confusingly at the API (M12).
+      if (!process.env.PANSA_BAW_API_KEY) {
+        return { ok: false, data: null, error: "BAW not configured: set PANSA_BAW_API_KEY (and optionally PANSA_BAW_BASE_URL)", signs: false };
+      }
 
       const client = getBAWClient();
 

@@ -29,6 +29,10 @@ export interface Slip10Node {
   chainCode: Buffer;
   depth: number;
   index: number;
+  // Fingerprint is intentionally always zero (D7): PANSA derives only
+  // hardened ed25519 paths and never serializes extended keys, so no
+  // parent fingerprint is ever needed. It is kept in the shape for
+  // SLIP-10 compatibility, not computed.
   fingerprint: Buffer;
 }
 
@@ -70,18 +74,32 @@ export function slip10DerivePath(seed: Buffer, path: string): Slip10Node {
   const parts = path.split("/").filter((p) => p.length > 0);
   if (parts[0] === "m") parts.shift();
   for (const part of parts) {
-    let index: number;
-    if (part.endsWith("'")) {
-      index = parseInt(part.slice(0, -1), 10) + 0x80000000;
-    } else {
-      index = parseInt(part, 10);
+    // Validate the segment before any arithmetic: parseInt("abc") is NaN
+    // and used to explode inside writeUInt32BE with a useless message.
+    const m = /^(\d+)('?)$/.exec(part);
+    if (!m) {
+      throw new Error(`Invalid derivation path segment: "${part}" in path "${path}" (expected <number> or <number>')`);
     }
-    node = slip10Derive(node, index);
+    const base = Number(m[1]);
+    if (!Number.isInteger(base) || base < 0 || base >= 0x80000000) {
+      throw new Error(`Invalid derivation index: "${part}" in path "${path}" (must be 0 <= index < 2^31)`);
+    }
+    const index = m[2] === "'" ? base + 0x80000000 : base;
+    try {
+      node = slip10Derive(node, index);
+    } catch (err) {
+      throw new Error(`Cannot derive segment "${part}" in path "${path}": ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   return node;
 }
 
 export function equal(a: Buffer, b: Buffer): boolean {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  // Length-hiding compare (same rationale as crypto.constantTimeCompare).
+  const len = Math.max(a.length, b.length);
+  const paddedA = Buffer.alloc(len);
+  const paddedB = Buffer.alloc(len);
+  a.copy(paddedA);
+  b.copy(paddedB);
+  return timingSafeEqual(paddedA, paddedB) && a.length === b.length;
 }

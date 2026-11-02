@@ -16,6 +16,7 @@ export function createTrackerTool(): Tool {
       campaign: { type: "string", description: "Campaign name" },
       deadline: { type: "string", description: "Deadline (ISO 8601)" },
     },
+    signs: false,
     async execute(args: Record<string, unknown>): Promise<{ ok: boolean; data: unknown; error?: string; signs?: boolean }> {
       const { action, task_id, title, description, status, priority, chain, campaign, deadline } = args as {
         action: string; task_id?: string; title?: string; description?: string; status?: string; priority?: string; chain?: string; campaign?: string; deadline?: string;
@@ -46,11 +47,17 @@ export function createTrackerTool(): Tool {
 
           case "update": {
             if (!task_id) return { ok: false, data: null, error: "task_id required" };
+            // Tool-side enum validation (mirrors updateTask's own checks):
+            // invalid values are rejected loudly, not silently dropped.
+            const validStatuses = ["pending", "in_progress", "completed", "failed", "cancelled"];
+            const validPriorities = ["low", "medium", "high"];
+            if (status && !validStatuses.includes(status)) return { ok: false, data: null, error: `Invalid status: ${status}` };
+            if (priority && !validPriorities.includes(priority)) return { ok: false, data: null, error: `Invalid priority: ${priority}` };
             const updates: Partial<Task> = {};
             if (title) updates.title = title;
             if (description !== undefined) updates.description = description;
-            if (status) updates.status = status as any;
-            if (priority) updates.priority = priority as any;
+            if (status) updates.status = status as Task["status"];
+            if (priority) updates.priority = priority as Task["priority"];
             if (chain !== undefined) updates.chain = chain;
             if (campaign !== undefined) updates.campaign = campaign;
             if (deadline !== undefined) updates.deadline = deadline;
@@ -99,11 +106,20 @@ export function createReportTool(): Tool {
       period: { type: "string", description: "Time period: 7d, 30d, all" },
       campaign: { type: "string", description: "Specific campaign (optional)" },
     },
+    signs: false,
     async execute(args: Record<string, unknown>): Promise<{ ok: boolean; data: unknown; error?: string; signs?: boolean }> {
       const { type, period, campaign } = args as { type?: string; period?: string; campaign?: string };
 
       const summary = tracker.getSummary();
-      const tasks = tracker.listTasks(campaign ? { campaign } : undefined);
+      let tasks = tracker.listTasks(campaign ? { campaign } : undefined);
+      // Period actually filters: 7d/30d keep only tasks created in the
+      // window (created_at normalized, since SQLite defaults use a space
+      // separator while ISO strings use 'T').
+      if (period === "7d" || period === "30d") {
+        const days = period === "7d" ? 7 : 30;
+        const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+        tasks = tasks.filter((t) => (t.created_at ?? "").replace(" ", "T") >= cutoff);
+      }
 
       const report = {
         generated_at: new Date().toISOString(),
@@ -116,6 +132,7 @@ export function createReportTool(): Tool {
           in_progress: tasks.filter(t => t.status === "in_progress").length,
           completed: tasks.filter(t => t.status === "completed").length,
           failed: tasks.filter(t => t.status === "failed").length,
+          cancelled: tasks.filter(t => t.status === "cancelled").length,
         },
         upcoming_deadlines: tasks
           .filter(t => t.deadline && t.status !== "completed" && t.status !== "cancelled")

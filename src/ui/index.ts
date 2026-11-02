@@ -1,7 +1,22 @@
 import { stdin as processStdin, stdout as processStdout } from "node:process";
 import { createInterface } from "node:readline";
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { Agent } from "../agent.js";
+import { ContextManager } from "../context.js";
+import { loadContextFiles } from "../context.js";
+import { buildAgentTools } from "../tools.js";
+import { loadConfig, PANSA_DIR } from "../config.js";
+import { ensureDaemon, fetchLiveModels } from "../llm.js";
+import { humanConfirm, humanReject } from "../human-confirm.js";
+import { getPolicy, listPendingConfirmations } from "../signer/policy.js";
+import { getSpentToday } from "../signer/ledger.js";
+import { walletRegistryLoad } from "../signer/keystore.js";
+import { resolveEvmRpc, getEvmBalance, formatEth } from "../evm-rpc.js";
+import { tracker } from "../tracker/index.js";
+import { createReportTool } from "../tracker/tools.js";
+import { sessionManager } from "../session-manager.js";
+import { runDoctor, formatDoctor } from "../doctor.js";
 
 // Color support using 16-color ANSI palette
 
@@ -45,7 +60,9 @@ export function isTTY(): boolean {
 
 // History management
 
-const HISTORY_PATH = `${process.env.HOME ?? ""}/.pansa/history`;
+function historyPath(): string {
+  return `${process.env.HOME ?? ""}/.pansa/history`;
+}
 const MAX_HISTORY = 500;
 
 export class History {
@@ -58,9 +75,9 @@ export class History {
 
   private load(): void {
     try {
-      const data = readFileSync(HISTORY_PATH, "utf8").trim();
+      const data = readFileSync(historyPath(), "utf8").trim();
       if (data) {
-        this.lines = data.split("\\n").slice(-MAX_HISTORY);
+        this.lines = data.split("\n").slice(-MAX_HISTORY);
       }
     } catch {
       // no history file yet
@@ -69,8 +86,8 @@ export class History {
 
   save(): void {
     try {
-      mkdirSync(dirname(HISTORY_PATH), { recursive: true });
-      writeFileSync(HISTORY_PATH, this.lines.join("\\n"), "utf8");
+      mkdirSync(dirname(historyPath()), { recursive: true });
+      writeFileSync(historyPath(), this.lines.join("\n"), "utf8");
     } catch {
       // ignore save errors
     }
@@ -156,13 +173,16 @@ export class TUI {
   public testnet = true;
   public spend = "0.00/0.05";
   public gateway = "off";
+  public verbose = false;
+  private liveModels: string[] = [];
+  private agent: Agent | null = null;
+  // Owns the agent's conversation context (used by /export and /compact).
+  public agentContext: ContextManager | null = null;
+  private agentStreamed = "";
 
   constructor() {
     this.history = new History();
     this.renderer = new MarkdownRenderer();
-    if (processStdout.isTTY) {
-      processStdout.write(this.clearScreen());
-    }
   }
 
   private clearScreen(): string {
@@ -177,26 +197,55 @@ export class TUI {
     return "\x1b[?25h";
   }
 
-  // Header rendering
+  // Header rendering (M1): every number shown is real data, never a
+  // hardcoded claim. Counts fall back to "?" when their store is
+  // unreachable instead of inventing a value.
+  private spendDisplay(): string {
+    try {
+      const policy = getPolicy();
+      if (this.wallet) {
+        const spent = getSpentToday(this.wallet, "evm");
+        return `${spent.toFixed(4)}/${policy.spendCapPerDay}`;
+      }
+      return `cap ${policy.spendCapPerDay}/day`;
+    } catch {
+      return this.spend;
+    }
+  }
+
+  private pendingTasksCount(): string {
+    try {
+      return String(tracker.listTasks({ pending: true }).length);
+    } catch {
+      return "?";
+    }
+  }
+
+  private pendingConfirmsCount(): string {
+    try {
+      return String(listPendingConfirmations().length);
+    } catch {
+      return "?";
+    }
+  }
 
   renderHeader(version = "v0.1.0"): string {
     const mainnet = !this.testnet ? `${COLORS.red}MAINNET${COLORS.reset}` : "TESTNET";
-    const walletDisplay = this.wallet ? `${this.wallet.substring(0, 6)}…${this.wallet.substring(-4)}` : "-";
-    const port = process.env.PORT || "17070";
+    const walletDisplay = this.wallet ? `${this.wallet.substring(0, 6)}…${this.wallet.slice(-4)}` : "-";
+    const modelDisplay = this.model || "auto";
     return `
   ╭─ PANSA · crypto airdrop agent ───── ${version} ──────────────────╮
-  │ ● bansos-router :${port}  12 models live                │
-  │ │ model   deepseek-v4-flash-free                     │
-  │ │ wallet  ${walletDisplay.padEnd(37)}│
-  │ │ mode    ${mainnet} · spend ${this.spend} · gateway: ${this.gateway}     │
-  │ │ due     2 tasks in 24h · pending confirms: 0       │
+  │ model   ${modelDisplay.padEnd(37)}│
+  │ wallet  ${walletDisplay.padEnd(37)}│
+  │ mode    ${mainnet} · spend ${this.spendDisplay()} · gateway: ${this.gateway}     │
+  │ due     ${this.pendingTasksCount()} pending tasks · pending confirms: ${this.pendingConfirmsCount()}       │
   ╰────────────────────────────────────────────────────────╯`;
   }
 
   // Status line
 
   renderStatusLine(): string {
-    this.statusLine = `model · ${this.wallet} · ${this.testnet ? "TESTNET" : "MAINNET"} · spend/${this.spend} · gateway: ${this.gateway}`;
+    this.statusLine = `model ${this.model || "auto"} · ${this.wallet} · ${this.testnet ? "TESTNET" : "MAINNET"} · spend/${this.spendDisplay()} · gateway: ${this.gateway}`;
     return this.statusLine;
   }
 
@@ -217,19 +266,10 @@ export class TUI {
     process.on("SIGINT", () => this.ctrlC());
     process.on("SIGTERM", () => this.exit(0));
 
-    processStdin.setRawMode(false);
-    processStdin.on("keypress", (_stream, key) => {
-      if (key && key.name === "l" && key.ctrl) {
-        processStdout.write(this.clearScreen());
-        processStdout.write(this.renderHeader() + "\n");
-        processStdout.write(this.renderStatusLine() + "\n");
-        processStdout.write(this.prompt());
-      }
-      if (key && key.name === "escape") {
-        this.exitCounter = 0;
-        processStdout.write(this.prompt());
-      }
-    });
+    // NOTE (D9): no keypress handler here. With raw mode off, stdin never
+    // emits keypress events, so the old Ctrl+L/Esc handler was dead code.
+    // Screen clearing is available via /clear; Ctrl+C/Ctrl+D are handled
+    // by readline and the SIGINT handler above.
 
     process.on("SIGWINCH", () => {
       processStdout.write(this.clearScreen());
@@ -282,6 +322,19 @@ export class TUI {
       return;
     }
 
+    // Human-only confirmation: intercepted before the agent ever sees it.
+    const confirmMatch = trimmed.match(/^CONFIRM\s+(\S+)$/i);
+    if (confirmMatch) {
+      void humanConfirm(confirmMatch[1]).then(() => processStdout.write(this.prompt()));
+      return;
+    }
+    const rejectMatch = trimmed.match(/^REJECT\s+(\S+)$/i);
+    if (rejectMatch) {
+      humanReject(rejectMatch[1]);
+      processStdout.write(this.prompt());
+      return;
+    }
+
     // Slash commands
     if (trimmed.startsWith("/")) {
       this.handleSlashCommand(trimmed);
@@ -292,110 +345,191 @@ export class TUI {
     this.processInput(trimmed);
   }
 
-  public handleSlashCommand(cmd: string): void {
+  public async handleSlashCommand(cmd: string): Promise<void> {
     const parts = cmd.slice(1).split(/\s+/);
     const command = parts[0];
 
-    switch (command) {
-      case "help": {
-        processStdout.write(this.helpText());
-        break;
-      }
-      case "status": {
-        processStdout.write(`Status: model=${this.model || "auto"}, wallet=${this.wallet || "none"}, ${this.testnet ? "TESTNET" : "MAINNET"}, spend=${this.spend}, gateway=${this.gateway}\n`);
-        break;
-      }
-      case "model": {
-        const m = parts[1] || this.model || "deepseek-v4-flash-free";
-        this.model = m;
-        processStdout.write(`Model set to: ${m}\n`);
-        break;
-      }
-      case "wallet": {
-        const sub = parts[1];
-        if (sub === "list") {
-          processStdout.write("Wallets: (none configured)\n");
-        } else if (sub === "use" && parts[2]) {
-          this.wallet = parts[2];
-          processStdout.write(`Wallet set to: ${parts[2]}\n`);
-        } else {
-          processStdout.write("Usage: /wallet [list|use <name>]\n");
+    try {
+      switch (command) {
+        case "help": {
+          processStdout.write(this.helpText());
+          break;
         }
-        break;
-      }
-      case "balance": {
-        const chain = parts[1] || "evm";
-        processStdout.write(`Balance for ${chain}: checking...\n`);
-        break;
-      }
-      case "skills": {
-        processStdout.write("Available skills: scout, scam-check, testnet, mint, baw, tracker, report\n");
-        break;
-      }
-      case "skill": {
-        const skillName = parts[1];
-        if (skillName) {
-          processStdout.write(`Skill: ${skillName} - loading...\n`);
-        } else {
-          processStdout.write("Usage: /skill <name>\n");
+        case "status": {
+          processStdout.write(`Status: model=${this.model || "auto"}, wallet=${this.wallet || "none"}, ${this.testnet ? "TESTNET" : "MAINNET"}, spend=${this.spendDisplay()}, gateway=${this.gateway}, pending tasks=${this.pendingTasksCount()}, pending confirms=${this.pendingConfirmsCount()}\n`);
+          break;
         }
-        break;
+        case "model": {
+          const m = parts[1];
+          if (!m) {
+            const live = await fetchLiveModels().catch(() => this.liveModels);
+            processStdout.write(`Model saat ini: ${this.model || "auto"}\nModel live: ${live.length ? live.join(", ") : "(tidak ada data)"}\nUsage: /model <id>\n`);
+            break;
+          }
+          const live = await fetchLiveModels().catch(() => this.liveModels);
+          if (live.length > 0 && !live.includes(m)) {
+            processStdout.write(`Model ${m} tidak ada di daftar live. Daftar live: ${live.join(", ")}\n`);
+            break;
+          }
+          this.model = m;
+          if (this.agent) this.agent.setModel(m);
+          processStdout.write(`Model set to: ${m}\n`);
+          break;
+        }
+        case "wallet": {
+          const sub = parts[1];
+          if (sub === "list") {
+            const names = walletRegistryLoad().map((w) => `${w.name} (${w.family} ${w.address})`);
+            processStdout.write(names.length ? `Wallets:\n${names.map((n) => `  ${n}`).join("\n")}\n` : "Wallets: (none configured)\n");
+          } else if (sub === "use" && parts[2]) {
+            const found = walletRegistryLoad().find((w) => w.name === parts[2]);
+            if (!found) {
+              processStdout.write(`Dompet tidak ditemukan: ${parts[2]}\n`);
+            } else {
+              this.wallet = parts[2];
+              processStdout.write(`Wallet set to: ${parts[2]}\n`);
+            }
+          } else {
+            processStdout.write("Usage: /wallet [list|use <name>]\n");
+          }
+          break;
+        }
+        case "balance": {
+          const chain = parts[1] || "evm";
+          const cfg = loadConfig();
+          const defs = (cfg as { defaultWallets?: Record<string, string> }).defaultWallets ?? {};
+          const name = this.wallet || defs[chain];
+          if (!name) {
+            processStdout.write(`Belum ada dompet untuk ${chain} (pilih dengan /wallet use <nama> atau buat via CLI).\n`);
+            break;
+          }
+          const record = walletRegistryLoad().find((w) => w.name === name && w.family === chain);
+          if (!record) {
+            processStdout.write(`Dompet "${name}" tidak ditemukan di registry untuk ${chain}.\n`);
+            break;
+          }
+          if (chain !== "evm") {
+            processStdout.write(`Balance lookup belum didukung untuk ${chain} (hanya EVM via RPC).\n${chain} ${name}: ${record.address}\n`);
+            break;
+          }
+          const rpcUrl = resolveEvmRpc();
+          if (!rpcUrl) {
+            processStdout.write(`Tidak ada endpoint EVM RPC. Set PANSA_EVM_RPC atau evmRpc di config.\n${chain} ${name}: ${record.address}\n`);
+            break;
+          }
+          try {
+            const balance = await getEvmBalance(record.address, rpcUrl);
+            processStdout.write(`${chain} ${name}: ${record.address}\nSaldo: ${formatEth(balance)} ETH\n`);
+          } catch (err) {
+            processStdout.write(`Gagal ambil saldo: ${err instanceof Error ? err.message : String(err)}\n`);
+          }
+          break;
+        }
+        case "skills": {
+          const tools = [...buildAgentTools().values()];
+          processStdout.write(`Agent tools:\n${tools.map((t) => `  ${t.name} - ${t.description}`).join("\n")}\n`);
+          break;
+        }
+        case "skill": {
+          const skillName = parts[1];
+          if (!skillName) {
+            processStdout.write("Usage: /skill <name>\n");
+            break;
+          }
+          const tool = buildAgentTools().get(skillName);
+          if (!tool) {
+            processStdout.write(`Tool tidak ditemukan: ${skillName} (lihat /skills)\n`);
+          } else {
+            processStdout.write(`Tool: ${tool.name}\nDeskripsi: ${tool.description}\nParameter: ${JSON.stringify(tool.parameters)}\n`);
+          }
+          break;
+        }
+        case "tracker": {
+          const tasks = tracker.listTasks({ pending: true });
+          if (tasks.length === 0) {
+            processStdout.write("Tracker: tidak ada tugas pending.\n");
+          } else {
+            processStdout.write(`Tracker: ${tasks.length} tugas pending:\n${tasks.slice(0, 10).map((t) => `  [${t.status}] ${t.title}`).join("\n")}\n`);
+          }
+          break;
+        }
+        case "report": {
+          const res = await createReportTool().execute({});
+          if (!res.ok) processStdout.write(`Report gagal: ${res.error}\n`);
+          else processStdout.write(JSON.stringify(res.data, null, 2) + "\n");
+          break;
+        }
+        case "policy": {
+          processStdout.write(JSON.stringify(getPolicy(), null, 2) + "\n");
+          break;
+        }
+        case "gateway": {
+          processStdout.write("Gateway tidak tersedia di PANSA dan tidak lagi dijanjikan.\n");
+          break;
+        }
+        case "setup": {
+          processStdout.write("Jalankan `pansa setup` dari shell (TUI tidak menjalankan setup).\n");
+          break;
+        }
+        case "sessions": {
+          const sessions = await sessionManager.listSessions();
+          if (sessions.length === 0) {
+            processStdout.write("Sessions: (kosong)\n");
+          } else {
+            processStdout.write(`Sessions:\n${sessions.slice(0, 10).map((s) => `  ${s.id} - ${s.title} (${s.updated_at})`).join("\n")}\n`);
+          }
+          break;
+        }
+        case "compact": {
+          if (!this.agentContext) {
+            processStdout.write("Compact: belum ada percakapan agent.\n");
+            break;
+          }
+          const before = this.agentContext.messagesForLlm().length;
+          this.agentContext.compact();
+          const after = this.agentContext.messagesForLlm().length;
+          processStdout.write(`Compact: ${before} -> ${after} pesan.\n`);
+          break;
+        }
+        case "clear": {
+          processStdout.write(this.clearScreen());
+          processStdout.write(this.renderHeader() + "\n");
+          processStdout.write(this.renderStatusLine() + "\n");
+          break;
+        }
+        case "verbose": {
+          this.verbose = !this.verbose;
+          processStdout.write(`Verbose mode: ${this.verbose ? "on" : "off"}\n`);
+          break;
+        }
+        case "theme": {
+          processStdout.write("Theme: default (satu-satunya tema yang tersedia)\n");
+          break;
+        }
+        case "doctor": {
+          const checks = await runDoctor();
+          processStdout.write(formatDoctor(checks) + "\n");
+          break;
+        }
+        case "export": {
+          if (!this.agentContext) {
+            processStdout.write("Export: belum ada percakapan agent.\n");
+            break;
+          }
+          mkdirSync(PANSA_DIR, { recursive: true, mode: 0o700 });
+          const file = `${PANSA_DIR}/export-${Date.now()}.json`;
+          writeFileSync(file, JSON.stringify(this.agentContext.messagesForLlm(), null, 2), { mode: 0o600 });
+          processStdout.write(`Export tersimpan: ${file}\n`);
+          break;
+        }
+        default: {
+          processStdout.write(`Unknown command: /${command}\n`);
+          processStdout.write(this.helpText());
+          break;
+        }
       }
-      case "tracker": {
-        processStdout.write("Tracker: showing pending tasks...\n");
-        break;
-      }
-      case "report": {
-        processStdout.write("Report: generating summary...\n");
-        break;
-      }
-      case "policy": {
-        processStdout.write("Policy: showing current policy...\n");
-        break;
-      }
-      case "gateway": {
-        processStdout.write("Gateway: status check...\n");
-        break;
-      }
-      case "setup": {
-        processStdout.write("Setup wizard - starting...\n");
-        break;
-      }
-      case "sessions": {
-        processStdout.write("Sessions: listing recent sessions...\n");
-        break;
-      }
-      case "compact": {
-        processStdout.write("Compact: summarizing old turns...\n");
-        break;
-      }
-      case "clear": {
-        processStdout.write(this.clearScreen());
-        processStdout.write(this.renderHeader() + "\n");
-        processStdout.write(this.renderStatusLine() + "\n");
-        break;
-      }
-      case "verbose": {
-        processStdout.write("Verbose mode toggled\n");
-        break;
-      }
-      case "theme": {
-        processStdout.write("Theme: default\n");
-        break;
-      }
-      case "doctor": {
-        processStdout.write(`Doctor: Node ${process.version}\n`);
-        break;
-      }
-      case "export": {
-        processStdout.write("Export: exporting session...\n");
-        break;
-      }
-      default: {
-        processStdout.write(`Unknown command: /${command}\n`);
-        processStdout.write(this.helpText());
-        break;
-      }
+    } catch (err) {
+      processStdout.write(`Error: ${err instanceof Error ? err.message : String(err)}\n`);
     }
     processStdout.write(this.prompt());
   }
@@ -405,31 +539,66 @@ export class TUI {
 PANSA Slash Commands:
   /help            Show this help
   /status          Show current status
-  /model [id]      Pick model (arrow-key picker)
+  /model [id]      Pin agent to a live model
   /wallet [list|use <n>]
-  /balance [chain] Check balance
-  /skills          List available skills
-  /skill <name>    Load a skill
+  /balance [chain] Check balance (real, EVM via RPC)
+  /skills          List agent tools
+  /skill <name>    Show tool info
   /tracker         Show pending tasks
   /report          Generate report
   /policy          Show current policy
-  /gateway         Gateway status/control
-  /setup           Setup wizard
+  /gateway         Gateway (not available)
+  /setup           Pointer to CLI setup
   /sessions        List sessions
   /compact         Summarize old turns
   /clear           Clear screen
-  /verbose         Toggle verbose output
+  /verbose         Toggle verbose error detail
   /doctor          Show system info
-  /export          Export session
+  /export          Export transcript to a file
   /exit            Exit PANSA
 
-Keybindings: Ctrl+C cancel, Ctrl+D exit, Ctrl+L clear, Esc cancel input
+Keybindings: Ctrl+C cancel, Ctrl+D exit
 `;
   }
 
-  private processInput(_input: string): void {
-    // Send input to agent
-    processStdout.write(`Processing: ${_input}\n`);
+  private async ensureAgent(): Promise<Agent> {
+    if (this.agent && this.agentContext) return this.agent;
+    const cfg = loadConfig();
+    try {
+      await ensureDaemon();
+    } catch {
+      // Daemon down: agent still builds; run() reports no-model on use.
+    }
+    const live = await fetchLiveModels().catch((): string[] => []);
+    this.liveModels = live;
+    const ctx = new ContextManager();
+    for (const f of loadContextFiles()) ctx.appendFileContext(f);
+    const agent = new Agent({
+      context: ctx,
+      tools: buildAgentTools(),
+      liveModels: live,
+      cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models },
+      onChunk: (t) => { this.agentStreamed += t; processStdout.write(t); },
+    });
+    if (this.model) agent.setModel(this.model);
+    this.agent = agent;
+    this.agentContext = ctx;
+    return agent;
+  }
+
+  private async processInput(input: string): Promise<void> {
+    try {
+      const agent = await this.ensureAgent();
+      this.agentStreamed = "";
+      const out = await agent.run(input);
+      if (!this.agentStreamed) processStdout.write(out + "\n");
+      else processStdout.write("\n");
+    } catch (err) {
+      // /verbose controls error detail: message only by default, full
+      // stack when verbose is on.
+      const detail = this.verbose && err instanceof Error && err.stack ? err.stack : (err instanceof Error ? err.message : String(err));
+      processStdout.write(`Error: ${detail}\n`);
+    }
     processStdout.write(this.prompt());
   }
 
@@ -473,34 +642,7 @@ Keybindings: Ctrl+C cancel, Ctrl+D exit, Ctrl+L clear, Esc cancel input
   }
 }
 
-// Entry point
-
-async function main(): Promise<void> {
-  // Check if stdin is a TTY
-  const isTTYMode = processStdin.isTTY && processStdout.isTTY;
-
-  if (!isTTYMode) {
-    // Non-TTY mode: plain text, no interactive features
-    processStdout.write("PANSA - non-interactive mode\n");
-    processStdout.write("Use: pansa run \"<prompt>\" for headless mode\n");
-    return;
-  }
-
-  // First-run check: if config missing, run setup
-  const configPath = `${process.env.HOME ?? ""}/.pansa/config.json`;
-  if (!existsSync(configPath)) {
-    processStdout.write("First run detected. Running setup...\n");
-    processStdout.write("Setup complete.\n");
-  }
-
-  const tui = new TUI();
-  tui.run();
-}
-
-// Run if executed directly (ESM-compatible)
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    processStdout.write(`Fatal error: ${err instanceof Error ? err.message : err}\n`);
-    process.exit(1);
-  });
-}
+// Entry point lives only in src/cli.ts. This module used to self-execute
+// when bundled (import.meta.url matched the bundle), starting a second TUI
+// on TTY and printing a non-interactive banner on non-TTY stdout (B11).
+// It is now a pure library: import { TUI } and run it explicitly.

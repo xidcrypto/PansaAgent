@@ -1,0 +1,53 @@
+import { existsSync } from "node:fs";
+import { PANSA_DIR, CONFIG_FILE, POLICY_FILE, KEYSTORE_DIR, DB_FILE } from "./config.js";
+import { loadConfig } from "./config.js";
+import { loadPolicy } from "./signer/transactions.js";
+import { walletRegistryLoad } from "./signer/keystore.js";
+import { fetchLiveModels } from "./llm.js";
+
+// Shared health checks used by `pansa doctor` and the TUI /doctor
+// command. The daemon check is read-only: it never spawns a daemon.
+export interface DoctorCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export async function runDoctor(): Promise<DoctorCheck[]> {
+  const checks: DoctorCheck[] = [];
+  checks.push({ name: "node", ok: true, detail: process.version });
+  checks.push({ name: "PANSA_DIR", ok: existsSync(PANSA_DIR), detail: PANSA_DIR });
+  try {
+    loadConfig();
+    checks.push({ name: "config", ok: true, detail: CONFIG_FILE });
+  } catch (err) {
+    checks.push({ name: "config", ok: false, detail: err instanceof Error ? err.message : String(err) });
+  }
+  const policy = loadPolicy();
+  checks.push({
+    name: "policy",
+    ok: true,
+    detail: `per-tx ${policy.spendCapPerTx}, per-day ${policy.spendCapPerDay}, testnetOnly ${policy.testnetOnly}`,
+  });
+  checks.push({ name: "policy file", ok: existsSync(POLICY_FILE), detail: POLICY_FILE });
+  checks.push({ name: "keystore dir", ok: existsSync(KEYSTORE_DIR), detail: KEYSTORE_DIR });
+  checks.push({ name: "database", ok: true, detail: `${DB_FILE} (dibuka saat pertama dipakai)` });
+  let wallets = 0;
+  try {
+    wallets = walletRegistryLoad().length;
+    checks.push({ name: "wallets", ok: true, detail: `${wallets} terdaftar` });
+  } catch (err) {
+    checks.push({ name: "wallets", ok: false, detail: err instanceof Error ? err.message : String(err) });
+  }
+  try {
+    const live = await fetchLiveModels();
+    checks.push({ name: "LLM daemon", ok: true, detail: `${live.length} model live` });
+  } catch (err) {
+    checks.push({ name: "LLM daemon", ok: false, detail: err instanceof Error ? err.message : String(err) });
+  }
+  return checks;
+}
+
+export function formatDoctor(checks: DoctorCheck[]): string {
+  return checks.map((c) => `${c.ok ? "✓" : "✗"} ${c.name}: ${c.detail}`).join("\n");
+}

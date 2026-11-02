@@ -1,37 +1,35 @@
 ---
 name: testnet
-description: Perform testnet transactions (swaps, transfers, stakes, bridges) for airdrop farming
+description: Prepare a testnet transaction for human confirmation. Never fabricates a hash.
 ---
 
 # Testnet Skill
 
-Executes testnet transactions across multiple chains to fulfill airdrop requirements.
+Prepares a transaction (transfer or contract call) as a pending
+confirmation through the sign flow. It does not execute by itself, and
+it never invents a transaction hash, gas used, or success status.
 
 ## Parameters
 
-- `chain` (string): Target chain
-- `action` (string): Action type (swap, transfer, stake, bridge, mint)
-- `from` (string): Source wallet name
-- `to` (string): Destination address (for transfers)
-- `amount` (string): Amount in token units
-
-## Supported Actions
-
-- **swap** — Token swap on testnet DEX
-- **transfer** — Send tokens to address
-- **stake** — Stake tokens in testnet protocol
-- **bridge** — Bridge tokens between chains
-- **mint** — Mint test NFT or token
+- `chain` (string): Target chain (currently EVM only for execution)
+- `action` (string): Informational only; the call is a plain transfer
+  or contract call
+- `from_wallet` (string): Source wallet name
+- `to` (string): Destination address
+- `amount` (string): Native value to send
+- `data` (string): Optional calldata for contract calls. Gas is
+  estimated from the RPC at broadcast time, never guessed.
 
 ## Output
 
-- Transaction hash
-- Status (success/failed/pending)
-- Gas used
-- Timestamp
+- A pending confirmation (id, policy check, simulation result), or a
+  clear error (policy refusal, simulation failure, non-EVM chain).
+- The transaction only executes after a human runs
+  `pansa confirm <id>` (or `CONFIRM <id>`), and only then is a real
+  broadcast hash returned.
 
 ## Example
 
 ```
-/testnet chain=sepolia action=swap from=test1 amount=0.1
+/testnet chain=evm from_wallet=mywallet to=0x123... amount=0.01
 ```

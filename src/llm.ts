@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { DEFAULT_MODEL_PREF, REASONING_MODELS, CHEAP_MODELS } from "./config.js";
 
-const BASE = "http://127.0.0.1:17070";
+// Overridable for tests (PANSA_LLM_BASE): points fetchJson/streamChat at
+// a local test server instead of the real daemon port.
+const BASE = process.env.PANSA_LLM_BASE ?? "http://127.0.0.1:17070";
 const MODELS_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
 const DAEMON_CMD = "bansos";
@@ -86,7 +88,17 @@ async function fetchJson(path: string, timeoutMs: number): Promise<unknown> {
   try {
     const res = await fetch(`${BASE}${path}`, { signal: ctrl.signal });
     if (!res.ok) throw new LlmError(`HTTP ${res.status}`, { code: "http_error", status: res.status, retryable: res.status >= 500 || res.status === 429 });
-    return res.json();
+    try {
+      return await res.json();
+    } catch {
+      throw new LlmError(`Invalid JSON from ${path}`, { code: "bad_json", retryable: false });
+    }
+  } catch (err) {
+    // Every failure surfaces as an LlmError, never a raw TypeError or
+    // SyntaxError, so callers can branch on code/retryable (M17).
+    if (err instanceof LlmError) throw err;
+    if (ctrl.signal.aborted) throw new LlmError(`Request timed out: ${path}`, { code: "timeout", retryable: true });
+    throw new LlmError(`Fetch failed: ${err instanceof Error ? err.message : String(err)}`, { code: "fetch_error", retryable: true });
   } finally {
     clearTimeout(t);
   }
@@ -99,23 +111,25 @@ export async function ensureDaemon(): Promise<void> {
   } catch {
     // daemon may be down
   }
-  // try to spawn bansos start --bg
-  let binaryMissing = false;
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(DAEMON_CMD, DAEMON_ARGS, { detached: true, stdio: "ignore" });
-      proc.unref();
-      proc.on("error", (err) => {
-        binaryMissing = true;
-        reject(err);
-      });
-      proc.on("exit", () => resolve());
-      setTimeout(resolve, 1000);
+  // try to spawn bansos start --bg. The spawn outcome is captured, not
+  // raced against a blind timeout: a binary-missing error must surface as
+  // binary_missing, never degrade into a daemon timeout (M17).
+  let spawnErr: Error | undefined;
+  await new Promise<void>((resolve) => {
+    const proc = spawn(DAEMON_CMD, DAEMON_ARGS, { detached: true, stdio: "ignore" });
+    proc.unref();
+    const timer = setTimeout(resolve, 1000);
+    proc.on("error", (err) => {
+      spawnErr = err;
+      clearTimeout(timer);
+      resolve();
     });
-  } catch {
-    binaryMissing = true;
-  }
-  if (binaryMissing) {
+    proc.on("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  if (spawnErr) {
     process.stderr.write(`bansos-router not found. Install it: npm i -g bansos-router\n`);
     throw new LlmError("bansos-router binary missing", { code: "binary_missing", retryable: false });
   }
@@ -169,7 +183,7 @@ async function* streamChat(
     stream: true,
   };
   if (tools.length > 0) body.tools = tools.map((t) => ({ type: "function", function: t }));
-  if (toolChoice === "required") body.tool_choice = "required";
+  if (toolChoice === "required" && tools.length > 0) body.tool_choice = "required";
   else if (toolChoice === "none") body.tool_choice = "none";
   else body.tool_choice = "auto";
 
@@ -178,7 +192,9 @@ async function* streamChat(
   const t = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
 
   let accContent = "";
-  const accCalls = new Map<string, { name: string; args: string }>();
+  // Keyed by stream index; the entry keeps the REAL streamed tool-call id
+  // when the provider sends one, falling back to call_<index>.
+  const accCalls = new Map<string, { id: string; name: string; args: string }>();
   try {
     const res = await fetch(`${BASE}${CHAT_PATH}`, {
       method: "POST",
@@ -226,7 +242,10 @@ async function* streamChat(
               const idx2 = (tc as { index?: number }).index;
               if (typeof idx2 !== "number") continue;
               let entry = accCalls.get(String(idx2));
-              if (!entry) { entry = { name: "", args: "" }; accCalls.set(String(idx2), entry); }
+              if (!entry) { entry = { id: `call_${idx2}`, name: "", args: "" }; accCalls.set(String(idx2), entry); }
+              if (typeof (tc as { id?: string }).id === "string" && (tc as { id: string }).id) {
+                entry.id = (tc as { id: string }).id;
+              }
               if (typeof (tc as { function?: { name?: string } }).function?.name === "string") {
                 entry.name = (tc as { function: { name: string } }).function.name;
               }
@@ -244,29 +263,54 @@ async function* streamChat(
     clearTimeout(t);
   }
   const toolCalls: ToolCall[] = [];
-  for (const [id, entry] of accCalls) {
-    if (entry.name) toolCalls.push({ id, type: "function", function: { name: entry.name, arguments: entry.args } });
+  for (const entry of accCalls.values()) {
+    if (entry.name) toolCalls.push({ id: entry.id, type: "function", function: { name: entry.name, arguments: entry.args } });
   }
   return { role: "assistant", content: accContent, tool_calls: toolCalls.length > 0 ? toolCalls : undefined };
 }
 
-const TOOL_JSON_FENCE = /```json\s*\n(\{[\s\S]*?\})\s*\n```/g;
-const TOOL_FENCE = /```\s*\n(\{[\s\S]*?\})\s*\n```/g;
+const TOOL_FENCE = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
+
+// Extract the first balanced {...} object from text, respecting strings
+// and escapes. The old non-greedy regex stopped at the first '}', which
+// broke every tool call with nested args objects.
+function extractBalancedJson(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
 
 function parseToolFence(text: string): { name: string; args: Record<string, unknown> } | null {
-  for (const re of [TOOL_JSON_FENCE, TOOL_FENCE]) {
-    re.lastIndex = 0;
-    const m = re.exec(text);
-    const raw = m ? m[1] : null;
-    if (raw) {
-      try {
-        const obj = JSON.parse(raw);
-        if (obj && typeof obj.tool === "string" && obj.args && typeof obj.args === "object") {
-          return { name: obj.tool, args: obj.args as Record<string, unknown> };
-        }
-      } catch {
-        // ignore
+  TOOL_FENCE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TOOL_FENCE.exec(text)) !== null) {
+    const raw = extractBalancedJson(m[1] ?? "");
+    if (!raw) continue;
+    try {
+      const obj = JSON.parse(raw) as { tool?: unknown; args?: unknown };
+      if (obj && typeof obj.tool === "string" && obj.args && typeof obj.args === "object") {
+        return { name: obj.tool, args: obj.args as Record<string, unknown> };
       }
+    } catch {
+      // try the next fence
     }
   }
   return null;
@@ -282,12 +326,15 @@ export async function chat(
   liveModels: string[],
   cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[] },
 ): Promise<ChatResult> {
-  const model = modelForKind(opts.kind, liveModels, cfg);
-  if (!model) throw new LlmError("no live model available", { code: "no_model", retryable: false });
-  if (circuitOpen(model)) throw new LlmError(`circuit open for ${model}`, { code: "circuit_open", retryable: true });
+  const candidates = modelsForKind(opts.kind, liveModels, cfg);
+  if (candidates.length === 0) throw new LlmError("no live model available", { code: "no_model", retryable: false });
 
+  // Failover, not retry: each candidate gets one attempt; a failure moves
+  // to the NEXT model instead of hammering the same one 3 times (M17).
   let lastErr: unknown;
-  for (let attempt = 0; attempt < MAX_FAILS_PER_MODEL; attempt++) {
+  let attempt = 0;
+  for (const model of candidates) {
+    if (circuitOpen(model)) continue;
     try {
       const signal = opts.signal ?? new AbortController().signal;
       const gen = streamChat(model, opts.messages, opts.tools, opts.toolChoice, signal);
@@ -303,26 +350,29 @@ export async function chat(
       lastErr = err;
       if (err instanceof LlmError && !err.retryable) throw err;
       circuitRecordFailure(model);
-      await sleep(backoffDelay(attempt));
+      await sleep(backoffDelay(attempt++));
     }
   }
   throw lastErr instanceof Error ? lastErr : new LlmError(String(lastErr));
 }
 
-function modelForKind(
+// Ordered candidate models for a task kind: preferred kind models first,
+// then every other live model from cfg.models, deduplicated.
+function modelsForKind(
   kind: ChatOptions["kind"],
   live: string[],
   cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[] },
-): string | undefined {
+): string[] {
   const all = cfg.models ?? [...DEFAULT_MODEL_PREF];
   const liveSet = new Set(live);
-  const candidates = all.filter((m: string) => liveSet.has(m));
-  if (kind === "reasoning") {
-    const reasoning = (cfg.preferReasoning ?? REASONING_MODELS).filter((m: string) => liveSet.has(m));
-    return reasoning[0] ?? candidates[0];
+  const preferred = kind === "reasoning"
+    ? (cfg.preferReasoning ?? REASONING_MODELS)
+    : (cfg.preferCheap ?? CHEAP_MODELS);
+  const out: string[] = [];
+  for (const m of [...preferred, ...all]) {
+    if (liveSet.has(m) && !out.includes(m)) out.push(m);
   }
-  const cheap = (cfg.preferCheap ?? CHEAP_MODELS).filter((m: string) => liveSet.has(m));
-  return cheap[0] ?? candidates[0];
+  return out;
 }
 
 export { parseToolFence };

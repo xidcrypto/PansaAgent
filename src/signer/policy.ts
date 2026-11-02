@@ -1,146 +1,200 @@
-import { PolicyConfig, TxRequest, checkPolicy, simulateTx, generateConfirmationId } from "./transactions.js";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { PANSA_DIR } from "../config.js";
+import { TxRequest, TxSimulation, PolicyConfig, checkPolicy, loadPolicy, validatePolicy, PolicyCheckOptions, simulateTx, generateConfirmationId } from "./transactions.js";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+
+// Pending confirmations are persisted to disk (mode 600) so a human can
+// confirm from a different process (`pansa confirm <id>`) than the one that
+// created the request. A confirmation is NEVER granted by an LLM tool.
+const PENDING_FILE = `${PANSA_DIR}/confirmations.json`;
+const CONFIRMATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 export interface ConfirmationRequest {
   id: string;
   tx: TxRequest;
-  simulation: { ok: boolean; gasUsed?: string; success?: boolean; error?: string };
+  simulation: TxSimulation;
   policyCheck: { ok: boolean; error?: string };
   createdAt: number;
   expiresAt: number;
-  status: "pending" | "confirmed" | "rejected" | "expired";
+  status: "pending" | "confirmed" | "rejected" | "executed" | "expired";
+  txHash?: string;
 }
 
-const PENDING_CONFIRMATIONS = new Map<string, ConfirmationRequest>();
-const CONFIRMATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
+function readPending(): Map<string, ConfirmationRequest> {
+  try {
+    if (!existsSync(PENDING_FILE)) return new Map();
+    const arr = JSON.parse(readFileSync(PENDING_FILE, "utf8")) as ConfirmationRequest[];
+    return new Map(arr.map((r) => [r.id, r]));
+  } catch {
+    return new Map();
+  }
+}
 
-export function savePolicy(policy: PolicyConfig): void {
-  const policyFile = `${PANSA_DIR}/policy.json`;
+function writePending(map: Map<string, ConfirmationRequest>): void {
   mkdirSync(PANSA_DIR, { recursive: true, mode: 0o700 });
-  writeFileSync(policyFile, JSON.stringify(policy, null, 2), { mode: 0o600 });
+  writeFileSync(PENDING_FILE, JSON.stringify([...map.values()], null, 2), { mode: 0o600 });
 }
 
 export function getPolicy(): PolicyConfig {
-  const policyFile = `${PANSA_DIR}/policy.json`;
-  if (!existsSync(policyFile)) {
-    return {
-      spendCapPerTx: 0.01,
-      spendCapPerDay: 0.05,
-      allowedChains: ["evm", "solana", "sui", "aptos"],
-      requireConfirmation: true,
-      testnetOnly: true,
-    };
-  }
-  try {
-    const data = JSON.parse(readFileSync(policyFile, "utf8"));
-    return data as PolicyConfig;
-  } catch {
-    return {
-      spendCapPerTx: 0.01,
-      spendCapPerDay: 0.05,
-      allowedChains: ["evm", "solana", "sui", "aptos"],
-      requireConfirmation: true,
-      testnetOnly: true,
-    };
-  }
+  return loadPolicy();
 }
 
-export async function requestConfirmation(tx: TxRequest, policy: PolicyConfig): Promise<ConfirmationRequest> {
-  const id = generateConfirmationId();
-  const [simulation, policyCheck] = await Promise.all([
-    simulateTx(tx),
-    Promise.resolve(checkPolicy(tx, policy)),
-  ]);
+export function savePolicy(policy: PolicyConfig): void {
+  const validated = validatePolicy(policy);
+  mkdirSync(PANSA_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(`${PANSA_DIR}/policy.json`, JSON.stringify(validated, null, 2), { mode: 0o600 });
+}
 
+export async function requestConfirmation(
+  tx: TxRequest,
+  policy: PolicyConfig,
+  opts: PolicyCheckOptions = {},
+): Promise<ConfirmationRequest> {
+  const policyCheck = checkPolicy(tx, policy, opts);
+  const simulation = await simulateTx(tx);
   const now = Date.now();
   const req: ConfirmationRequest = {
-    id,
+    id: generateConfirmationId(),
     tx,
     simulation,
     policyCheck,
     createdAt: now,
     expiresAt: now + CONFIRMATION_TTL_MS,
-    status: "pending",
+    // Policy-rejected requests are reported but never stored as pending.
+    status: policyCheck.ok ? "pending" : "rejected",
   };
-
-  PENDING_CONFIRMATIONS.set(id, req);
-  return req;
-}
-
-export function confirm(id: string): ConfirmationRequest | null {
-  const req = PENDING_CONFIRMATIONS.get(id);
-  if (!req) return null;
-  if (req.status !== "pending") return null;
-  if (Date.now() > req.expiresAt) {
-    req.status = "expired";
-    PENDING_CONFIRMATIONS.set(id, req);
-    return null;
+  if (policyCheck.ok) {
+    const pending = readPending();
+    pending.set(req.id, req);
+    writePending(pending);
   }
-  if (!req.policyCheck.ok) {
-    req.status = "rejected";
-    PENDING_CONFIRMATIONS.set(id, req);
-    return null;
-  }
-  req.status = "confirmed";
-  PENDING_CONFIRMATIONS.set(id, req);
-  return req;
-}
-
-export function reject(id: string): ConfirmationRequest | null {
-  const req = PENDING_CONFIRMATIONS.get(id);
-  if (!req) return null;
-  if (req.status !== "pending") return null;
-  req.status = "rejected";
-  PENDING_CONFIRMATIONS.set(id, req);
   return req;
 }
 
 export function getConfirmation(id: string): ConfirmationRequest | undefined {
-  return PENDING_CONFIRMATIONS.get(id);
+  return readPending().get(id);
 }
 
 export function listPendingConfirmations(): ConfirmationRequest[] {
+  const pending = readPending();
   const now = Date.now();
-  const result: ConfirmationRequest[] = [];
-  for (const req of PENDING_CONFIRMATIONS.values()) {
-    if (req.status === "pending" && now <= req.expiresAt) {
-      result.push(req);
-    } else if (now > req.expiresAt && req.status === "pending") {
+  let changed = false;
+  for (const req of pending.values()) {
+    if (req.status === "pending" && now > req.expiresAt) {
       req.status = "expired";
-      PENDING_CONFIRMATIONS.set(req.id, req);
+      pending.set(req.id, req);
+      changed = true;
     }
   }
-  return result;
+  if (changed) writePending(pending);
+  return [...pending.values()].filter((r) => r.status === "pending");
+}
+
+// Human confirmation (M7): blocked when the policy check fails, when the
+// request expired, and when simulation failed or is unavailable. Returns a
+// result object so callers can report the exact reason instead of a bare
+// null.
+export function confirm(id: string): { ok: boolean; req?: ConfirmationRequest; error?: string } {
+  const pending = readPending();
+  const req = pending.get(id);
+  if (!req) return { ok: false, error: `Confirmation not found: ${id}` };
+  if (req.status !== "pending") return { ok: false, error: `Confirmation ${id} is already ${req.status}` };
+  if (Date.now() > req.expiresAt) {
+    req.status = "expired";
+    pending.set(id, req);
+    writePending(pending);
+    return { ok: false, error: `Confirmation ${id} expired` };
+  }
+  if (!req.policyCheck.ok) {
+    req.status = "rejected";
+    pending.set(id, req);
+    writePending(pending);
+    return { ok: false, error: req.policyCheck.error ?? "Policy check failed" };
+  }
+  if (!req.simulation.ok) {
+    req.status = "rejected";
+    pending.set(id, req);
+    writePending(pending);
+    return { ok: false, error: `Simulation failed: ${req.simulation.error ?? "unknown"}` };
+  }
+  req.status = "confirmed";
+  pending.set(id, req);
+  writePending(pending);
+  return { ok: true, req };
+}
+
+export function reject(id: string): { ok: boolean; req?: ConfirmationRequest; error?: string } {
+  const pending = readPending();
+  const req = pending.get(id);
+  if (!req) return { ok: false, error: `Confirmation not found: ${id}` };
+  if (req.status !== "pending") return { ok: false, error: `Confirmation ${id} is already ${req.status}` };
+  req.status = "rejected";
+  pending.set(id, req);
+  writePending(pending);
+  return { ok: true, req };
+}
+
+// Mark a confirmed request as executed (after broadcast) and record its hash.
+export function markExecuted(id: string, txHash: string): ConfirmationRequest | undefined {
+  const pending = readPending();
+  const req = pending.get(id);
+  if (!req) return undefined;
+  req.status = "executed";
+  req.txHash = txHash;
+  pending.set(id, req);
+  writePending(pending);
+  return req;
+}
+
+// Reopen a confirmed request back to pending (e.g. after a failed
+// broadcast) so the human can retry within the original TTL.
+export function reopenConfirmation(id: string): ConfirmationRequest | undefined {
+  const pending = readPending();
+  const req = pending.get(id);
+  if (!req || req.status !== "confirmed") return undefined;
+  if (Date.now() > req.expiresAt) {
+    req.status = "expired";
+    pending.set(id, req);
+    writePending(pending);
+    return undefined;
+  }
+  req.status = "pending";
+  pending.set(id, req);
+  writePending(pending);
+  return req;
 }
 
 export function cleanupExpired(): void {
+  const pending = readPending();
   const now = Date.now();
-  for (const [id, req] of PENDING_CONFIRMATIONS.entries()) {
+  let changed = false;
+  for (const req of pending.values()) {
     if (now > req.expiresAt && req.status === "pending") {
       req.status = "expired";
-      PENDING_CONFIRMATIONS.set(id, req);
+      pending.set(req.id, req);
+      changed = true;
     }
   }
+  if (changed) writePending(pending);
 }
 
 export function formatConfirmationCard(req: ConfirmationRequest): string {
-  const statusIcon = req.status === "pending" ? "⏳" : req.status === "confirmed" ? "✅" : req.status === "rejected" ? "❌" : "⏰";
+  const statusIcon = req.status === "pending" ? "⏳" : req.status === "confirmed" ? "✅" : req.status === "rejected" ? "❌" : req.status === "executed" ? "✅" : "⏰";
   const timeLeft = Math.max(0, Math.floor((req.expiresAt - Date.now()) / 1000));
   const minutes = Math.floor(timeLeft / 60);
   const seconds = timeLeft % 60;
+  const truncate = (addr: string) => `${addr.slice(0, 10)}...${addr.slice(-8)}`;
 
   return `
 ╭─ CONFIRMATION REQUIRED ${statusIcon} ─────────────────────────────────────╮
 │ ID: ${req.id.padEnd(56)}│
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ Chain: ${req.tx.chain.toUpperCase().padEnd(55)}│
-│ From: ${req.tx.from.slice(0, 10)}...${req.tx.from.slice(-8)}.padEnd(44)}│
-│ To: ${req.tx.to.slice(0, 10)}...${req.tx.to.slice(-8)}.padEnd(45)}│
+│ From: ${truncate(req.tx.from).padEnd(44)}│
+│ To: ${truncate(req.tx.to).padEnd(46)}│
 │ Value: ${(req.tx.value ?? "0").padEnd(55)}│
 │ Gas Limit: ${(req.tx.gasLimit ?? "auto").padEnd(51)}│
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ Simulation: ${req.simulation.ok ? "✓ Success" : "✗ Failed"} ${req.simulation.gasUsed ? `(gas: ${req.simulation.gasUsed})` : ""}
+│ Simulation: ${req.simulation.ok ? "✓ Success" : "✗ Failed"} ${req.simulation.gasUsed ? `(gas: ${req.simulation.gasUsed})` : req.simulation.error ? `(${req.simulation.error})` : ""}
 │ Policy Check: ${req.policyCheck.ok ? "✓ Passed" : `✗ ${req.policyCheck.error}`}
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ Expires in: ${minutes}m ${seconds}s

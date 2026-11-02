@@ -1,19 +1,56 @@
 import * as sha256mod from "@noble/hashes/sha256";
 import * as blake2bmod from "@noble/hashes/blake2b";
+import { wordlist as BIP39_WORDLIST } from "@scure/bip39/wordlists/english";
 
 const BOT_TOKEN = /\b\d{6,}:[\w-]{30,}\b/g;
-const HEX64 = /\b0x[0-9a-fA-F]{64}\b/g;
 const B58 = /\b[1-9A-HJ-NP-Za-km-z]{64,90}\b/g;
-// BIP39: 12-24 space-separated lowercase wordlist words
-const MNEMONIC = /\b(?:[a-z]{3,}\s+){11,23}[a-z]{3,}\b/g;
+// Mnemonic candidates: 12-24 lowercase words. A candidate is redacted
+// ONLY if every word is on the BIP39 English list and the count is a
+// valid mnemonic length — plain prose must survive (M5).
+const BIP39 = new Set<string>(BIP39_WORDLIST);
+// Valid BIP39 mnemonic lengths, longest first so a 24-word phrase is
+// consumed whole instead of as two 12-word halves.
+const MNEMONIC_LENGTHS = [24, 21, 18, 15, 12];
+
+function redactMnemonics(text: string): string {
+  // Scan each maximal run of lowercase words; greedily redact the
+  // longest valid-length all-BIP39 window starting at each position.
+  // Normal prose survives because its words are not all on the list, and
+  // a valid mnemonic embedded in surrounding words is still caught.
+  return text.replace(/[a-z]{3,}(?:\s+[a-z]{3,})+/g, (run) => {
+    const words = run.split(/\s+/);
+    let out = "";
+    let changed = false;
+    let i = 0;
+    while (i < words.length) {
+      let matched = false;
+      for (const len of MNEMONIC_LENGTHS) {
+        if (i + len <= words.length && words.slice(i, i + len).every((w) => BIP39.has(w))) {
+          out += (out ? " " : "") + "[REDACTED MNEMONIC]";
+          i += len;
+          matched = true;
+          changed = true;
+          break;
+        }
+      }
+      if (!matched) {
+        out += (out ? " " : "") + words[i];
+        i++;
+      }
+    }
+    return changed ? out : run;
+  });
+}
 
 export function redact(text: unknown): string {
   if (typeof text !== "string") return String(text);
-  return text
-    .replace(BOT_TOKEN, "[REDACTED BOT TOKEN]")
-    .replace(HEX64, "[REDACTED HEX]")
-    .replace(B58, "[REDACTED BASE58]")
-    .replace(MNEMONIC, "[REDACTED MNEMONIC]");
+  // NOTE: 0x + 64 hex (transaction hashes) is deliberately NOT redacted:
+  // legit hashes must survive logs and history (M5).
+  return redactMnemonics(
+    text
+      .replace(BOT_TOKEN, "[REDACTED BOT TOKEN]")
+      .replace(B58, "[REDACTED BASE58]"),
+  );
 }
 
 export function redactObj<T>(value: T): T {

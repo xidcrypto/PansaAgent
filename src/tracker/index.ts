@@ -1,8 +1,12 @@
 import Database from "better-sqlite3";
-import { PANSA_DIR } from "../config.js";
+import { DB_FILE, PANSA_DIR } from "../config.js";
 import { existsSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "failed" | "cancelled";
+
+const TASK_STATUSES: TaskStatus[] = ["pending", "in_progress", "completed", "failed", "cancelled"];
+const TASK_PRIORITIES = ["low", "medium", "high"] as const;
 
 export interface Task {
   id: string;
@@ -19,15 +23,19 @@ export interface Task {
 }
 
 export class Tracker {
-  private db: Database;
+  // Lazy init (M8): importing this module must not touch the disk, so
+  // --help and other early paths stay side-effect free. The DB opens on
+  // first use, at the single shared path DB_FILE.
+  private db: Database | null = null;
 
-  constructor() {
-    const dbPath = `${PANSA_DIR}/tracker.db`;
+  private ensureDb(): Database {
+    if (this.db) return this.db;
     if (!existsSync(PANSA_DIR)) {
       mkdirSync(PANSA_DIR, { recursive: true, mode: 0o700 });
     }
-    this.db = new Database(dbPath);
-    this.db.exec(`
+    const db = new Database(DB_FILE);
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -45,12 +53,15 @@ export class Tracker {
       CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline);
       CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON tasks(campaign);
     `);
+    this.db = db;
+    return db;
   }
 
   createTask(task: Omit<Task, "id" | "created_at" | "updated_at">): Task {
-    const id = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const db = this.ensureDb();
+    const id = `task_${Date.now().toString(36)}_${randomUUID().slice(0, 8)}`;
     const now = new Date().toISOString();
-    const stmt = this.db.prepare(`
+    const stmt = db.prepare(`
       INSERT INTO tasks (id, title, description, status, priority, chain, campaign, deadline, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
@@ -59,7 +70,7 @@ export class Tracker {
   }
 
   getTask(id: string): Task | undefined {
-    const stmt = this.db.prepare(`SELECT * FROM tasks WHERE id = ?`);
+    const stmt = this.ensureDb().prepare(`SELECT * FROM tasks WHERE id = ?`);
     return stmt.get(id) as Task | undefined;
   }
 
@@ -67,13 +78,17 @@ export class Tracker {
     const existing = this.getTask(id);
     if (!existing) return undefined;
 
+    // Whitelist + enum validation: unknown keys and invalid enum values
+    // are ignored, never interpolated into SQL (M-group hardening).
+    const allowed = new Set(["title", "description", "status", "priority", "chain", "campaign", "deadline"]);
     const fields: string[] = [];
     const values: unknown[] = [];
     for (const [key, value] of Object.entries(updates)) {
-      if (value !== undefined && key !== "id" && key !== "created_at") {
-        fields.push(`${key} = ?`);
-        values.push(value);
-      }
+      if (value === undefined || !allowed.has(key)) continue;
+      if (key === "status" && !TASK_STATUSES.includes(value as TaskStatus)) continue;
+      if (key === "priority" && !(TASK_PRIORITIES as readonly string[]).includes(value as string)) continue;
+      fields.push(`${key} = ?`);
+      values.push(value);
     }
     if (fields.length === 0) return existing;
 
@@ -86,13 +101,13 @@ export class Tracker {
     }
 
     values.push(id);
-    const stmt = this.db.prepare(`UPDATE tasks SET ${fields.join(", ")} WHERE id = ?`);
+    const stmt = this.ensureDb().prepare(`UPDATE tasks SET ${fields.join(", ")} WHERE id = ?`);
     stmt.run(...values);
     return this.getTask(id);
   }
 
   removeTask(id: string): boolean {
-    const stmt = this.db.prepare(`DELETE FROM tasks WHERE id = ?`);
+    const stmt = this.ensureDb().prepare(`DELETE FROM tasks WHERE id = ?`);
     const result = stmt.run(id) as { changes?: number };
     return (result.changes ?? 0) > 0;
   }
@@ -117,28 +132,32 @@ export class Tracker {
       query += ` AND status IN ('pending', 'in_progress')`;
     }
 
-    query += ` ORDER BY deadline ASC, priority DESC, created_at DESC`;
-    const stmt = this.db.prepare(query);
+    query += ` ORDER BY (deadline IS NULL), deadline ASC, priority DESC, created_at DESC`;
+    const stmt = this.ensureDb().prepare(query);
     return stmt.all(...params) as Task[];
   }
 
   getSummary(): { total: number; pending: number; in_progress: number; completed: number; failed: number; overdue: number } {
     const now = new Date().toISOString();
-    const stmt = this.db.prepare(`
-      SELECT 
+    // COALESCE: SUM over zero rows is NULL, and callers expect numbers.
+    const stmt = this.ensureDb().prepare(`
+      SELECT
         COUNT(*) as total,
-        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
-        SUM(CASE WHEN deadline < ? AND status NOT IN ('completed', 'cancelled') THEN 1 ELSE 0 END) as overdue
+        COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) as pending,
+        COALESCE(SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END), 0) as in_progress,
+        COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) as completed,
+        COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) as failed,
+        COALESCE(SUM(CASE WHEN deadline < ? AND status NOT IN ('completed', 'cancelled') THEN 1 ELSE 0 END), 0) as overdue
       FROM tasks
     `);
     return stmt.get(now) as { total: number; pending: number; in_progress: number; completed: number; failed: number; overdue: number };
   }
 
   close(): void {
-    this.db.close();
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
   }
 }
 

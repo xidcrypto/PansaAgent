@@ -22,21 +22,36 @@ export function secretsLoad(passphrase: string): SecretsStore {
   const raw = JSON.parse(readFileSync(SECRETS_FILE, "utf8")) as { [key: string]: unknown };
   const out: SecretsStore = {};
   for (const [key, value] of Object.entries(raw)) {
-    if (typeof value === "string") {
-      try {
-        const payload = JSON.parse(value) as EncryptedPayload;
-        const plain = decrypt(payload, passphrase);
-        out[key] = plain.toString("utf8");
-        zeroize(plain);
-      } catch {
-        // not encrypted or wrong passphrase -> keep as-is? No, skip
-        out[key] = String(value);
-      }
-    } else {
+    if (typeof value !== "string") {
       out[key] = String(value);
+      continue;
+    }
+    if (looksEncrypted(value)) {
+      // Fail hard: decrypt throws on a wrong passphrase instead of
+      // silently returning ciphertext as the "value".
+      const payload = JSON.parse(value) as EncryptedPayload;
+      const plain = decrypt(payload, passphrase);
+      out[key] = plain.toString("utf8");
+      zeroize(plain);
+    } else {
+      // Plaintext legacy value, kept as-is.
+      out[key] = value;
     }
   }
   return out;
+}
+
+function looksEncrypted(value: string): boolean {
+  try {
+    const p = JSON.parse(value) as Partial<EncryptedPayload>;
+    return typeof p === "object" && p !== null &&
+      typeof p.ciphertext === "string" &&
+      typeof p.iv === "string" &&
+      typeof p.tag === "string" &&
+      typeof p.salt === "string";
+  } catch {
+    return false;
+  }
 }
 
 export function secretsSave(store: SecretsStore, passphrase: string): void {

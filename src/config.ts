@@ -1,4 +1,6 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import type { PolicyConfig as SignerPolicyConfig } from "./signer/transactions.js";
 
 export const PANSA_DIR = `${process.env.HOME ?? process.env.USERPROFILE ?? ""}/.pansa`;
 export const CONFIG_FILE = `${PANSA_DIR}/config.json`;
@@ -34,12 +36,11 @@ export interface ChainConfig {
   gasPriceCap?: string;
 }
 
-export interface PolicyConfig {
-  defaultDeny: boolean;
-  testnetOnly: boolean;
-  mainnetEnabled: boolean;
-  chains: Record<string, ChainConfig>;
-}
+// The canonical policy shape is the signer's (M9). The old config-local
+// PolicyConfig (defaultDeny/chains) is retired; anything that read
+// config.policy now sees the signer shape, and enforcement always loads
+// policy.json through the single loader in signer/transactions.ts.
+export type PolicyConfig = SignerPolicyConfig;
 
 export interface GatewayConfig {
   enabled: boolean;
@@ -54,6 +55,9 @@ export interface PansaConfig {
   preferCheap?: string[];
   concurrency?: number;
   ttlMs?: number;
+  // EVM JSON-RPC endpoint for balance lookup, testnet detection,
+  // simulation and broadcast. Env PANSA_EVM_RPC overrides this.
+  evmRpc?: string;
   policy?: PolicyConfig;
   gateways?: Record<string, GatewayConfig>;
   mcpServers?: Record<string, string>;
@@ -76,6 +80,7 @@ export function loadConfig(): PansaConfig {
 }
 
 export function saveConfig(cfg: PansaConfig): void {
+  mkdirSync(dirname(CONFIG_FILE), { recursive: true, mode: 0o700 });
   writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
 }
 
@@ -93,14 +98,10 @@ export function modelForTask(
 
 export function defaultPolicy(): PolicyConfig {
   return {
-    defaultDeny: true,
+    spendCapPerTx: 0.01,
+    spendCapPerDay: 0.05,
+    allowedChains: ["evm", "solana", "sui", "aptos"],
+    requireConfirmation: true,
     testnetOnly: true,
-    mainnetEnabled: false,
-    chains: {
-      evm: { enabled: true, testnetOnly: true, maxNativePerTx: "0.01", maxNativePerDay: "0.05" },
-      solana: { enabled: true, testnetOnly: true, maxNativePerTx: "0.01", maxNativePerDay: "0.05" },
-      sui: { enabled: true, testnetOnly: true, maxNativePerTx: "0.01", maxNativePerDay: "0.05" },
-      aptos: { enabled: true, testnetOnly: true, maxNativePerTx: "0.01", maxNativePerDay: "0.05" },
-    },
   };
 }

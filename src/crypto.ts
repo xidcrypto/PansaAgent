@@ -7,7 +7,12 @@ const SCRYPT_N = 2 ** 17;
 const SCRYPT_R = 8;
 const SCRYPT_P = 1;
 const SCRYPT_KEYLEN = 32;
-const SCRYPT_MAXMEM = SCRYPT_N * SCRYPT_R * 16 * 1024 * 1024;
+// One shared maxmem formula for encrypt and decrypt (D2). The value is a
+// ceiling, not an allocation; it must stay well above scrypt's working
+// set (~128 * N * r bytes).
+function scryptMaxMem(N: number, r: number): number {
+  return N * r * 16 * 1024 * 1024;
+}
 
 export interface EncryptedPayload {
   ciphertext: string;
@@ -24,7 +29,7 @@ export function encrypt(plaintext: Buffer, passphrase: string): EncryptedPayload
     N: SCRYPT_N,
     r: SCRYPT_R,
     p: SCRYPT_P,
-    maxmem: SCRYPT_MAXMEM,
+    maxmem: scryptMaxMem(SCRYPT_N, SCRYPT_R),
   });
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   cipher.setAAD(Buffer.from("pansa-v1", "utf8"));
@@ -49,7 +54,7 @@ export function decrypt(payload: EncryptedPayload, passphrase: string): Buffer {
     N: payload.scrypt.N ?? SCRYPT_N,
     r: payload.scrypt.r ?? SCRYPT_R,
     p: payload.scrypt.p ?? SCRYPT_P,
-    maxmem: (payload.scrypt.N ?? SCRYPT_N) * (payload.scrypt.r ?? SCRYPT_R) * 1024 * 1024,
+    maxmem: scryptMaxMem(payload.scrypt.N ?? SCRYPT_N, payload.scrypt.r ?? SCRYPT_R),
   });
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
@@ -69,6 +74,12 @@ export function verifyPassphrase(payload: EncryptedPayload, passphrase: string):
 }
 
 export function constantTimeCompare(a: Buffer, b: Buffer): boolean {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  // Length-hiding: always compare max(len) bytes, so an early return on
+  // length mismatch cannot leak the expected length (D3).
+  const len = Math.max(a.length, b.length);
+  const paddedA = Buffer.alloc(len);
+  const paddedB = Buffer.alloc(len);
+  a.copy(paddedA);
+  b.copy(paddedB);
+  return timingSafeEqual(paddedA, paddedB) && a.length === b.length;
 }

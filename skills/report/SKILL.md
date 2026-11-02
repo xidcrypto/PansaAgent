@@ -1,28 +1,27 @@
 ---
 name: report
-description: Generate airdrop farming reports and summaries
+description: Generate airdrop farming reports from real tracker tasks
 ---
 
 # Report Skill
 
-Generates comprehensive reports on airdrop farming activities.
+Generates a report from the real task database. Nothing is estimated or
+invented: counts come from stored tasks.
 
 ## Parameters
 
-- `type` (string): scam_report, risk_report, task_report, earnings_report
-- `period` (string): Time period (7d, 30d, all)
-- `include_data` (boolean): Include detailed transaction data
+- `period` (string): `7d`, `30d`, or `all` (default `all`). Tasks are
+  filtered by creation date inside the window.
 
 ## Output
 
-- Summary statistics
-- Earnings breakdown
-- Risk analysis
-- Task completion rate
-- Recommendations
+- Summary statistics (total, pending, in progress, completed, failed,
+  overdue — zero on an empty database, never null)
+- Tasks by status, including `cancelled`
+- Task list for the period
 
 ## Example
 
 ```
-/report type=earnings_report period=30d include_data=true
+/report period=30d
 ```
