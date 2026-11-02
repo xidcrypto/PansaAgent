@@ -53,7 +53,7 @@ jobs:
       - run: npm pack --dry-run
       - name: Verify package contents
         run: |
-          CONTENTS=$(npm pack --dry-run 2>&1 | grep -E '^\s+(dist|skills|prompts|README|LICENSE|package\.json)')
+          CONTENTS=$(npm pack --dry-run 2>&1 | grep -E ' (dist|skills|prompts|README|LICENSE|package\.json)')
           echo "$CONTENTS"
           echo "$CONTENTS" | grep -q "dist/" || exit 1
           echo "$CONTENTS" | grep -q "skills/" || exit 1
