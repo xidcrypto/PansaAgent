@@ -24,8 +24,9 @@
 //   or secret values.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { cpus, freemem, loadavg, totalmem, uptime } from "node:os";
-import { statfsSync } from "node:fs";
+import { cpus, freemem, loadavg, totalmem, uptime, homedir } from "node:os";
+import { statfsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult } from "../providers/index.js";
 
@@ -41,6 +42,31 @@ export interface ProviderStore {
 
 function sha256(s: string): Buffer {
   return createHash("sha256").update(s, "utf8").digest();
+}
+
+// Dashboard password: only its sha256 hash is ever stored, never the
+// password itself. A hash file written by POST /api/password wins over
+// opts/env/default on the next start, so a changed password survives
+// restarts without editing env. Path resolves lazily (os.homedir reads
+// $HOME per call) so tests can isolate it with a temp HOME.
+function dashboardPasswordFile(): string {
+  return join(homedir(), ".pansa", "dashboard-password");
+}
+
+function readStoredPasswordHash(): Buffer | null {
+  try {
+    const text = readFileSync(dashboardPasswordFile(), "utf8").trim();
+    if (!/^[0-9a-f]{64}$/.test(text)) return null;
+    return Buffer.from(text, "hex");
+  } catch {
+    return null;
+  }
+}
+
+function storePasswordHash(hash: Buffer): void {
+  const file = dashboardPasswordFile();
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, hash.toString("hex"), { mode: 0o600 });
 }
 
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -361,7 +387,22 @@ h2{font-size:.9rem;letter-spacing:.08em;text-transform:uppercase;margin:32px 0 1
 .live{display:flex;align-items:center;gap:8px;font-size:.9rem;font-weight:700}
 .dot{width:12px;height:12px;background:#B9FF66;border:2px solid #000}
 .dot.off{background:#FF6B6B}
-button{border:3px solid #000;background:#fff;color:#000;border-radius:0;padding:8px 14px;cursor:pointer;font:inherit;font-weight:800;box-shadow:4px 4px 0 #000}
+button{border:3px solid #000;background:#fff;color:#000;border-radius:0;padding:8px 14px;cursor:pointer;font:inherit;font-weight:800;box-shadow:4px 4px 0 #000;transition:transform .08s,box-shadow .08s}
+button:active{transform:translate(4px,4px);box-shadow:0 0 0 #000}
+button:disabled{opacity:.55;cursor:wait}
+section{animation:secin .25s ease}
+@keyframes secin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+#dot:not(.off){animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(0,0,0,.35)}50%{box-shadow:0 0 0 6px rgba(0,0,0,0)}}
+#toasts{position:fixed;top:16px;right:16px;z-index:50;display:flex;flex-direction:column;gap:10px;max-width:340px}
+.toast{border:3px solid #000;box-shadow:4px 4px 0 #000;padding:12px 14px;font-weight:800;animation:toastin .25s ease;cursor:pointer}
+.toast.ok{background:#B9FF66}
+.toast.bad{background:#FF6B6B}
+.toast.info{background:#FFDC58}
+.toast.out{opacity:0;transition:opacity .3s}
+@keyframes toastin{from{opacity:0;transform:translateX(30px)}to{opacity:1;transform:none}}
+#custom-rows tr.flash td{animation:flashfade 2.5s forwards}
+@keyframes flashfade{from{background:#FFDC58}to{background:transparent}}
 button:active{transform:translate(4px,4px);box-shadow:0 0 0 #000}
 input,textarea,select{color:#000;background:#fff}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
@@ -447,8 +488,15 @@ async function api(path,method,body){
   if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
   return j;
 }
+function toast(msg,kind){
+  const box=document.getElementById("toasts"); if(!box) return;
+  const t=document.createElement("div"); t.className="toast "+(kind||"info"); t.textContent=msg;
+  t.addEventListener("click",()=>t.remove()); box.appendChild(t);
+  setTimeout(()=>{ t.classList.add("out"); setTimeout(()=>t.remove(),350); },4500);
+}
 let customCache=[];
 let armedDel="";
+let lastTouchedId="";
 function modelChips(p){ const off=new Set(p.disabledModels||[]); if(!p.models.length) return "(tidak ada model)"; return p.models.map(m=>'<button type="button" data-act="model" data-id="'+esc(p.id)+'" data-model="'+esc(m)+'">'+(off.has(m)?'✗ ':'✓ ')+esc(m)+'</button>').join(" "); }
 function customRowsHtml(list){
   if(!list.length) return '<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>';
@@ -457,25 +505,32 @@ function customRowsHtml(list){
 function renderCustom(list){
   customCache=list;
   document.getElementById("custom-rows").innerHTML=customRowsHtml(list);
+  if(lastTouchedId){
+    const btns=document.getElementById("custom-rows").querySelectorAll("button[data-id]");
+    btns.forEach(b=>{ if(b.getAttribute("data-id")===lastTouchedId){ const tr=b.closest("tr"); if(tr) tr.classList.add("flash"); } });
+  }
 }
 async function refreshCustom(){
   const j=await api("api/providers","GET");
   renderCustom(j.providers||[]);
 }
 document.getElementById("custom-rows").addEventListener("click",async e=>{
-  const btn=e.target.closest("button[data-act]"); if(!btn) return;
+  const btn=e.target.closest("button[data-act]"); if(!btn||btn.disabled) return;
   const id=btn.getAttribute("data-id"); const act=btn.getAttribute("data-act");
   const msg=document.getElementById("provider-msg");
+  btn.disabled=true;
   try{
     let doneMsg="";
     if(act==="del"){ if(armedDel!==id){ armedDel=id; renderCustom(customCache); setTimeout(()=>{ if(armedDel===id){ armedDel=""; renderCustom(customCache); } },5000); return; } armedDel=""; await api("api/providers/"+encodeURIComponent(id),"DELETE"); doneMsg="Provider dihapus."; }
-    else if(act==="toggle"){ const cur=customCache.find(x=>x.id===id); if(!cur) return; await api("api/providers/"+encodeURIComponent(id),"PUT",{enabled:!cur.enabled}); doneMsg="Status provider diubah."; }
-    else if(act==="model"){ const model=btn.getAttribute("data-model"); const cur=customCache.find(x=>x.id===id); if(!cur||!model) return; const off=(cur.disabledModels||[]).includes(model); await api("api/providers/"+encodeURIComponent(id)+"/model","POST",{model,enabled:off}); doneMsg=off?("Model diaktifkan: "+model):("Model dinonaktifkan: "+model); }
-    else if(act==="test"){ const res=await api("api/providers/"+encodeURIComponent(id)+"/test","POST"); msg.textContent=res.ok?("Uji OK: "+res.count+" model ("+(res.sample||[]).join(", ")+")"):("Uji gagal: "+res.error); return; }
-    else if(act==="edit"){ let p=customCache.find(x=>x.id===id); if(!p){ await refreshCustom(); p=customCache.find(x=>x.id===id); } if(!p){ msg.textContent="Error: provider tidak ditemukan, coba muat ulang halaman."; return; } document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); renderModelList(p.models,p.disabledModels||[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
+    else if(act==="toggle"){ const cur=customCache.find(x=>x.id===id); if(!cur) return; await api("api/providers/"+encodeURIComponent(id),"PUT",{enabled:!cur.enabled}); lastTouchedId=id; doneMsg="Status provider diubah."; }
+    else if(act==="model"){ const model=btn.getAttribute("data-model"); const cur=customCache.find(x=>x.id===id); if(!cur||!model) return; const off=(cur.disabledModels||[]).includes(model); await api("api/providers/"+encodeURIComponent(id)+"/model","POST",{model,enabled:off}); lastTouchedId=id; doneMsg=off?("Model diaktifkan: "+model):("Model dinonaktifkan: "+model); }
+    else if(act==="test"){ const res=await api("api/providers/"+encodeURIComponent(id)+"/test","POST"); msg.textContent=res.ok?("Uji OK: "+res.count+" model ("+(res.sample||[]).join(", ")+")"):("Uji gagal: "+res.error); toast(msg.textContent,res.ok?"ok":"bad"); return; }
+    else if(act==="edit"){ let p=customCache.find(x=>x.id===id); if(!p){ await refreshCustom(); p=customCache.find(x=>x.id===id); } if(!p){ msg.textContent="Error: provider tidak ditemukan, coba muat ulang halaman."; toast(msg.textContent,"bad"); return; } document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); renderModelList(p.models,p.disabledModels||[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
     await refreshCustom();
     msg.textContent=doneMsg;
-  }catch(err){ msg.textContent="Error: "+err.message; }
+    if(doneMsg) toast(doneMsg,"ok");
+  }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
+  finally{ btn.disabled=false; }
 });
 function renderModelList(models,disabled){
   const box=document.getElementById("pf-models-list"); if(!box) return;
@@ -493,21 +548,29 @@ function readModelList(){
   return {models,disabled};
 }
 document.getElementById("provider-connect").addEventListener("click",async()=>{
+  const btn=document.getElementById("provider-connect"); if(btn.disabled) return;
   const msg=document.getElementById("provider-msg");
   const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value;
-  if(!baseUrl){ msg.textContent="Error: isi Base URL dulu sebelum Connect."; return; }
+  if(!baseUrl){ msg.textContent="Error: isi Base URL dulu sebelum Connect."; toast(msg.textContent,"bad"); return; }
+  btn.disabled=true; const oldLabel=btn.textContent; btn.textContent="Menghubungkan…";
   msg.textContent="Menghubungkan, mengambil daftar model…";
   try{
     const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined});
-    if(!res.ok){ msg.textContent="Connect gagal: "+(res.error||"tidak diketahui"); return; }
+    if(!res.ok){ msg.textContent="Connect gagal: "+(res.error||"tidak diketahui"); toast(msg.textContent,"bad"); return; }
     const models=res.models||[];
     document.getElementById("pf-models").value=models.join(", ");
     renderModelList(models,[]);
     msg.textContent=models.length?("Connect OK: "+models.length+" model ditemukan, centang yang aktif lalu Simpan."):("Connect OK: endpoint tidak mengembalikan model, isi manual di kolom Model.");
-  }catch(err){ msg.textContent="Error: "+err.message; }
+    toast(msg.textContent,"ok");
+  }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
+  finally{ btn.disabled=false; btn.textContent=oldLabel; }
 });
+let submitting=false;
 document.getElementById("provider-form").addEventListener("submit",async e=>{
   e.preventDefault();
+  if(submitting) return;
+  submitting=true;
+  const submitBtn=document.querySelector('#provider-form button[type="submit"]'); if(submitBtn) submitBtn.disabled=true;
   const msg=document.getElementById("provider-msg");
   const id=document.getElementById("pf-id").value;
   const picked=readModelList();
@@ -515,12 +578,16 @@ document.getElementById("provider-form").addEventListener("submit",async e=>{
   if(picked) payload.disabledModels=picked.disabled;
   const key=document.getElementById("pf-key").value; if(key) payload.apiKey=key;
   try{
-    if(id) await api("api/providers/"+encodeURIComponent(id),"PUT",payload);
-    else await api("api/providers","POST",payload);
+    let saved=null;
+    if(id) saved=await api("api/providers/"+encodeURIComponent(id),"PUT",payload);
+    else saved=await api("api/providers","POST",payload);
+    if(saved&&saved.provider) lastTouchedId=saved.provider.id;
     document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
     await refreshCustom();
     msg.textContent="Provider tersimpan.";
-  }catch(err){ msg.textContent="Error: "+err.message; }
+    toast(msg.textContent,"ok");
+  }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
+  finally{ submitting=false; if(submitBtn) submitBtn.disabled=false; }
 });
 document.getElementById("provider-cancel").addEventListener("click",()=>{
   document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
@@ -548,21 +615,45 @@ function render(d){
     renderCustom(d.customProviders);
   }
 }
-async function tick(){
+async function manualRefresh(){
   try{
     const r=await fetch("api/status",{cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const d=await r.json(); render(d);
     document.getElementById("dot").className="dot";
-    document.getElementById("updated").textContent="diperbarui "+new Date().toLocaleTimeString("id-ID");
+    document.getElementById("updated").textContent="live · "+new Date().toLocaleTimeString("id-ID");
   }catch(e){
     document.getElementById("dot").className="dot off";
     document.getElementById("updated").textContent="koneksi terputus — mencoba lagi…";
   }
 }
-document.getElementById("refresh").addEventListener("click",tick);
-tick();
-setInterval(tick,3000);
+document.getElementById("refresh").addEventListener("click",manualRefresh);
+document.getElementById("password-form").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const btn=document.querySelector('#password-form button[type="submit"]'); if(btn&&btn.disabled) return;
+  const msg=document.getElementById("password-msg");
+  const current=document.getElementById("pw-current").value;
+  const next=document.getElementById("pw-next").value;
+  const confirm=document.getElementById("pw-confirm").value;
+  if(next!==confirm){ msg.textContent="Error: password baru tidak sama dengan ulangannya."; toast(msg.textContent,"bad"); return; }
+  if(btn) btn.disabled=true;
+  try{
+    await api("api/password","POST",{current,next});
+    document.getElementById("pw-current").value=""; document.getElementById("pw-next").value=""; document.getElementById("pw-confirm").value="";
+    msg.textContent="Password berhasil diganti. Sesi lain sudah dicabut.";
+    toast(msg.textContent,"ok");
+  }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
+  finally{ if(btn) btn.disabled=false; }
+});
+let es=null; let lastAuthCheck=0;
+function startEvents(){
+  if(es) es.close();
+  es=new EventSource("api/events");
+  es.onmessage=e=>{ try{ const d=JSON.parse(e.data); render(d); document.getElementById("dot").className="dot"; document.getElementById("updated").textContent="live · "+new Date().toLocaleTimeString("id-ID"); }catch(err){} };
+  es.onerror=()=>{ document.getElementById("dot").className="dot off"; document.getElementById("updated").textContent="koneksi terputus — mencoba lagi…"; const now=Date.now(); if(now-lastAuthCheck>10000){ lastAuthCheck=now; fetch("api/status",{cache:"no-store"}).then(r=>{ if(r.status===401) location=dashPrefix+"/login"; }).catch(()=>{}); } };
+}
+startEvents();
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden && es && es.readyState===EventSource.CLOSED) startEvents(); });
 `;
 
 function providerStatusHtml(providers: ProvidersInfo): string {
@@ -648,6 +739,17 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 </div>
 <h2>Konfigurasi</h2>
 <div class="card" id="cfg">Model: ${escapeHtml(data.models.join(", ") || "(tidak ada)")}<br>Gateway Telegram: ${data.gatewayEnabled ? "aktif" : "nonaktif"} · pengguna terdaftar: ${data.gatewayAllowedUsers}<br>Testnet only: ${data.testnetOnly === undefined ? "tidak diketahui" : data.testnetOnly ? "ya" : "tidak"}<br>Tugas terjadwal pending: ${data.scheduledPending} dari ${data.scheduledTotal} · Price alert aktif: ${data.alertsActive} dari ${data.alertsTotal}</div>
+<h2>Ganti password</h2>
+<div class="card"><form id="password-form">
+<div class="label" style="margin-bottom:6px">Password saat ini</div>
+<input id="pw-current" type="password" autocomplete="current-password" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px">
+<div class="label" style="margin-bottom:6px">Password baru (minimal 8 karakter)</div>
+<input id="pw-next" type="password" autocomplete="new-password" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px">
+<div class="label" style="margin-bottom:6px">Ulangi password baru</div>
+<input id="pw-confirm" type="password" autocomplete="new-password" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px">
+<div style="margin-top:6px"><button type="submit">Ganti password</button></div>
+<p class="note" id="password-msg"></p>
+</form></div>
 </section>
 <section id="sec-provider">
 <h2>Provider</h2>
@@ -702,7 +804,7 @@ ${alertRows(data.alerts)}</tbody></table></div>
 <pre class="log" id="logs">${data.logs.length ? escapeHtml(data.logs.join("\n")) : "(tidak ada log yang dikonfigurasi — set PANSA_DASHBOARD_LOG ke path file log.)"}</pre>
 </section>
 <p class="note">Untuk saldo, jalankan <code>pansa portfolio</code>. Log yang tampil sudah disaring dari nilai yang tampak seperti secret.</p>
-</div></main></div><script>${JS}</script></body></html>`;
+</div></main></div><div id="toasts"></div><script>${JS}</script></body></html>`;
 }
 
 export async function startDashboard(opts: {
@@ -718,11 +820,87 @@ export async function startDashboard(opts: {
   if (opts.host !== undefined && opts.host !== "127.0.0.1" && opts.host !== "localhost") {
     throw new Error("Dashboard hanya boleh bind ke 127.0.0.1 (loopback).");
   }
-  const expectedHash = sha256(opts.password ?? process.env.PANSA_DASHBOARD_PASSWORD ?? "password");
+  const expectedHashInit =
+    readStoredPasswordHash() ?? sha256(opts.password ?? process.env.PANSA_DASHBOARD_PASSWORD ?? "password");
+  let expectedHash = expectedHashInit;
   const sessions = new Set<string>();
   const isAuthed = (req: IncomingMessage): boolean => {
     const token = parseCookies(req.headers.cookie).pansa_session;
     return typeof token === "string" && sessions.has(token);
+  };
+  // Satu payload status untuk /api/status dan stream SSE.
+  const buildStatus = async () => {
+    const raw = await opts.data();
+    const data: DashboardData = { ...raw, logs: raw.logs.map(redactLogLine) };
+    const system = collectSystemMetrics();
+    const providers = await getProvidersInfo(
+      opts.daemonBase ?? process.env.PANSA_LLM_BASE ?? "http://127.0.0.1:17070",
+    );
+    const customProviders = opts.providers ? opts.providers.list() : [];
+    return { ...data, system, providers, customProviders, readOnly: false, host: "127.0.0.1" };
+  };
+  // SSE, bukan polling: client membuka SATU stream; server yang mendorong
+  // snapshot. Satu timer server melayani semua tab (bukan satu timer per
+  // tab), dan setiap mutasi provider mendorong snapshot baru seketika.
+  // Heartbeat 5 detik menjaga stream tetap hidup lewat proxy (nginx
+  // /pansa/ menutup koneksi yang diam 10 detik) dan header
+  // X-Accel-Buffering menonaktifkan buffering proxy untuk respons ini.
+  const sseClients = new Set<ServerResponse>();
+  let sseTimer: ReturnType<typeof setInterval> | null = null;
+  let sseHeartbeat: ReturnType<typeof setInterval> | null = null;
+  let sseBusy = false;
+  let sseDirty = false;
+  const ssePush = (payload: string) => {
+    for (const client of [...sseClients]) {
+      try {
+        client.write(`data: ${payload}\n\n`);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+  };
+  const sseBroadcast = async () => {
+    if (sseBusy) {
+      sseDirty = true;
+      return;
+    }
+    sseBusy = true;
+    try {
+      ssePush(JSON.stringify(await buildStatus()));
+    } catch {
+      // Stream tetap hidup lewat heartbeat; tick berikutnya mencoba lagi.
+    }
+    sseBusy = false;
+    if (sseDirty) {
+      sseDirty = false;
+      void sseBroadcast();
+    }
+  };
+  const sseEnsureTimers = () => {
+    if (sseTimer) return;
+    sseTimer = setInterval(() => {
+      void sseBroadcast();
+    }, 3000);
+    sseHeartbeat = setInterval(() => {
+      for (const client of [...sseClients]) {
+        try {
+          client.write(": ping\n\n");
+        } catch {
+          sseClients.delete(client);
+        }
+      }
+    }, 5000);
+  };
+  const sseStopTimersIfIdle = () => {
+    if (sseClients.size === 0) {
+      if (sseTimer) clearInterval(sseTimer);
+      sseTimer = null;
+      if (sseHeartbeat) clearInterval(sseHeartbeat);
+      sseHeartbeat = null;
+    }
+  };
+  const sseNotifyMutation = () => {
+    void sseBroadcast();
   };
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
@@ -773,7 +951,55 @@ export async function startDashboard(opts: {
         }
         return;
       }
+      // Ganti password dashboard (session-gated). Sesi lain dicabut,
+      // sesi pemohon dipertahankan supaya tidak langsung terlempar.
+      if (url.pathname === "/api/password" && req.method === "POST") {
+        const body = (await readJsonBody(req)) as { current?: unknown; next?: unknown };
+        const current = typeof body.current === "string" ? body.current : "";
+        const next = typeof body.next === "string" ? body.next : "";
+        const fail = (error: string) => {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error }));
+        };
+        if (!timingSafeEqual(sha256(current), expectedHash)) {
+          fail("Password saat ini salah.");
+          return;
+        }
+        if (next.length < 8) {
+          fail("Password baru minimal 8 karakter.");
+          return;
+        }
+        if (timingSafeEqual(sha256(next), expectedHash)) {
+          fail("Password baru harus berbeda dari yang lama.");
+          return;
+        }
+        const hash = sha256(next);
+        storePasswordHash(hash);
+        expectedHash = hash;
+        const mine = parseCookies(req.headers.cookie).pansa_session;
+        for (const token of [...sessions]) if (token !== mine) sessions.delete(token);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
       // Provider CRUD (session-gated; keys never leave the server).
+      if (url.pathname === "/api/events" && req.method === "GET") {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+        });
+        res.write(": connected\n\n");
+        sseClients.add(res);
+        sseEnsureTimers();
+        void sseBroadcast();
+        req.on("close", () => {
+          sseClients.delete(res);
+          sseStopTimersIfIdle();
+        });
+        return;
+      }
       if (url.pathname === "/api/providers" || url.pathname.startsWith("/api/providers/")) {
         if (!opts.providers) {
           res.writeHead(501, { "Content-Type": "application/json" });
@@ -790,6 +1016,7 @@ export async function startDashboard(opts: {
           if (rest === "" && req.method === "POST") {
             const input = (await readJsonBody(req)) as ProviderInput;
             const created = opts.providers.create(input);
+            sseNotifyMutation();
             res.writeHead(201, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ provider: created }));
             return;
@@ -815,6 +1042,7 @@ export async function startDashboard(opts: {
               const body = (await readJsonBody(req)) as { model?: string; enabled?: boolean };
               if (!body.model || typeof body.enabled !== "boolean") throw new Error("Butuh model dan enabled.");
               const updated = opts.providers.setModel(id, body.model, body.enabled);
+              sseNotifyMutation();
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ provider: updated }));
               return;
@@ -822,12 +1050,14 @@ export async function startDashboard(opts: {
             if (req.method === "PUT") {
               const patch = (await readJsonBody(req)) as Partial<ProviderInput>;
               const updated = opts.providers.update(id, patch);
+              sseNotifyMutation();
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ provider: updated }));
               return;
             }
             if (req.method === "DELETE") {
               opts.providers.remove(id);
+              sseNotifyMutation();
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ ok: true }));
               return;
@@ -848,19 +1078,13 @@ export async function startDashboard(opts: {
         return;
       }
       if (url.pathname === "/" || url.pathname === "/api/status") {
-        const raw = await opts.data();
-        const data: DashboardData = { ...raw, logs: raw.logs.map(redactLogLine) };
-        const system = collectSystemMetrics();
-        const providers = await getProvidersInfo(
-          opts.daemonBase ?? process.env.PANSA_LLM_BASE ?? "http://127.0.0.1:17070",
-        );
-        const customProviders = opts.providers ? opts.providers.list() : [];
+        const status = await buildStatus();
         if (url.pathname === "/") {
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(renderDashboardHtml(data, system, providers, customProviders));
+          res.end(renderDashboardHtml(status, status.system, status.providers, status.customProviders));
         } else {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ...data, system, providers, customProviders, readOnly: false, host: "127.0.0.1" }));
+          res.end(JSON.stringify(status));
         }
         return;
       }
@@ -879,6 +1103,10 @@ export async function startDashboard(opts: {
     port,
     close: () =>
       new Promise<void>((resolve, reject) => {
+        if (sseTimer) clearInterval(sseTimer);
+        sseTimer = null;
+        if (sseHeartbeat) clearInterval(sseHeartbeat);
+        sseHeartbeat = null;
         // Drop keep-alive connections first: otherwise close() waits
         // forever for a client (e.g. fetch's agent) that holds one open,
         // which also hangs Ctrl+C shutdown, not just tests.

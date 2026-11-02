@@ -413,6 +413,12 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     process.on("SIGINT", () => abort.abort());
     process.on("SIGTERM", () => abort.abort());
     process.stdout.write("Gateway Telegram berjalan (Ctrl+C untuk berhenti).\n");
+    // Menu button bot: best-effort, jangan pernah menggagalkan start
+    // gateway bila API Telegram sedang bermasalah.
+    await bot.setBotCommands().then(
+      () => process.stdout.write("Menu button Telegram diperbarui (daftar perintah).\n"),
+      (err) => process.stderr.write(`Menu button Telegram gagal diperbarui: ${err instanceof Error ? err.message : String(err)}\n`),
+    );
     await runGatewayLoop({
       bot,
       allowlist: () => loadConfig().gateways?.telegram?.allowlist ?? [],

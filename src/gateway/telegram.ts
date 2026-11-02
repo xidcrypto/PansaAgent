@@ -133,6 +133,23 @@ export class TelegramBot {
     return result ?? [];
   }
 
+  // Menu button bot (tombol Menu di aplikasi Telegram, BUKAN tombol
+  // inline di dalam chat): mengisi daftar perintah yang muncul saat
+  // pengguna mengetuk Menu. Tanpa ini tombol Menu kosong.
+  async setBotCommands(): Promise<void> {
+    await this.api("setMyCommands", {
+      commands: [
+        { command: "start", description: "Mulai dan info koneksi" },
+        { command: "help", description: "Daftar perintah PANSA" },
+        { command: "status", description: "Ringkasan doctor" },
+        { command: "schedule", description: "Tugas terjadwal yang pending" },
+        { command: "alerts", description: "Price alert yang aktif" },
+        { command: "provider", description: "Provider & model dari daemon" },
+        { command: "pair", description: "Hubungkan chat ini (kode dari pansa gateway pair)" },
+      ],
+    });
+  }
+
   async sendMessage(chatId: number, text: string, replyMarkup?: InlineKeyboardMarkup): Promise<void> {
     const chunks = splitMessage(text);
     for (let i = 0; i < chunks.length; i++) {
