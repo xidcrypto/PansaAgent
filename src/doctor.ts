@@ -53,6 +53,13 @@ export async function runDoctor(): Promise<DoctorCheck[]> {
     checks.push({ name: "scheduler", ok: false, detail: err instanceof Error ? err.message : String(err) });
   }
   try {
+    const { listAlerts } = await import("./alerts/index.js");
+    const active = listAlerts("active");
+    checks.push({ name: "alerts", ok: true, detail: `${active.length} alert aktif (tabel bisa dibaca)` });
+  } catch (err) {
+    checks.push({ name: "alerts", ok: false, detail: err instanceof Error ? err.message : String(err) });
+  }
+  try {
     const cfg = loadConfig();
     const gw = cfg.gateways?.telegram;
     checks.push({

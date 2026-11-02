@@ -167,6 +167,35 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]
   return { kind: "agent", userId, chatId, text };
 }
 
+export interface GatewayCommandDeps {
+  doctorText: () => Promise<string>;
+  scheduleText: () => string;
+  alertText: () => string;
+}
+
+// Deterministic gateway commands: answered without an LLM call (fast,
+// no model cost). Anything else falls through to the agent (null).
+// /balance and /portfolio are intentionally NOT deterministic here: they
+// need a configured wallet backend, and the agent's baw tool answers
+// them honestly when one is configured.
+export async function handleGatewayCommand(text: string, deps: GatewayCommandDeps): Promise<string | null> {
+  const cmd = text.trim().split(/\s+/)[0];
+  if (cmd === "/help") {
+    return [
+      "Perintah PANSA:",
+      "/status — ringkasan doctor (node, config, daemon, scheduler, gateway)",
+      "/schedule — tugas terjadwal yang masih pending",
+      "/alerts — price alert yang masih aktif",
+      "/pair <kode> — hubungkan chat ini (kode dari `pansa gateway pair`)",
+      "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
+    ].join("\n");
+  }
+  if (cmd === "/status") return deps.doctorText();
+  if (cmd === "/schedule") return deps.scheduleText();
+  if (cmd === "/alerts") return deps.alertText();
+  return null;
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function runGatewayLoop(opts: {

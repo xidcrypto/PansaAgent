@@ -15,7 +15,7 @@ import { walletRegistryLoad } from "./signer/keystore.js";
 import { getPolicy, savePolicy } from "./signer/policy.js";
 import { secretsLoad, secretsSave, secretsGet, secretsSet } from "./secrets.js";
 import { runDoctor, formatDoctor } from "./doctor.js";
-import { resolveEvmRpc, getEvmBalance, formatEth } from "./evm-rpc.js";
+import { resolveEvmRpc, getEvmBalance, formatEth, evmPublicClient } from "./evm-rpc.js";
 import { buildAgentToolsWithMcp } from "./tools.js";
 import { humanConfirm, humanReject } from "./human-confirm.js";
 import { TUI } from "./ui/index.js";
@@ -23,9 +23,12 @@ import { resolveRestore, startRunSession, finishRunSession } from "./session-flo
 import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
-import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed } from "./gateway/telegram.js";
+import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
+import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
+import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
+import type { ScoutRpc } from "./scout/index.js";
 
 // Pure restore flags (no command, no other flags) open the TUI with a
 // session restore: `pansa -c` (last session) or `pansa --resume <id>`.
@@ -69,6 +72,8 @@ Usage:
   pansa update             Cek pembaruan (hanya info, tidak auto-install)
   pansa gateway [status|pair|start]
   pansa schedule [add|list|cancel|run-once|watch]
+  pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
+  pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
   pansa mcp [list|tools|call]
   pansa browse <url>       Baca halaman web (butuh browser: true + playwright)
   pansa setup              Buat direktori + config/policy default
@@ -222,6 +227,10 @@ export async function main(argv: string[]): Promise<number> {
       return gatewayCmd(rest);
     case "schedule":
       return scheduleCmd(rest);
+    case "alert":
+      return alertCmd(rest);
+    case "scout":
+      return scoutCmd(rest);
     case "mcp":
       return mcpCmd(rest);
     case "browse":
@@ -330,6 +339,22 @@ async function gatewayCmd(rest: string[]): Promise<number> {
         saveConfig(c);
       },
       onAgentText: async (_userId, _chatId, text) => {
+        // Deterministic commands answer without an LLM call (fast, no
+        // model cost). Anything else goes to the agent.
+        const direct = await handleGatewayCommand(text, {
+          doctorText: async () => formatDoctor(await runDoctor()),
+          scheduleText: () => {
+            const pending = listScheduled("pending");
+            if (!pending.length) return "Tugas terjadwal: (kosong)";
+            return pending.map((t) => `${t.id} | ${t.run_at} | ${t.prompt.slice(0, 80)}`).join("\n");
+          },
+          alertText: () => {
+            const active = listAlerts("active");
+            if (!active.length) return "Price alert aktif: (kosong)";
+            return active.map((a) => `${a.id} | ${a.token} ${a.op} $${a.price_usd}${a.note ? ` | ${a.note}` : ""}`).join("\n");
+          },
+        }).catch(() => null);
+        if (direct !== null) return direct;
         try {
           return await agentAnswer(text, tools);
         } catch (err) {
@@ -409,12 +434,95 @@ async function scheduleCmd(rest: string[]): Promise<number> {
       for (const t of due) {
         process.stdout.write(`${t.id}: dijalankan @ ${new Date().toISOString()}.\n`);
       }
+      // Price alerts ride the same cycle: a crossing prints once here
+      // (the alert is marked triggered, so it never re-fires).
+      const triggered = await checkAlerts().catch(() => []);
+      for (const { alert, price } of triggered) {
+        process.stdout.write(`ALERT: ${alert.token} ${alert.op} $${alert.price_usd} tercapai (harga $${price})${alert.note ? ` — ${alert.note}` : ""}\n`);
+      }
       await sleepAbortable(60000);
     }
     return 0;
   }
   process.stderr.write("Usage: pansa schedule [add <ISO-time> \"<prompt>\"|list|cancel <id>|run-once|watch]\n");
   return 1;
+}
+
+async function alertCmd(rest: string[]): Promise<number> {
+  const sub = rest[0];
+  if (sub === "add") {
+    const [token, op, priceRaw, ...noteParts] = rest.slice(1);
+    const price = priceRaw === undefined ? NaN : parseFloat(priceRaw);
+    if (!token || (op !== ">=" && op !== "<=") || !Number.isFinite(price)) {
+      process.stderr.write("Usage: pansa alert add <token-address> <>=|<= > <price-usd> [note]\n");
+      return 1;
+    }
+    const alert = addAlert(token, op, price, noteParts.join(" "));
+    process.stdout.write(`Alert dibuat: ${alert.id} | ${token} ${op} $${price}\n`);
+    return 0;
+  }
+  if (sub === "list") {
+    const alerts = listAlerts();
+    if (!alerts.length) {
+      process.stdout.write("Price alert: (kosong)\n");
+      return 0;
+    }
+    for (const a of alerts) {
+      process.stdout.write(`${a.id} | ${a.token} ${a.op} $${a.price_usd} | ${a.status}${a.note ? ` | ${a.note}` : ""}\n`);
+    }
+    return 0;
+  }
+  if (sub === "cancel") {
+    if (!rest[1]) {
+      process.stderr.write("Usage: pansa alert cancel <id>\n");
+      return 1;
+    }
+    const ok = cancelAlert(rest[1]);
+    process.stdout.write(ok ? `Alert ${rest[1]} dibatalkan.\n` : `Alert tidak ditemukan atau sudah tidak aktif: ${rest[1]}\n`);
+    return ok ? 0 : 1;
+  }
+  if (sub === "check") {
+    const triggered = await checkAlerts();
+    if (!triggered.length) {
+      process.stdout.write("Tidak ada alert yang terpicu.\n");
+      return 0;
+    }
+    for (const { alert, price } of triggered) {
+      process.stdout.write(`TERPICU: ${alert.id} | ${alert.token} ${alert.op} $${alert.price_usd} (harga $${price})${alert.note ? ` — ${alert.note}` : ""}\n`);
+    }
+    return 0;
+  }
+  process.stderr.write("Usage: pansa alert [add <token> <>=|<= > <price> [note]|list|cancel <id>|check]\n");
+  return 1;
+}
+
+async function scoutCmd(rest: string[]): Promise<number> {
+  const target = rest[0];
+  if (!target) {
+    process.stderr.write("Usage: pansa scout <contract-address-atau-url>\n");
+    return 1;
+  }
+  const resolved = await resolveScoutTarget(target).catch(() => null);
+  if (!resolved) {
+    process.stderr.write("Target tidak dapat diurai: butuh alamat kontrak 0x… atau URL proyek yang memuat alamat kontrak.\n");
+    return 1;
+  }
+  const rpcUrl = resolveEvmRpc();
+  if (!rpcUrl) {
+    process.stderr.write("RPC EVM tidak terkonfigurasi (set PANSA_EVM_RPC atau config).\n");
+    return 1;
+  }
+  const client = await evmPublicClient(rpcUrl);
+  const rpc: ScoutRpc = {
+    getCode: (address: string) => client.getCode({ address: address as `0x${string}` }),
+    call: async (to: string, data: string) => {
+      const res = await client.call({ to: to as `0x${string}`, data: data as `0x${string}` });
+      return res.data ?? "0x";
+    },
+  };
+  const report = await inspectContract(resolved.address, rpc, dexscreenerPrice);
+  process.stdout.write(`${formatScoutReport(report)}\n`);
+  return 0;
 }
 
 async function mcpCmd(rest: string[]): Promise<number> {
