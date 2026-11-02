@@ -552,12 +552,12 @@ function readModelList(){
 document.getElementById("provider-connect").addEventListener("click",async()=>{
   const btn=document.getElementById("provider-connect"); if(btn.disabled) return;
   const msg=document.getElementById("provider-msg");
-  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value; const api=document.getElementById("pf-api").value;
+  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value; const apiType=document.getElementById("pf-api").value;
   if(!baseUrl){ msg.textContent="Error: isi Base URL dulu sebelum Connect."; toast(msg.textContent,"bad"); return; }
   btn.disabled=true; const oldLabel=btn.textContent; btn.textContent="Menghubungkan…";
   msg.textContent="Menghubungkan, mengambil daftar model…";
   try{
-    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined,api});
+    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined,api:apiType});
     if(!res.ok){ msg.textContent="Connect gagal: "+(res.error||"tidak diketahui"); toast(msg.textContent,"bad"); return; }
     const models=res.models||[];
     document.getElementById("pf-models").value=models.join(", ");
@@ -570,16 +570,16 @@ document.getElementById("provider-connect").addEventListener("click",async()=>{
 document.getElementById("provider-testconn").addEventListener("click",async()=>{
   const btn=document.getElementById("provider-testconn"); if(btn.disabled) return;
   const msg=document.getElementById("provider-msg");
-  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value; const api=document.getElementById("pf-api").value;
+  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value; const apiType=document.getElementById("pf-api").value;
   if(!baseUrl){ msg.textContent="Error: isi Base URL dulu sebelum Test koneksi."; toast(msg.textContent,"bad"); return; }
   btn.disabled=true; const oldLabel=btn.textContent; btn.textContent="Menguji…";
   const started=Date.now();
   try{
-    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined,api});
+    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined,api:apiType});
     const ms=Date.now()-started;
     if(!res.ok){ msg.textContent="Test koneksi gagal: "+(res.error||"tidak diketahui")+" ("+ms+" ms)"; toast(msg.textContent,"bad"); return; }
     const models=res.models||[];
-    msg.textContent="Test koneksi OK ("+api+"): "+models.length+" model, "+ms+" ms"+(models.length?" — contoh: "+models.slice(0,5).join(", "):"");
+    msg.textContent="Test koneksi OK ("+apiType+"): "+models.length+" model, "+ms+" ms"+(models.length?" — contoh: "+models.slice(0,5).join(", "):"");
     toast(msg.textContent,"ok");
   }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
   finally{ btn.disabled=false; btn.textContent=oldLabel; }
