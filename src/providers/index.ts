@@ -60,12 +60,17 @@ export function slugify(name: string): string {
   return slug || "provider";
 }
 
-function normalizeBaseUrl(raw: string): string {
+/** Canonical base URL for API calls: no trailing slash, no trailing
+ *  /v1 segments. Every URL builder appends /v1/... itself, so a pasted
+ *  "https://host/v1" or "https://host/api/v1" (the form placeholder even
+ *  shows one) used to double into /v1/v1/... and 404 every custom chat
+ *  call. Stored values keep whatever was saved; callers normalize. */
+export function normalizeBaseUrl(raw: string): string {
   const url = new URL(raw.trim());
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("baseUrl harus http:// atau https://");
   }
-  return url.toString().replace(/\/$/, "");
+  return url.toString().replace(/\/$/, "").replace(/(\/v1)+$/, "");
 }
 
 function normalizeModels(models: unknown): string[] {
@@ -143,7 +148,7 @@ export function listProviders(passphrase?: string): CustomProviderView[] {
   return (cfg.providers ?? []).map((p) => ({
     id: p.id,
     name: p.name,
-    baseUrl: p.baseUrl,
+    baseUrl: normalizeBaseUrl(p.baseUrl),
     api: normalizeApi(p.api),
     models: [...p.models],
     disabledModels: normalizeDisabledModels(p.models, p.disabledModels),
@@ -254,9 +259,12 @@ export function findCustomProvider(
   model: string,
   providers?: CustomProviderConfig[],
 ): CustomProviderConfig | undefined {
-  return (providers ?? []).find(
+  const found = (providers ?? []).find(
     (p) => p.enabled && p.models.includes(model) && !(p.disabledModels ?? []).includes(model),
   );
+  // Callers build /v1/... URLs off this, so hand them the normalized
+  // base even when the stored value carries a /v1 suffix.
+  return found ? { ...found, baseUrl: normalizeBaseUrl(found.baseUrl) } : undefined;
 }
 
 /** Switch one registered model on or off without touching the rest. */
@@ -308,7 +316,7 @@ export async function fetchProviderModels(
     } else if (apiKey) {
       headers.Authorization = `Bearer ${apiKey}`;
     }
-    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/models`, {
+    const res = await fetch(`${normalizeBaseUrl(baseUrl)}/v1/models`, {
       signal: ctrl.signal,
       headers,
     });
