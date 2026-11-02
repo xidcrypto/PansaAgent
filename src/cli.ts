@@ -260,6 +260,22 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
+// Switchable models for the Telegram bot: daemon live models first,
+// then enabled custom-provider models that are not disabled and not
+// already listed. Previously the bot only offered daemon models, so a
+// custom provider's model could never be picked from Telegram.
+async function gatewayListModels(): Promise<string[]> {
+  const live = await fetchLiveModels().catch((): string[] => []);
+  const custom: string[] = [];
+  for (const p of listProviders()) {
+    if (!p.enabled) continue;
+    for (const m of p.models) {
+      if (!p.disabledModels.includes(m) && !live.includes(m) && !custom.includes(m)) custom.push(m);
+    }
+  }
+  return [...live, ...custom];
+}
+
 // Headless agent run returning the final answer (scheduler, gateway).
 // No streaming, no session persistence: the caller owns reporting.
 // The MCP-augmented tool set is built once per process: a long-running
@@ -280,7 +296,7 @@ async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.j
     context: ctx,
     tools,
     liveModels: live,
-    cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models },
+    cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models, providers: cfg.providers },
   });
   return agent.run(prompt);
 }
@@ -447,15 +463,16 @@ async function gatewayCmd(rest: string[]): Promise<number> {
             return active.map((a) => `${a.id} | ${a.token} ${a.op} $${a.price_usd}${a.note ? ` | ${a.note}` : ""}`).join("\n");
           },
           providerText: async () => {
-            const models = await fetchLiveModels().catch((): string[] => []);
+            const models = await gatewayListModels();
             const pinned = loadConfig().models?.[0];
+            const customs = listProviders().filter((p) => p.enabled);
             return [
               "➕ Provider & model:",
-              `Model live dari daemon: ${models.length}`,
+              `Model yang bisa dipilih bot: ${models.length} (daemon + provider custom aktif)`,
+              `Provider custom aktif: ${customs.length}`,
               `Model terkunci: ${pinned ?? "(tidak ada — daemon memilih)"}`,
-              "Provider dikelola di konfigurasi daemon LLM (port 17070) di VPS, bukan lewat chat.",
-              "Daemon bansos v1 hanya keyless — gateway lokal bertoken (mis. 9Router) adalah roadmap M5 yang belum dirilis.",
-              "API key tidak boleh dikirim lewat Telegram — tambah provider lewat dashboard 9Router sendiri.",
+              "Kelola provider lewat dashboard PANSA (bukan lewat chat).",
+              "API key tidak boleh dikirim lewat Telegram — tambah provider lewat dashboard.",
               "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
             ].join("\n");
           },
@@ -480,7 +497,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
             if (!active.length) return "Price alert aktif: (kosong)";
             return active.map((a) => `${a.id} | ${a.token} ${a.op} $${a.price_usd}${a.note ? ` | ${a.note}` : ""}`).join("\n");
           },
-          listModels: () => fetchLiveModels().catch((): string[] => []),
+          listModels: () => gatewayListModels(),
           pinnedModel: () => loadConfig().models?.[0],
           setModel: (id) => {
             const c = loadConfig();

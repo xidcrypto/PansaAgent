@@ -636,8 +636,10 @@ function render(d){
   if(d.usage){
     const fmtN=n=>n.toLocaleString("id-ID");
     const fmtC=c=>c===null?"—":"$"+c.toFixed(4);
+    document.getElementById("usage-summary").textContent=d.usage.calls===0?"(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)":'Total: '+fmtN(d.usage.totalTokens)+' token · in '+fmtN(d.usage.inputTokens)+' · out '+fmtN(d.usage.outputTokens)+' · '+d.usage.calls+' panggilan · estimasi biaya $'+d.usage.costUsd.toFixed(4)+' — rincian per model dan per provider ada di halaman Penggunaan.';
     document.getElementById("usage-totals").textContent='Total: '+fmtN(d.usage.totalTokens)+' token · in '+fmtN(d.usage.inputTokens)+' · out '+fmtN(d.usage.outputTokens)+' · '+d.usage.calls+' panggilan · estimasi biaya $'+d.usage.costUsd.toFixed(4)+' (hanya model yang harganya diketahui; model lain tidak dihitung, bukan nol)';
     document.getElementById("usage-rows").innerHTML=d.usage.byModel.length?d.usage.byModel.map(r=>'<tr><td class="mono">'+esc(r.model)+'</td><td>'+esc(r.provider)+'</td><td>'+fmtN(r.inputTokens)+'</td><td>'+fmtN(r.outputTokens)+'</td><td>'+fmtN(r.totalTokens)+'</td><td>'+fmtC(r.costUsd)+'</td><td>'+r.calls+'</td></tr>').join(""):'<tr><td colspan="7">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>';
+    document.getElementById("usage-provider-rows").innerHTML=d.usage.byProvider.length?d.usage.byProvider.map(r=>'<tr><td>'+esc(r.provider)+'</td><td>'+fmtN(r.inputTokens)+'</td><td>'+fmtN(r.outputTokens)+'</td><td>'+fmtN(r.totalTokens)+'</td><td>'+fmtC(r.costUsd)+'</td><td>'+r.calls+'</td></tr>').join(""):'<tr><td colspan="6">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>';
   }
 }
 async function manualRefresh(){
@@ -734,6 +736,21 @@ function usageTotalsHtml(usage: UsageTotals): string {
   return `Total: ${fmtNum(usage.totalTokens)} token · in ${fmtNum(usage.inputTokens)} · out ${fmtNum(usage.outputTokens)} · ${usage.calls} panggilan · estimasi biaya $${usage.costUsd.toFixed(4)} (hanya model yang harganya diketahui; model lain tidak dihitung, bukan nol)`;
 }
 
+function usageSummaryHtml(usage: UsageTotals): string {
+  if (usage.calls === 0) return "(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)";
+  return `Total: ${fmtNum(usage.totalTokens)} token · in ${fmtNum(usage.inputTokens)} · out ${fmtNum(usage.outputTokens)} · ${usage.calls} panggilan · estimasi biaya $${usage.costUsd.toFixed(4)} — rincian per model dan per provider ada di halaman Penggunaan.`;
+}
+
+function usageProviderRowsHtml(usage: UsageTotals): string {
+  if (!usage.byProvider.length) return `<tr><td colspan="6">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>`;
+  return usage.byProvider
+    .map(
+      (r) =>
+        `<tr><td>${escapeHtml(r.provider)}</td><td>${fmtNum(r.inputTokens)}</td><td>${fmtNum(r.outputTokens)}</td><td>${fmtNum(r.totalTokens)}</td><td>${fmtCost(r.costUsd)}</td><td>${r.calls}</td></tr>`,
+    )
+    .join("\n");
+}
+
 function usageRowsHtml(usage: UsageTotals): string {
   if (!usage.byModel.length) return `<tr><td colspan="7">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>`;
   return usage.byModel
@@ -768,6 +785,7 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 <a href="#status" data-sec="status" class="active">Status</a>
 <a href="#provider" data-sec="provider">Provider <span class="dot-nav${providers.reachable ? "" : " off"}" id="dot-provider"></span></a>
 <a href="#model" data-sec="model">Model</a>
+<a href="#usage" data-sec="usage">Penggunaan</a>
 <a href="#dompet" data-sec="dompet">Dompet</a>
 <a href="#tugas" data-sec="tugas">Tugas <span class="count" id="badge-tugas">${data.scheduledPending > 0 ? data.scheduledPending : ""}</span></a>
 <a href="#alert" data-sec="alert">Alert <span class="count" id="badge-alert">${data.alertsActive > 0 ? data.alertsActive : ""}</span></a>
@@ -787,9 +805,7 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 <h2>Konfigurasi</h2>
 <div class="card" id="cfg">Model: ${escapeHtml(data.models.join(", ") || "(tidak ada)")}<br>Gateway Telegram: ${data.gatewayEnabled ? "aktif" : "nonaktif"} · pengguna terdaftar: ${data.gatewayAllowedUsers}<br>Testnet only: ${data.testnetOnly === undefined ? "tidak diketahui" : data.testnetOnly ? "ya" : "tidak"}<br>Tugas terjadwal pending: ${data.scheduledPending} dari ${data.scheduledTotal} · Price alert aktif: ${data.alertsActive} dari ${data.alertsTotal}</div>
 <h2>Penggunaan LLM</h2>
-<div class="card" id="usage-totals">${usage ? usageTotalsHtml(usage) : "(tidak ada data)"}</div>
-<div class="tablewrap"><table><tr><th>Model</th><th>Provider</th><th>In</th><th>Out</th><th>Total</th><th>Estimasi biaya</th><th>Panggilan</th></tr><tbody id="usage-rows">
-${usage ? usageRowsHtml(usage) : `<tr><td colspan="7">(tidak ada data)</td></tr>`}</tbody></table></div>
+<div class="card" id="usage-summary">${usage ? usageSummaryHtml(usage) : "(belum ada pemakaian tercatat)"}</div>
 <h2>Ganti password</h2>
 <div class="card"><form id="password-form">
 <div class="label" style="margin-bottom:6px">Password saat ini</div>
@@ -836,6 +852,17 @@ ${customRows(customProviders)}</tbody></table></div>
 <div class="card" id="model-pinned">Model terkunci (config): ${escapeHtml(data.models.join(", ") || "(tidak ada — daemon memilih)")}</div>
 <div class="tablewrap"><table><tr><th>ID</th><th>Sumber</th><th>Konteks</th><th>Reasoning</th><th>Tools</th></tr><tbody id="model-rows">
 ${modelRows(providers)}</tbody></table></div>
+</section>
+<section id="sec-usage">
+<h2>Penggunaan LLM</h2>
+<div class="card" id="usage-totals">${usage ? usageTotalsHtml(usage) : "(tidak ada data)"}</div>
+<h2>Per model</h2>
+<div class="tablewrap"><table><tr><th>Model</th><th>Provider</th><th>In</th><th>Out</th><th>Total</th><th>Estimasi biaya</th><th>Panggilan</th></tr><tbody id="usage-rows">
+${usage ? usageRowsHtml(usage) : `<tr><td colspan="7">(tidak ada data)</td></tr>`}</tbody></table></div>
+<h2>Per provider</h2>
+<div class="tablewrap"><table><tr><th>Provider</th><th>In</th><th>Out</th><th>Total</th><th>Estimasi biaya</th><th>Panggilan</th></tr><tbody id="usage-provider-rows">
+${usage ? usageProviderRowsHtml(usage) : `<tr><td colspan="6">(tidak ada data)</td></tr>`}</tbody></table></div>
+<p class="note">Estimasi biaya hanya dari model yang harganya diketahui; model lain tidak dihitung, bukan nol. Pemakaian dicatat setiap chat selesai dan diperbarui live lewat stream.</p>
 </section>
 <section id="sec-dompet">
 <h2>Dompet</h2>
@@ -894,7 +921,7 @@ export async function startDashboard(opts: {
     try {
       usage = getUsageTotals();
     } catch {
-      usage = { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, byModel: [] };
+      usage = { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, byModel: [], byProvider: [] };
     }
     return { ...data, system, providers, customProviders, usage, readOnly: false, host: "127.0.0.1" };
   };

@@ -25,6 +25,16 @@ export interface UsageByModel {
   costUsd: number | null;
 }
 
+export interface UsageByProvider {
+  provider: string;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  /** Null when NONE of the provider's calls has a known price. */
+  costUsd: number | null;
+}
+
 export interface UsageTotals {
   calls: number;
   inputTokens: number;
@@ -33,6 +43,7 @@ export interface UsageTotals {
   /** Sum of known costs only; unknown-cost calls contribute 0 here. */
   costUsd: number;
   byModel: UsageByModel[];
+  byProvider: UsageByProvider[];
 }
 
 // Price per 1M tokens, USD. Best-effort snapshot for well-known models;
@@ -107,7 +118,7 @@ export function recordUsage(entry: UsageEntry): void {
 }
 
 export function getUsageTotals(limitModels = 50): UsageTotals {
-  const empty: UsageTotals = { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, byModel: [] };
+  const empty: UsageTotals = { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, byModel: [], byProvider: [] };
   let db: Database | null = null;
   try {
     db = openDb();
@@ -135,6 +146,21 @@ export function getUsageTotals(limitModels = 50): UsageTotals {
         costUsd: cost,
       };
     });
+    const provRows = db
+      .prepare(
+        `SELECT provider, COUNT(*) AS calls, SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens,
+                SUM(cost_usd) AS knownCost, COUNT(cost_usd) AS pricedCalls
+         FROM llm_usage GROUP BY provider ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC`,
+      )
+      .all() as Array<{ provider: string; calls: number; inputTokens: number; outputTokens: number; knownCost: number | null; pricedCalls: number }>;
+    const byProvider: UsageByProvider[] = provRows.map((r) => ({
+      provider: r.provider,
+      calls: r.calls,
+      inputTokens: r.inputTokens,
+      outputTokens: r.outputTokens,
+      totalTokens: r.inputTokens + r.outputTokens,
+      costUsd: r.pricedCalls === 0 ? null : (r.knownCost ?? 0),
+    }));
     return {
       calls: total.calls,
       inputTokens: total.inputTokens,
@@ -142,6 +168,7 @@ export function getUsageTotals(limitModels = 50): UsageTotals {
       totalTokens: total.inputTokens + total.outputTokens,
       costUsd: total.costUsd,
       byModel,
+      byProvider,
     };
   } catch {
     return empty;

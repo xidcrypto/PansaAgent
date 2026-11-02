@@ -205,15 +205,40 @@ export function settingsKeyboard(): InlineKeyboardMarkup {
 
 // Model buttons: callback_data is capped at 64 bytes by Telegram, so
 // over-long model ids are listed as text only, never as buttons.
-export function modelKeyboard(models: string[], pinned?: string): InlineKeyboardMarkup {
+// Ten buttons per page; page buttons recompute the list on tap, so no
+// server-side page state is needed.
+export const MODEL_PAGE_SIZE = 10;
+
+export function modelKeyboard(models: string[], pinned?: string, page = 0): InlineKeyboardMarkup {
+  const buttonable = models.filter((m) => `model:${m}`.length <= 64);
+  const maxPage = Math.max(0, Math.ceil(buttonable.length / MODEL_PAGE_SIZE) - 1);
+  const safePage = Math.min(Math.max(0, page), maxPage);
+  const slice = buttonable.slice(safePage * MODEL_PAGE_SIZE, safePage * MODEL_PAGE_SIZE + MODEL_PAGE_SIZE);
   const rows: InlineKeyboardButton[][] = [];
-  for (const m of models.slice(0, 10)) {
-    if (`model:${m}`.length > 64) continue;
+  for (const m of slice) {
     const label = (pinned === m ? "✓ " : "") + (m.length > 40 ? m.slice(0, 37) + "…" : m);
     rows.push([{ text: label, callback_data: `model:${m}` }]);
   }
+  const nav: InlineKeyboardButton[] = [];
+  if (safePage > 0) nav.push({ text: "⬅️ Sebelumnya", callback_data: `modelpage:${safePage - 1}` });
+  if (safePage < maxPage) nav.push({ text: "➡️ Lagi", callback_data: `modelpage:${safePage + 1}` });
+  if (nav.length) rows.push(nav);
   rows.push([{ text: "⬅️ Kembali ke menu", callback_data: "menu" }]);
   return { inline_keyboard: rows };
+}
+
+function modelPageText(models: string[], pinned: string | undefined, page: number): string {
+  const buttonable = models.filter((m) => `model:${m}`.length <= 64);
+  const skipped = models.filter((m) => `model:${m}`.length > 64);
+  const maxPage = Math.max(0, Math.ceil(buttonable.length / MODEL_PAGE_SIZE) - 1);
+  const safePage = Math.min(Math.max(0, page), maxPage);
+  const slice = buttonable.slice(safePage * MODEL_PAGE_SIZE, safePage * MODEL_PAGE_SIZE + MODEL_PAGE_SIZE);
+  return [
+    "🤖 Pilih model untuk agen gateway (klik untuk mengunci):",
+    ...(slice.length ? slice.map((m) => (pinned === m ? `✓ ${m}` : m)) : ["(tidak ada model yang bisa dipilih)"]),
+    ...(maxPage > 0 ? [`Halaman ${safePage + 1} dari ${maxPage + 1} (${buttonable.length} model)`] : []),
+    ...(skipped.length ? [`(${skipped.length} model lain tidak bisa jadi tombol — id melebihi 64 byte)`] : []),
+  ].join("\n");
 }
 
 export type GatewayAction =
@@ -394,20 +419,28 @@ export async function handleGatewayCallback(
   }
   if (data === "model") {
     const models = await deps.listModels().catch((): string[] => []);
-    const shown = models.filter((m) => `model:${m}`.length <= 64).slice(0, 10);
-    const skipped = models.filter((m) => `model:${m}`.length > 64);
     return {
-      text: [
-        "🤖 Pilih model untuk agen gateway (klik untuk mengunci):",
-        ...(shown.length ? shown.map((m) => (deps.pinnedModel() === m ? `✓ ${m}` : m)) : ["(tidak ada model live dari daemon)"]),
-        ...(skipped.length ? [`(${skipped.length} model lain tidak bisa jadi tombol — id melebihi 64 byte)`] : []),
-      ].join("\n"),
-      keyboard: modelKeyboard(models, deps.pinnedModel()),
+      text: modelPageText(models, deps.pinnedModel(), 0),
+      keyboard: modelKeyboard(models, deps.pinnedModel(), 0),
+    };
+  }
+  if (data.startsWith("modelpage:")) {
+    const page = Number(data.slice("modelpage:".length));
+    const models = await deps.listModels().catch((): string[] => []);
+    return {
+      text: modelPageText(models, deps.pinnedModel(), Number.isFinite(page) ? page : 0),
+      keyboard: modelKeyboard(models, deps.pinnedModel(), Number.isFinite(page) ? page : 0),
     };
   }
   if (data.startsWith("model:")) {
     const id = data.slice("model:".length);
     if (!id) return null;
+    // Never pin a model that is not on the current switchable list: a
+    // crafted callback must not lock the agent to a dead model.
+    const models = await deps.listModels().catch((): string[] => []);
+    if (!models.includes(id)) {
+      return { text: `Model tidak ada di daftar yang bisa dipilih. Buka tombol Model lagi untuk daftar terbaru.`, keyboard: mainMenuKeyboard() };
+    }
     deps.setModel(id);
     return { text: `Model gateway dikunci ke: ${id}\nJawaban agen berikutnya memakai model ini.`, keyboard: mainMenuKeyboard() };
   }
@@ -416,10 +449,10 @@ export async function handleGatewayCallback(
     return {
       text: [
         "➕ Provider & model:",
-        `Model live dari daemon: ${models.length}`,
+        `Model yang bisa dipilih bot: ${models.length} (daemon + provider custom aktif)`,
         `Model terkunci: ${deps.pinnedModel() ?? "(tidak ada — daemon memilih)"}`,
-        "Provider dikelola di konfigurasi daemon LLM (port 17070) di VPS, bukan lewat chat.",
-        "API key tidak boleh dikirim lewat Telegram — tambah provider langsung di daemon.",
+        "Kelola provider lewat dashboard PANSA (bukan lewat chat).",
+        "API key tidak boleh dikirim lewat Telegram — tambah provider lewat dashboard.",
         "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
       ].join("\n"),
       keyboard: mainMenuKeyboard(),
