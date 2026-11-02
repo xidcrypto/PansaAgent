@@ -47,6 +47,18 @@ export function keystorePath(name: string): string {
   return join(KEYSTORE_DIR, `${name}.json`);
 }
 
+// Default derivation path per chain family. Shared by the CLI
+// (pansa <chain> wallet) and the TUI (/wallet new).
+export function defaultPath(chain: string): string {
+  switch (chain) {
+    case "evm": return "m/44'/60'/0'/0/0";
+    case "solana": return "m/44'/501'/0'/0'";
+    case "sui": return "m/44'/784'/0'/0'/0'";
+    case "aptos": return "m/44'/637'/0'/0'/0'";
+    default: return "m/44'/60'/0'/0/0";
+  }
+}
+
 export function validateName(name: string): void {
   if (!NAME_RE.test(name)) {
     throw new Error(`invalid wallet name: ${name} (use ^[a-z0-9_-]{1,32}$)`);

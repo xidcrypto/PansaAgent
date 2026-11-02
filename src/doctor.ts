@@ -45,6 +45,34 @@ export async function runDoctor(): Promise<DoctorCheck[]> {
   } catch (err) {
     checks.push({ name: "LLM daemon", ok: false, detail: err instanceof Error ? err.message : String(err) });
   }
+  try {
+    const { listScheduled } = await import("./scheduler/index.js");
+    const tasks = listScheduled();
+    checks.push({ name: "scheduler", ok: true, detail: `${tasks.length} tugas terjadwal (tabel bisa dibaca)` });
+  } catch (err) {
+    checks.push({ name: "scheduler", ok: false, detail: err instanceof Error ? err.message : String(err) });
+  }
+  try {
+    const cfg = loadConfig();
+    const gw = cfg.gateways?.telegram;
+    checks.push({
+      name: "gateway",
+      ok: true,
+      detail: gw ? `telegram dikonfigurasi (${gw.allowlist.length} chat di allowlist)` : "telegram belum dikonfigurasi",
+    });
+    const servers = cfg.mcpServers ?? {};
+    checks.push({ name: "mcp", ok: true, detail: `${Object.keys(servers).length} server dikonfigurasi` });
+  } catch (err) {
+    checks.push({ name: "gateway/mcp", ok: false, detail: err instanceof Error ? err.message : String(err) });
+  }
+  try {
+    const { createRequire } = await import("node:module");
+    const req = createRequire(import.meta.url);
+    req.resolve("playwright");
+    checks.push({ name: "playwright", ok: true, detail: "terinstal (browser aktif bila config.browser=true)" });
+  } catch {
+    checks.push({ name: "playwright", ok: false, detail: "tidak terinstal (peer opsional; jalankan: npm i playwright)" });
+  }
   return checks;
 }
 

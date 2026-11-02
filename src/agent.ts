@@ -14,12 +14,22 @@ export interface Tool {
   execute(args: Record<string, unknown>): Promise<{ ok: boolean; data: unknown; error?: string; signs?: boolean }>;
 }
 
+export interface ToolCallInfo {
+  name: string;
+  ms: number;
+  ok: boolean;
+  summary: string;
+}
+
 export interface AgentOptions {
   context: ContextManager;
   tools: Map<string, Tool>;
   liveModels: string[];
   cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[] };
   onChunk?: (text: string) => void;
+  // Compact tool-call reporting for the TUI (U3): one line per tool
+  // execution with timing. Never carries secrets (summary is redacted).
+  onToolCall?: (info: ToolCallInfo) => void;
   // Injectable chat function for tests (defaults to the real LLM chat).
   // Production always uses the default; tests inject a fake to drive
   // tool-flow scenarios without a daemon or network.
@@ -41,6 +51,7 @@ export class Agent {
   private readonly liveModels: string[];
   private readonly cfg: AgentOptions["cfg"];
   private readonly onChunk?: (text: string) => void;
+  private readonly onToolCall?: (info: ToolCallInfo) => void;
   private readonly chatFn: NonNullable<AgentOptions["chatFn"]>;
 
   constructor(opts: AgentOptions) {
@@ -49,6 +60,7 @@ export class Agent {
     this.liveModels = opts.liveModels;
     this.cfg = opts.cfg;
     this.onChunk = opts.onChunk;
+    this.onToolCall = opts.onToolCall;
     this.chatFn = opts.chatFn ?? chat;
   }
 
@@ -60,10 +72,14 @@ export class Agent {
     this.cfg.preferCheap = [model];
   }
 
-  async run(prompt: string): Promise<string> {
+  async run(prompt: string, opts: { signal?: AbortSignal } = {}): Promise<string> {
     this.context.addUser(prompt);
     let steps = 0;
     while (steps < 14) {
+      // Ctrl+C abort (U3): checked between steps and before tool work.
+      // An in-flight LLM request is aborted via the signal passed to
+      // chat(); the loop exits before acting on its result.
+      if (opts.signal?.aborted) return "Generasi dibatalkan.";
       steps++;
       const toolsDefs: ToolDef[] = [...this.tools.values()].map((t) => ({
         name: t.name,
@@ -77,11 +93,12 @@ export class Agent {
       let result;
       try {
         result = await this.chatFn(
-          { messages, tools: toolsDefs, toolChoice: this.tools.size > 0 ? "required" : "auto", kind: "reasoning", onChunk: this.onChunk },
+          { messages, tools: toolsDefs, toolChoice: this.tools.size > 0 ? "required" : "auto", kind: "reasoning", onChunk: this.onChunk, signal: opts.signal },
           this.liveModels,
           this.cfg,
         );
       } catch (err) {
+        if (opts.signal?.aborted) return "Generasi dibatalkan.";
         if (err instanceof LlmError && err.code === "no_model") {
           return "Model tidak tersedia. Jalankan `pansa setup` atau pastikan bansos-router berjalan.";
         }
@@ -98,6 +115,7 @@ export class Agent {
       if (signing.length > 0) {
         // serialize signing, one at a time
         for (const tc of signing) {
+          if (opts.signal?.aborted) return "Generasi dibatalkan.";
           const res = await this.executeOne(tc);
           this.context.addToolResult(tc.function.name, res.data, res.ok, res.error);
           if (!res.ok) {
@@ -144,12 +162,29 @@ export class Agent {
     } catch {
       return { ok: false, data: null, error: "argumen tool tidak valid JSON" };
     }
+    const started = Date.now();
     try {
       const res = await tool.execute(args);
+      this.reportToolCall(tc.function.name, started, res.ok, res.data, res.error);
       return { ok: res.ok, data: res.data, error: res.error };
     } catch (err) {
-      return { ok: false, data: null, error: err instanceof Error ? err.message : String(err) };
+      const msg = err instanceof Error ? err.message : String(err);
+      this.reportToolCall(tc.function.name, started, false, null, msg);
+      return { ok: false, data: null, error: msg };
     }
+  }
+
+  private reportToolCall(name: string, started: number, ok: boolean, data: unknown, error?: string): void {
+    if (!this.onToolCall) return;
+    const raw = error ?? (() => {
+      try {
+        const s = JSON.stringify(data);
+        return s.length > 120 ? s.slice(0, 120) + "…" : s;
+      } catch {
+        return String(data);
+      }
+    })();
+    this.onToolCall({ name, ms: Date.now() - started, ok, summary: redact(raw) });
   }
 }
 

@@ -3,8 +3,7 @@ import { evmAccountFromMnemonic } from "./evm.js";
 import { PANSA_DIR } from "../config.js";
 import { resolveEvmRpc, evmPublicClient, isTestnetChainId } from "../evm-rpc.js";
 import { existsSync, readFileSync } from "node:fs";
-import { parseEther, parseGwei, keccak256 } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { loadViem, loadViemAccounts } from "../viem-lazy.js";
 import { randomUUID } from "node:crypto";
 
 const UNLOCK_TTL_MS = 15 * 60 * 1000;
@@ -146,7 +145,8 @@ export async function simulateTx(tx: TxRequest): Promise<TxSimulation> {
     return { ok: false, error: `Unknown wallet or address: ${tx.from}` };
   }
   try {
-    const client = evmPublicClient(rpcUrl);
+    const client = await evmPublicClient(rpcUrl);
+    const { parseEther } = await loadViem();
     const value = tx.value ? parseEther(tx.value) : 0n;
     await client.call({
       account: fromAddress as `0x${string}`,
@@ -199,6 +199,8 @@ export async function signEvmTx(tx: TxRequest, mnemonic: string, path: string): 
   if (tx.chain !== "evm") throw new Error("signEvmTx only supports evm");
   if (tx.chainId === undefined) throw new Error("chainId required to sign (resolve it from the RPC endpoint first)");
   const { privateKey } = evmAccountFromMnemonic(mnemonic, path);
+  const { privateKeyToAccount } = await loadViemAccounts();
+  const { parseEther, parseGwei, keccak256 } = await loadViem();
   const account = privateKeyToAccount(privateKey as `0x${string}`);
   const value = tx.value ? parseEther(tx.value) : 0n;
   // Gas is never guessed for contract calls: a plain transfer costs 21000

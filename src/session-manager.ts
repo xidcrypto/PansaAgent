@@ -92,6 +92,16 @@ export class SessionManager {
     return true;
   }
 
+  // Retitle a session (U4: cheap-model titles). Returns false when the
+  // session does not exist. Titles are plain text, never secrets.
+  async renameSession(id: string, title: string): Promise<boolean> {
+    const stmt = this.ensureDb().prepare(
+      `UPDATE sessions SET title = ?, updated_at = datetime('now') WHERE id = ?`,
+    );
+    const info = stmt.run(title.slice(0, 120), id) as { changes: number };
+    return info.changes > 0;
+  }
+
   // Message management
 
   async addMessage(sessionId: string, role: "user" | "assistant" | "tool", content: string): Promise<void> {

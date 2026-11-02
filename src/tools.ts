@@ -3,6 +3,10 @@ import { createSignTool, createRejectTool, createListConfirmationsTool } from ".
 import { createTrackerTool, createReportTool } from "./tracker/tools.js";
 import { createBAWTool } from "./skills/baw.js";
 import { createScamCheckTool } from "./research/index.js";
+import { createSkillLoadTool } from "./skills/loader.js";
+import { loadConfig } from "./config.js";
+import { openPage } from "./browser/index.js";
+import { McpClient } from "./mcp/client.js";
 
 // Single wiring for the agent's tool set (B1/M3). The CLI and the TUI both
 // build their Agent from this registry; the SkillsManager registry is a
@@ -17,7 +21,83 @@ export function buildAgentTools(): Map<string, Tool> {
     createReportTool(),
     createBAWTool(),
     createScamCheckTool(),
+    createSkillLoadTool(),
+    createBrowserTool(),
   ];
   for (const t of list) tools.set(t.name, t);
+  return tools;
+}
+
+// Optional browser tool. It exists in every agent's tool set but refuses
+// unless config.browser is true, and fails honestly when playwright is
+// not installed (optional peer) instead of pretending to browse.
+export function createBrowserTool(): Tool {
+  return {
+    name: "browser_open",
+    description: "Open a public web page and return its title and text (requires config.browser=true and the optional playwright peer).",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
+    },
+    signs: false,
+    execute: async (args: Record<string, unknown>) => {
+      const cfg = loadConfig();
+      if (!cfg.browser) {
+        return { ok: false, data: null, error: "Browser dinonaktifkan di config (set browser: true untuk mengaktifkan)." };
+      }
+      const url = String(args.url ?? "");
+      if (!/^https?:\/\//.test(url)) return { ok: false, data: null, error: "URL harus http(s)." };
+      try {
+        const snap = await openPage(url);
+        return { ok: true, data: snap };
+      } catch (err) {
+        return { ok: false, data: null, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  };
+}
+
+// MCP-augmented tool set (U5). Starts from buildAgentTools() and merges
+// one tool per MCP server tool, named mcp_<server>_<tool>. A dead or
+// misconfigured server is skipped best-effort: it must never break the
+// agent. Started clients are killed on process exit so one-shot runs do
+// not leak orphaned server processes.
+export async function buildAgentToolsWithMcp(): Promise<Map<string, Tool>> {
+  const tools = buildAgentTools();
+  let servers: Record<string, string> = {};
+  try {
+    servers = loadConfig().mcpServers ?? {};
+  } catch {
+    return tools;
+  }
+  for (const [server, command] of Object.entries(servers)) {
+    try {
+      const client = new McpClient(command);
+      await client.start();
+      process.once("exit", () => client.close());
+      const defs = await client.listTools();
+      for (const def of defs) {
+        const name = `mcp_${server}_${def.name}`.replace(/[^a-zA-Z0-9_]/g, "_");
+        if (tools.has(name)) continue;
+        tools.set(name, {
+          name,
+          description: `MCP tool ${server}/${def.name}: ${def.description ?? ""}`,
+          parameters: (def.inputSchema as Record<string, unknown>) ?? { type: "object", properties: {} },
+          signs: false,
+          execute: async (args: Record<string, unknown>) => {
+            try {
+              const result = await client.callTool(def.name, args);
+              return { ok: true, data: result };
+            } catch (err) {
+              return { ok: false, data: null, error: err instanceof Error ? err.message : String(err) };
+            }
+          },
+        });
+      }
+    } catch {
+      // Dead server: skip it, agent continues with the rest.
+    }
+  }
   return tools;
 }

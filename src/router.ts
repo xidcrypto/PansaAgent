@@ -1,6 +1,7 @@
 import { spawn, exec } from "node:child_process";
 import { execPath } from "node:process";
 import { createInterface } from "node:readline";
+import { createRequire } from "node:module";
 import net from "node:net";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -10,10 +11,26 @@ const DEFAULT_PORT = 17070;
 const PORT_MIN = 17070;
 const PORT_MAX = 17090;
 
-// Resolve the bansos-router CLI without hardcoded absolute paths: walk up
-// from this module looking for a project-local install, and fall back to
-// the PATH name (global install) when none is found.
-function resolveBansosRouter(): string {
+// Resolve the bansos-router CLI entry. Preferred: Node's own resolution
+// from this module (handles hoisting and installed layouts correctly).
+// Fallback: walk up from this module (dev layouts, bundled copies).
+// The bin entry prefers the "bansos" key when bin is an object (U1.5).
+export function resolveBansosRouter(): string {
+  try {
+    const req = createRequire(import.meta.url);
+    const pkgPath = req.resolve("bansos-router/package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { bin?: string | Record<string, string> };
+    const bin = pkg.bin;
+    const entry =
+      typeof bin === "string"
+        ? bin
+        : bin && typeof bin === "object"
+          ? (bin["bansos"] ?? Object.values(bin)[0])
+          : undefined;
+    if (typeof entry === "string" && entry.length > 0) return join(dirname(pkgPath), entry);
+  } catch {
+    // fall through to the walk-up fallback
+  }
   let dir = dirname(fileURLToPath(import.meta.url));
   for (let i = 0; i < 6; i++) {
     const pkgDir = join(dir, "node_modules", "bansos-router");
@@ -22,7 +39,12 @@ function resolveBansosRouter(): string {
       try {
         const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { bin?: string | Record<string, string> };
         const bin = pkg.bin;
-        const entry = typeof bin === "string" ? bin : bin && typeof bin === "object" ? Object.values(bin)[0] : undefined;
+        const entry =
+          typeof bin === "string"
+            ? bin
+            : bin && typeof bin === "object"
+              ? (bin["bansos"] ?? Object.values(bin)[0])
+              : undefined;
         if (typeof entry === "string" && entry.length > 0) return join(pkgDir, entry);
       } catch {
         // fall through to the PATH name
@@ -35,14 +57,19 @@ function resolveBansosRouter(): string {
   return "bansos-router";
 }
 
+// Spawn helper shared by the router module and llm.ensureDaemon: a bare
+// name runs from PATH; a resolved file path runs under node.
+export function spawnRouter(args: string[]): ReturnType<typeof spawn> {
+  const routerPath = resolveBansosRouter();
+  return routerPath === "bansos-router"
+    ? spawn(routerPath, args, { stdio: "ignore", detached: true })
+    : spawn(execPath, [routerPath, ...args], { stdio: "ignore", detached: true });
+}
+
 export function spawnDaemon(port: number = DEFAULT_PORT): Promise<void> {
   return new Promise((resolve, reject) => {
-    const routerPath = resolveBansosRouter();
     const args = ["start", `--port=${port}`, "--bg"];
-    // A bare name runs from PATH; a resolved file path runs under node.
-    const proc = routerPath === "bansos-router"
-      ? spawn(routerPath, args, { stdio: "ignore", detached: true })
-      : spawn(execPath, [routerPath, ...args], { stdio: "ignore", detached: true });
+    const proc = spawnRouter(args);
     proc.unref();
 
     const deadline = Date.now() + 5000;

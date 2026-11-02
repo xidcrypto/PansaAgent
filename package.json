@@ -1,5 +1,5 @@
 {
-  "name": "pansa",
+  "name": "pansa-agent",
   "version": "0.1.0",
   "description": "PANSA - lightweight CLI + TUI AI agent focused on crypto airdrops",
   "license": "MIT",
@@ -17,18 +17,26 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "PANSA_TEST=1 tsx --test test/*.test.ts",
-    "build": "esbuild src/cli.ts --bundle --platform=node --target=node22 --format=esm --outdir=dist --external:viem --external:@scure/bip39 --external:@noble/hashes --external:bansos-router --external:better-sqlite3 --sourcemap",
+    "build": "esbuild src/cli.ts --bundle --platform=node --target=node22 --format=esm --splitting --outdir=dist --banner:js='#!/usr/bin/env node' --external:viem --external:@scure/bip39 --external:@noble/hashes --external:bansos-router --external:better-sqlite3 --external:@solana/web3.js --external:playwright --sourcemap && node scripts/postbuild.mjs",
     "dev": "tsx src/cli.ts"
   },
   "dependencies": {
     "@noble/hashes": "^1.5.0",
     "@scure/bip39": "^1.4.0",
     "bansos-router": "0.5.1",
+    "better-sqlite3": "^13.0.3",
     "viem": "^2.21.5"
+  },
+  "peerDependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "playwright": "^1.49.0"
+  },
+  "peerDependenciesMeta": {
+    "@solana/web3.js": { "optional": true },
+    "playwright": { "optional": true }
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "better-sqlite3": "^13.0.3",
     "esbuild": "^0.24.0",
     "tsx": "^4.23.15",
     "typescript": "^5.6.3"

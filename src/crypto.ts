@@ -22,14 +22,26 @@ export interface EncryptedPayload {
   scrypt: { N: number; r: number; p: number; keylen: number };
 }
 
-export function encrypt(plaintext: Buffer, passphrase: string): EncryptedPayload {
+export interface ScryptParams {
+  N?: number;
+  r?: number;
+  p?: number;
+}
+
+// Production KDF parameters. Weaker parameters may be injected ONLY via
+// the optional `params` argument (used by tests for speed); environment
+// variables NEVER change production crypto behavior (U1.4).
+export function encrypt(plaintext: Buffer, passphrase: string, params: ScryptParams = {}): EncryptedPayload {
+  const N = params.N ?? SCRYPT_N;
+  const r = params.r ?? SCRYPT_R;
+  const p = params.p ?? SCRYPT_P;
   const salt = randomBytes(SALT_LEN);
   const iv = randomBytes(IV_LEN);
   const key = scryptSync(passphrase, salt, SCRYPT_KEYLEN, {
-    N: SCRYPT_N,
-    r: SCRYPT_R,
-    p: SCRYPT_P,
-    maxmem: scryptMaxMem(SCRYPT_N, SCRYPT_R),
+    N,
+    r,
+    p,
+    maxmem: scryptMaxMem(N, r),
   });
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   cipher.setAAD(Buffer.from("pansa-v1", "utf8"));
@@ -41,7 +53,7 @@ export function encrypt(plaintext: Buffer, passphrase: string): EncryptedPayload
     iv: iv.toString("base64"),
     tag: tag.toString("base64"),
     salt: salt.toString("base64"),
-    scrypt: { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, keylen: SCRYPT_KEYLEN },
+    scrypt: { N, r, p, keylen: SCRYPT_KEYLEN },
   };
 }
 

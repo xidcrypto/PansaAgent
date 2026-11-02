@@ -5,8 +5,7 @@ import { keystoreUnlock } from "./keystore.js";
 import { getSpentToday, recordSpend } from "./ledger.js";
 import { resolveEvmRpc, getEvmChainId, isTestnetChainId } from "../evm-rpc.js";
 import { evmAccountFromMnemonic } from "./evm.js";
-import { createWalletClient, http, parseEther } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { loadViem, loadViemAccounts } from "../viem-lazy.js";
 
 // Execute a HUMAN-confirmed request: re-validate everything at broadcast
 // time (expiry, policy, daily cap, live testnet check, fresh simulation),
@@ -74,6 +73,8 @@ export async function executeConfirmed(
 
   try {
     const { privateKey } = evmAccountFromMnemonic(mnemonic, path);
+    const { privateKeyToAccount } = await loadViemAccounts();
+    const { createWalletClient, http, parseEther } = await loadViem();
     const account = privateKeyToAccount(privateKey as `0x${string}`);
     const chainId = tx.chainId!;
     const walletClient = createWalletClient({

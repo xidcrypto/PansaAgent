@@ -1,12 +1,11 @@
-import { spawn } from "node:child_process";
 import { DEFAULT_MODEL_PREF, REASONING_MODELS, CHEAP_MODELS } from "./config.js";
+import { spawnRouter } from "./router.js";
 
 // Overridable for tests (PANSA_LLM_BASE): points fetchJson/streamChat at
 // a local test server instead of the real daemon port.
 const BASE = process.env.PANSA_LLM_BASE ?? "http://127.0.0.1:17070";
 const MODELS_PATH = "/v1/models";
 const CHAT_PATH = "/v1/chat/completions";
-const DAEMON_CMD = "bansos";
 const DAEMON_ARGS = ["start", "--bg"];
 const START_POLL_MS = 200;
 const START_MAX_MS = 5000;
@@ -116,7 +115,10 @@ export async function ensureDaemon(): Promise<void> {
   // binary_missing, never degrade into a daemon timeout (M17).
   let spawnErr: Error | undefined;
   await new Promise<void>((resolve) => {
-    const proc = spawn(DAEMON_CMD, DAEMON_ARGS, { detached: true, stdio: "ignore" });
+    // Resolve the bundled bansos-router first (createRequire), global
+    // "bansos" only as fallback: a local install must work without a
+    // global binary (U1.5).
+    const proc = spawnRouter(DAEMON_ARGS);
     proc.unref();
     const timer = setTimeout(resolve, 1000);
     proc.on("error", (err) => {

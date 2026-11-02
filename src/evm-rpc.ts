@@ -1,4 +1,4 @@
-import { createPublicClient, http, formatEther } from "viem";
+import { loadViem } from "./viem-lazy.js";
 import { loadConfig } from "./config.js";
 
 // EVM RPC access shared by balance lookup, testnet detection, simulation
@@ -9,21 +9,23 @@ export function resolveEvmRpc(explicit?: string): string | undefined {
   return explicit ?? process.env.PANSA_EVM_RPC ?? loadConfig().evmRpc;
 }
 
-export function evmPublicClient(rpcUrl: string): ReturnType<typeof createPublicClient> {
+export async function evmPublicClient(rpcUrl: string) {
+  const { createPublicClient, http } = await loadViem();
   return createPublicClient({ transport: http(rpcUrl) });
 }
 
 export async function getEvmBalance(address: string, rpcUrl: string): Promise<bigint> {
-  const client = evmPublicClient(rpcUrl);
+  const client = await evmPublicClient(rpcUrl);
   return client.getBalance({ address: address as `0x${string}` });
 }
 
 export async function getEvmChainId(rpcUrl: string): Promise<number> {
-  const client = evmPublicClient(rpcUrl);
+  const client = await evmPublicClient(rpcUrl);
   return client.getChainId();
 }
 
-export function formatEth(value: bigint): string {
+export async function formatEth(value: bigint): Promise<string> {
+  const { formatEther } = await loadViem();
   return formatEther(value);
 }
 

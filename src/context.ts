@@ -107,6 +107,19 @@ export class ContextManager {
     this.trim();
   }
 
+  // Restore prior turns (U4: -c / --resume / /resume). Messages were
+  // already redacted when persisted, so they are restored as-is. Tool
+  // turns are skipped: bare tool outputs without their calls are noise
+  // for the model. Safety rules are never restored from history — the
+  // system prompt and the signer policy are independent of this.
+  restoreTurns(turns: Array<{ role: string; content: string }>): void {
+    for (const t of turns) {
+      if (t.role !== "user" && t.role !== "assistant") continue;
+      this.messages.push({ role: t.role, content: t.content });
+    }
+    this.trim();
+  }
+
   messagesForLlm(): Array<{ role: string; content: string }> {
     return [
       { role: "system", content: this.systemPrompt },

@@ -1,5 +1,6 @@
 import { fork, ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import { resolveSignerEntry } from "./entry.js";
 
 export type SignerRequest = { id: unknown; method: string; params?: Record<string, unknown> };
 export type SignerResponse = { id: unknown; ok: boolean; result?: unknown; error?: string };
@@ -97,5 +98,25 @@ export class SignerClient {
 
   close(): void {
     try { this.proc.kill(); } catch { /* ignore */ }
+  }
+}
+
+// Shared signer client for the CLI and the TUI (U3: /wallet new and the
+// deterministic TUI commands must use the same signer process channel,
+// not touch keystore files directly).
+let sharedClient: SignerClient | null = null;
+
+export function getSignerClient(): SignerClient {
+  if (!sharedClient) {
+    const { file, args } = resolveSignerEntry();
+    sharedClient = new SignerClient(file, process.env.PANSA_PASSPHRASE, args);
+  }
+  return sharedClient;
+}
+
+export function closeSignerClient(): void {
+  if (sharedClient) {
+    try { sharedClient.close(); } catch { /* ignore */ }
+    sharedClient = null;
   }
 }

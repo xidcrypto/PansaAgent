@@ -47,6 +47,9 @@ export interface GatewayConfig {
   adapter: string;
   allowlist: string[];
   features: string[];
+  // Explicit opt-in for the testnet confirm path via the gateway.
+  // Mainnet confirmations via the gateway are never allowed.
+  confirmTestnet?: boolean;
 }
 
 export interface PansaConfig {
