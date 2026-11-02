@@ -6,6 +6,9 @@ export interface UpdateInfo {
   current: string;
   latest: string | null;
   updateAvailable: boolean;
+  // True when the registry answers 404: the package was never published.
+  // This is not a network failure, and the message must say so.
+  notPublished?: boolean;
 }
 
 // The installed version, read from the nearest package.json walking up
@@ -49,6 +52,7 @@ export async function checkUpdate(fetchFn: typeof fetch = fetch): Promise<Update
     const res = await fetchFn("https://registry.npmjs.org/pansa-agent/latest", {
       headers: { accept: "application/json" },
     });
+    if (res.status === 404) return { current, latest: null, updateAvailable: false, notPublished: true };
     if (!res.ok) return { current, latest: null, updateAvailable: false };
     const data = (await res.json()) as { version?: string };
     const latest = data.version ?? null;

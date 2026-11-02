@@ -259,6 +259,10 @@ async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.j
 
 async function updateCmd(): Promise<number> {
   const info = await checkUpdate();
+  if (info.notPublished) {
+    process.stdout.write(`Paket pansa-agent belum dipublish di npm (versi terinstal: ${info.current}). Jalankan npm publish bila sudah siap.\n`);
+    return 0;
+  }
   if (info.latest === null) {
     process.stdout.write(`Tidak dapat memeriksa pembaruan (registry tidak terjangkau). Versi terinstal: ${info.current}\n`);
     return 1;
