@@ -152,7 +152,9 @@ export async function inspectContract(
       report.probes.push({ selector: cand.selector, label: cand.label, ok: true, detail: `menjawab (${data.slice(0, 18)}…)` });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      report.probes.push({ selector: cand.selector, label: cand.label, ok: false, detail: msg.slice(0, 80) });
+      // RPC errors are multi-line (viem prints call arguments); flatten
+      // so one probe stays one line in the report.
+      report.probes.push({ selector: cand.selector, label: cand.label, ok: false, detail: msg.replace(/\s+/g, " ").slice(0, 80) });
     }
   }
   if (report.probes.some((p) => p.ok)) {
