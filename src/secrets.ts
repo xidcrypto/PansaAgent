@@ -119,6 +119,14 @@ export function secretsLoad(passphrase: string): SecretsStore {
   );
 }
 
+export function secretsHas(key: string): boolean {
+  ensureSecretsDb();
+  return withDb((db) => {
+    const row = db.prepare("SELECT 1 AS one FROM secrets WHERE key = ?").get(key) as { one: number } | undefined;
+    return row !== undefined;
+  });
+}
+
 export function secretsSave(store: SecretsStore, passphrase: string): void {
   ensureSecretsDb();
   withDb((db) => {

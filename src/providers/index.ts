@@ -5,7 +5,7 @@
 // `provider:<id>:apiKey` and is never returned by any list/read call.
 
 import { loadConfig, saveConfig } from "../config.js";
-import { secretsLoad, secretsSave, secretsSet } from "../secrets.js";
+import { secretsLoad, secretsSave, secretsSet, secretsHas } from "../secrets.js";
 
 export interface CustomProviderConfig {
   id: string;
@@ -71,10 +71,13 @@ function secretKey(id: string): string {
 }
 
 function hasStoredKey(id: string, passphrase?: string): boolean {
+  // Hanya cek keberadaan baris (tanpa dekripsi): listProviders dipanggil
+  // setiap polling /api/status (3 detik), dan dekripsi scrypt per nilai
+  // membuat status menggantung sampai nginx 504 (10 detik) saat provider
+  // dan secret bertambah. Fail-closed tetap: tanpa passphrase -> false.
   if (!passphrase) return false;
   try {
-    const store = secretsLoad(passphrase);
-    return typeof store[secretKey(id)] === "string" && store[secretKey(id)].length > 0;
+    return secretsHas(secretKey(id));
   } catch {
     return false;
   }

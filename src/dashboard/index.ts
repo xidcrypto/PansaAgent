@@ -437,7 +437,7 @@ document.getElementById("sidebar-toggle").addEventListener("click",()=>{
   }
 });
 document.getElementById("backdrop").addEventListener("click",()=>layoutEl.classList.remove("sidebar-open"));
-document.getElementById("logout").addEventListener("click",async()=>{ await fetch("api/logout",{method:"POST"}); location=dashPrefix + "/login"; });
+document.getElementById("logout").addEventListener("click",()=>{ try{ fetch("api/logout",{method:"POST",keepalive:true}).catch(()=>{}); }catch(e){} location=dashPrefix + "/login"; });
 async function api(path,method,body){
   const r=await fetch(path,{method,headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
   if(r.status===401){ location=dashPrefix + "/login"; throw new Error("Belum masuk."); }
@@ -446,9 +446,10 @@ async function api(path,method,body){
   return j;
 }
 let customCache=[];
+let armedDel="";
 function customRowsHtml(list){
   if(!list.length) return '<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>';
-  return list.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="mono">'+esc(p.baseUrl)+'</td><td>'+esc(p.models.join(", "))+'</td><td>'+(p.enabled?'<span class="badge ok">aktif</span>':'<span class="badge muted">nonaktif</span>')+'</td><td>'+(p.hasKey?"ada":"tidak ada")+'</td><td><button type="button" data-act="test" data-id="'+esc(p.id)+'">Uji</button> <button type="button" data-act="edit" data-id="'+esc(p.id)+'">Edit</button> <button type="button" data-act="toggle" data-id="'+esc(p.id)+'">'+(p.enabled?"Nonaktifkan":"Aktifkan")+'</button> <button type="button" data-act="del" data-id="'+esc(p.id)+'">Hapus</button></td></tr>').join("");
+  return list.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="mono">'+esc(p.baseUrl)+'</td><td>'+esc(p.models.join(", "))+'</td><td>'+(p.enabled?'<span class="badge ok">aktif</span>':'<span class="badge muted">nonaktif</span>')+'</td><td>'+(p.hasKey?"ada":"tidak ada")+'</td><td><button type="button" data-act="test" data-id="'+esc(p.id)+'">Uji</button> <button type="button" data-act="edit" data-id="'+esc(p.id)+'">Edit</button> <button type="button" data-act="toggle" data-id="'+esc(p.id)+'">'+(p.enabled?"Nonaktifkan":"Aktifkan")+'</button> <button type="button" data-act="del" data-id="'+esc(p.id)+'">'+(armedDel===p.id?"Yakin hapus?":"Hapus")+'</button></td></tr>').join("");
 }
 function renderCustom(list){
   customCache=list;
@@ -463,12 +464,13 @@ document.getElementById("custom-rows").addEventListener("click",async e=>{
   const id=btn.getAttribute("data-id"); const act=btn.getAttribute("data-act");
   const msg=document.getElementById("provider-msg");
   try{
-    if(act==="del"){ if(!confirm("Hapus provider ini?")) return; await api("api/providers/"+encodeURIComponent(id),"DELETE"); }
-    else if(act==="toggle"){ const cur=customCache.find(x=>x.id===id); if(!cur) return; await api("api/providers/"+encodeURIComponent(id),"PUT",{enabled:!cur.enabled}); }
+    let doneMsg="";
+    if(act==="del"){ if(armedDel!==id){ armedDel=id; renderCustom(customCache); setTimeout(()=>{ if(armedDel===id){ armedDel=""; renderCustom(customCache); } },5000); return; } armedDel=""; await api("api/providers/"+encodeURIComponent(id),"DELETE"); doneMsg="Provider dihapus."; }
+    else if(act==="toggle"){ const cur=customCache.find(x=>x.id===id); if(!cur) return; await api("api/providers/"+encodeURIComponent(id),"PUT",{enabled:!cur.enabled}); doneMsg="Status provider diubah."; }
     else if(act==="test"){ const res=await api("api/providers/"+encodeURIComponent(id)+"/test","POST"); msg.textContent=res.ok?("Uji OK: "+res.count+" model ("+(res.sample||[]).join(", ")+")"):("Uji gagal: "+res.error); return; }
-    else if(act==="edit"){ const p=customCache.find(x=>x.id===id); if(!p) return; document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
-    msg.textContent="";
+    else if(act==="edit"){ let p=customCache.find(x=>x.id===id); if(!p){ await refreshCustom(); p=customCache.find(x=>x.id===id); } if(!p){ msg.textContent="Error: provider tidak ditemukan, coba muat ulang halaman."; return; } document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
     await refreshCustom();
+    msg.textContent=doneMsg;
   }catch(err){ msg.textContent="Error: "+err.message; }
 });
 document.getElementById("provider-form").addEventListener("submit",async e=>{
@@ -481,8 +483,8 @@ document.getElementById("provider-form").addEventListener("submit",async e=>{
     if(id) await api("api/providers/"+encodeURIComponent(id),"PUT",payload);
     else await api("api/providers","POST",payload);
     document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
-    msg.textContent="Provider tersimpan.";
     await refreshCustom();
+    msg.textContent="Provider tersimpan.";
   }catch(err){ msg.textContent="Error: "+err.message; }
 });
 document.getElementById("provider-cancel").addEventListener("click",()=>{
@@ -492,7 +494,7 @@ function render(d){
   document.getElementById("m-cpu").innerHTML=d.system.cpuLoad1.toFixed(2)+' <span class="sub">/ '+d.system.cpuCount+' core</span>';
   document.getElementById("m-ram").innerHTML=fmtP(d.system.memUsedPct)+' <span class="sub">'+fmtB(d.system.memTotal-d.system.memFree)+' / '+fmtB(d.system.memTotal)+'</span>';
   document.getElementById("m-disk").innerHTML=fmtP(d.system.diskUsedPct)+' <span class="sub">'+(d.system.diskTotal===null?"—":fmtB(d.system.diskTotal-d.system.diskFree)+' / '+fmtB(d.system.diskTotal))+'</span>';
-  document.getElementById("m-up").innerHTML=fmtU(d.system.uptimeSec)+' <span class="sub">proses '+fmtU(d.system.processUptimeSec)+' · RSS '+fmtB(d.system.processRss)+'</span>';
+  document.getElementById("m-up").innerHTML=fmtU(d.system.uptimeSec)+' <span class="sub">proses '+fmtU(d.system.processUptimeSec)+' · RSS <span style="white-space:nowrap">'+fmtB(d.system.processRss)+'</span></span>';
   document.getElementById("wallets").innerHTML=d.wallets.length?d.wallets.map(w=>'<tr><td>'+esc(w.name)+'</td><td>'+esc(w.family)+'</td><td class="addr" title="'+esc(w.address)+'">'+esc(w.address)+'</td></tr>').join(""):'<tr><td colspan="3">(kosong — belum ada dompet di registry)</td></tr>';
   document.getElementById("cfg").innerHTML='Model: '+esc(d.models.join(", ")||"(tidak ada)")+'<br>Gateway Telegram: '+(d.gatewayEnabled?"aktif":"nonaktif")+' · pengguna terdaftar: '+d.gatewayAllowedUsers+'<br>Testnet only: '+(d.testnetOnly===undefined?"tidak diketahui":d.testnetOnly?"ya":"tidak")+'<br>Tugas terjadwal pending: '+d.scheduledPending+' dari '+d.scheduledTotal+' · Price alert aktif: '+d.alertsActive+' dari '+d.alertsTotal;
   document.getElementById("tasks").innerHTML=d.tasks.length?d.tasks.map(t=>'<tr><td class="mono">'+esc(t.id.slice(0,8))+'</td><td title="'+esc(t.prompt)+'">'+esc(trunc(t.prompt,90))+'</td><td>'+esc(t.run_at)+'</td><td>'+badge(t.status)+'</td><td title="'+esc(t.last_result||"")+'">'+esc(trunc(t.last_result,60))+'</td></tr>').join(""):'<tr><td colspan="5">(belum ada tugas terjadwal)</td></tr>';
@@ -524,6 +526,7 @@ async function tick(){
   }
 }
 document.getElementById("refresh").addEventListener("click",tick);
+tick();
 setInterval(tick,3000);
 `;
 
