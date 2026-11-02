@@ -24,7 +24,7 @@ import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand } from "./gateway/telegram.js";
+import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, connectTemplate } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -70,7 +70,7 @@ Usage:
   pansa --plain            Output teks polos (tanpa warna/markdown)
   pansa --no-color         Nonaktifkan warna ANSI
   pansa update             Cek pembaruan (hanya info, tidak auto-install)
-  pansa gateway [status|pair|start|allow|deny|allowlist]
+  pansa gateway [status|pair|start|allow|deny|allowlist|notify]
   pansa schedule [add|list|cancel|run-once|watch]
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
@@ -331,6 +331,33 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     process.stdout.write(`User ID terdaftar: ${(gw.allowedUsers ?? []).join(", ") || "(kosong)"}\nChat ter-pairing: ${gw.allowlist.join(", ") || "(kosong)"}\n`);
     return 0;
   }
+  if (sub === "notify") {
+    const id = Number(rest[1]);
+    if (!Number.isInteger(id) || id <= 0) {
+      process.stderr.write("Usage: pansa gateway notify <telegram-user-id-numerik>\n");
+      return 1;
+    }
+    const pass = process.env.PANSA_PASSPHRASE;
+    if (!pass) {
+      process.stderr.write("PANSA_PASSPHRASE diperlukan untuk membaca token bot dari secrets store.\n");
+      return 1;
+    }
+    const token = secretsGet(secretsLoad(pass), "telegram_bot_token");
+    if (!token) {
+      process.stderr.write("Token bot belum disimpan. Jalankan: pansa setup gateway\n");
+      return 1;
+    }
+    const bot = new TelegramBot(token);
+    try {
+      // Private chats with a bot use chat_id == user_id.
+      await bot.sendMessage(id, connectTemplate());
+      process.stdout.write(`Notifikasi connect terkirim ke user ${id}.\n`);
+      return 0;
+    } catch (err) {
+      process.stderr.write(`Gagal mengirim ke user ${id}: ${err instanceof Error ? err.message : String(err)}\n`);
+      return 1;
+    }
+  }
   if (sub === "pair") {
     const code = createPairing();
     process.stdout.write(`Kode pairing (berlaku 5 menit, sekali pakai): ${code}\nKirim /pair ${code} ke bot dari chat pribadi.\n`);
@@ -399,7 +426,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     });
     return 0;
   }
-  process.stderr.write("Usage: pansa gateway [status|pair|start|allow <user-id>|deny <user-id>|allowlist]\n");
+  process.stderr.write("Usage: pansa gateway [status|pair|start|allow <user-id>|deny <user-id>|allowlist|notify <user-id>]\n");
   return 1;
 }
 

@@ -122,12 +122,15 @@ export class TelegramBot {
   }
 
   async getUpdates(offset?: number, timeout = 5): Promise<TelegramUpdate[]> {
-    const res = await this.api<{ result: TelegramUpdate[] }>("getUpdates", {
+    // api() already unwraps data.result; do NOT unwrap twice (an early
+    // version read .result off the returned array and got [] forever —
+    // the loop polled empty batches and never answered anyone).
+    const result = await this.api<TelegramUpdate[]>("getUpdates", {
       offset,
       timeout,
       allowed_updates: ["message", "callback_query"],
     });
-    return res.result ?? [];
+    return result ?? [];
   }
 
   async sendMessage(chatId: number, text: string): Promise<void> {
@@ -143,7 +146,50 @@ export type GatewayAction =
   | { kind: "paired"; userId: number; chatId: number; text: string }
   | { kind: "agent"; userId: number; chatId: number; text: string };
 
-// Pure routing for one update. Private chats only; /pair links a chat
+// Connect template: the notification a user gets when they connect.
+// Sent on /start, on the first served message from a user, and by
+// `pansa gateway notify <user-id>`. Kept plain-text (no Markdown
+// parsing surprises) and honest: signing never happens via the bot.
+export function connectTemplate(nowMs: number = Date.now()): string {
+  const when = new Intl.DateTimeFormat("id-ID", {
+    timeZone: "Asia/Jakarta",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(nowMs));
+  return [
+    "✅ PANSA Terhubung",
+    "",
+    "Bot PANSA kamu sudah aktif dan siap dipakai.",
+    "",
+    "Perintah cepat:",
+    "/status — ringkasan kesehatan PANSA",
+    "/schedule — tugas terjadwal yang masih pending",
+    "/alerts — price alert yang masih aktif",
+    "/help — daftar perintah lengkap",
+    "",
+    "Atau kirim pesan bebas — agen PANSA akan menjawabnya.",
+    "",
+    "🔒 Keamanan: tanda tangan transaksi TIDAK PERNAH lewat bot. Konfirmasi hanya dilakukan manusia di TUI/CLI.",
+    "",
+    `Terhubung: ${when} WIB`,
+  ].join("\n");
+}
+
+// First-seen tracking: the connect template is sent once, before the
+// first served answer to a user — not on every message.
+export function markUserSeen(userId: number): boolean {
+  gatewayDb().exec(`
+    CREATE TABLE IF NOT EXISTS gateway_seen_users (
+      user_id TEXT PRIMARY KEY,
+      seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+  const info = gatewayDb().prepare(`INSERT OR IGNORE INTO gateway_seen_users (user_id) VALUES (?)`).run(String(userId)) as { changes: number };
+  return info.changes > 0;
+}
 // (owner-issued codes); /confirm and /reject are always refused via
 // the gateway (human-only, TUI/CLI). Access rule, in order:
 //   1. a user ID in allowedUsers is served immediately — no pairing
@@ -171,7 +217,7 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]
     return { kind: "reply", chatId, text: "Konfirmasi hanya bisa dilakukan manusia di TUI/CLI, bukan lewat gateway." };
   }
   if (text === "/start") {
-    return { kind: "reply", chatId, text: "PANSA terhubung. Kirim perintah apa pun; tanda tangan tetap butuh konfirmasi manusia di TUI/CLI." };
+    return { kind: "reply", chatId, text: connectTemplate() };
   }
   return { kind: "agent", userId, chatId, text };
 }
@@ -239,6 +285,15 @@ export async function runGatewayLoop(opts: {
           await opts.onPaired(action.userId, action.chatId);
           await opts.bot.sendMessage(action.chatId, action.text);
         } else if (action.kind === "agent") {
+          // First served message from this user: send the connect
+          // template once, then the actual answer.
+          try {
+            if (markUserSeen(action.userId)) {
+              await opts.bot.sendMessage(action.chatId, connectTemplate());
+            }
+          } catch {
+            // A template failure must not block the answer.
+          }
           const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
           await opts.bot.sendMessage(action.chatId, answer);
         }
