@@ -988,6 +988,18 @@ async function dashboardCmd(rest: string[], portArg?: string | boolean): Promise
     } catch {
       testnetOnly = undefined;
     }
+    // Log tail is opt-in via env so a dashboard never reads an arbitrary
+    // file by default; the module redacts secret-looking values at serve
+    // time regardless of what the file contains.
+    let logs: string[] = [];
+    const logFile = process.env.PANSA_DASHBOARD_LOG;
+    if (logFile && existsSync(logFile)) {
+      try {
+        logs = readFileSync(logFile, "utf8").split("\n").filter((l) => l.length > 0).slice(-100);
+      } catch {
+        logs = [];
+      }
+    }
     return {
       wallets: registry.map((w) => ({ name: w.name, address: w.address, family: w.family })),
       models: cfg.models ?? [],
@@ -998,6 +1010,25 @@ async function dashboardCmd(rest: string[], portArg?: string | boolean): Promise
       scheduledTotal: scheduled.length,
       alertsActive: alerts.filter((a) => a.status === "active").length,
       alertsTotal: alerts.length,
+      tasks: scheduled.map((t) => ({
+        id: t.id,
+        prompt: t.prompt,
+        run_at: t.run_at,
+        status: t.status,
+        last_run_at: t.last_run_at ?? null,
+        last_result: t.last_result ?? null,
+      })),
+      alerts: alerts.map((a) => ({
+        id: a.id,
+        token: a.token,
+        op: a.op,
+        price_usd: a.price_usd,
+        note: a.note,
+        status: a.status,
+        created_at: a.created_at,
+        triggered_at: a.triggered_at ?? null,
+      })),
+      logs,
     };
   };
   let handle: Awaited<ReturnType<typeof startDashboard>>;
