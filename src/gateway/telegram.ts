@@ -143,10 +143,15 @@ export type GatewayAction =
   | { kind: "paired"; userId: number; chatId: number; text: string }
   | { kind: "agent"; userId: number; chatId: number; text: string };
 
-// Pure routing for one update. Private chats only; non-allowlisted users
-// are ignored silently (no info leak); /pair links a chat; /confirm and
-// /reject are always refused via the gateway (human-only, TUI/CLI).
-export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]): GatewayAction {
+// Pure routing for one update. Private chats only; /pair links a chat
+// (owner-issued codes); /confirm and /reject are always refused via
+// the gateway (human-only, TUI/CLI). Access rule, in order:
+//   1. a user ID in allowedUsers is served immediately — no pairing
+//      needed, any private chat from that user works;
+//   2. a userId:chatId pair in allowlist (from a past pairing) works;
+//   3. everyone else is ignored silently (no info leak — not even the
+//      confirm refusal, which would confirm the bot is listening).
+export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[], allowedUsers: number[] = []): GatewayAction {
   const msg = update.message;
   if (!msg || typeof msg.text !== "string") return { kind: "ignore" };
   const userId = msg.from?.id;
@@ -161,10 +166,10 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]
     }
     return { kind: "reply", chatId, text: "Kode pairing tidak valid atau kedaluwarsa. Jalankan `pansa gateway pair` untuk kode baru." };
   }
+  if (!allowedUsers.includes(userId) && !isAllowlisted(allowlist, userId, chatId)) return { kind: "ignore" };
   if (text.startsWith("/confirm") || text.startsWith("/reject") || /^CONFIRM\s+\S+$/i.test(text) || /^REJECT\s+\S+$/i.test(text)) {
     return { kind: "reply", chatId, text: "Konfirmasi hanya bisa dilakukan manusia di TUI/CLI, bukan lewat gateway." };
   }
-  if (!isAllowlisted(allowlist, userId, chatId)) return { kind: "ignore" };
   if (text === "/start") {
     return { kind: "reply", chatId, text: "PANSA terhubung. Kirim perintah apa pun; tanda tangan tetap butuh konfirmasi manusia di TUI/CLI." };
   }
@@ -205,6 +210,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export async function runGatewayLoop(opts: {
   bot: TelegramBot;
   allowlist: () => string[];
+  allowedUsers?: () => number[];
   onPaired: (userId: number, chatId: number) => Promise<void> | void;
   onAgentText: (userId: number, chatId: number, text: string) => Promise<string>;
   signal: AbortSignal;
@@ -224,7 +230,7 @@ export async function runGatewayLoop(opts: {
     }
     for (const u of updates) {
       offset = u.update_id + 1;
-      const action = handleTelegramUpdate(u, opts.allowlist());
+      const action = handleTelegramUpdate(u, opts.allowlist(), opts.allowedUsers?.() ?? []);
       if (action.kind === "ignore") continue;
       try {
         if (action.kind === "reply") {

@@ -47,6 +47,12 @@ export interface GatewayConfig {
   adapter: string;
   allowlist: string[];
   features: string[];
+  // Telegram user IDs that may use the bot WITHOUT pairing: a private
+  // message from one of these users is served immediately. Anyone else
+  // is ignored silently (pairing codes issued by the owner still work
+  // as an enrollment path). Never put secrets here — user IDs are not
+  // secret, but they do identify who may access this instance.
+  allowedUsers?: number[];
   // Explicit opt-in for the testnet confirm path via the gateway.
   // Mainnet confirmations via the gateway are never allowed.
   confirmTestnet?: boolean;

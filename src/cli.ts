@@ -70,7 +70,7 @@ Usage:
   pansa --plain            Output teks polos (tanpa warna/markdown)
   pansa --no-color         Nonaktifkan warna ANSI
   pansa update             Cek pembaruan (hanya info, tidak auto-install)
-  pansa gateway [status|pair|start]
+  pansa gateway [status|pair|start|allow|deny|allowlist]
   pansa schedule [add|list|cancel|run-once|watch]
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
@@ -294,8 +294,41 @@ async function gatewayCmd(rest: string[]): Promise<number> {
       return 0;
     }
     process.stdout.write(
-      `Gateway Telegram: ${gw.enabled ? "aktif" : "nonaktif"}\nAllowlist: ${gw.allowlist.length} chat\nKonfirmasi via gateway: mainnet selalu ditolak; testnet ${gw.confirmTestnet ? "diizinkan" : "tidak diizinkan"} (eksekusi tetap manusia di TUI/CLI).\n`,
+      `Gateway Telegram: ${gw.enabled ? "aktif" : "nonaktif"}\nAllowlist: ${gw.allowlist.length} chat\nUser ID terdaftar (tanpa pairing): ${(gw.allowedUsers ?? []).length}\nKonfirmasi via gateway: mainnet selalu ditolak; testnet ${gw.confirmTestnet ? "diizinkan" : "tidak diizinkan"} (eksekusi tetap manusia di TUI/CLI).\n`,
     );
+    return 0;
+  }
+  if (sub === "allow" || sub === "deny") {
+    const id = Number(rest[1]);
+    if (!Number.isInteger(id) || id <= 0) {
+      process.stderr.write(`Usage: pansa gateway ${sub} <telegram-user-id-numerik>\n`);
+      return 1;
+    }
+    const c = loadConfig();
+    const g = c.gateways?.telegram ?? { enabled: true, adapter: "telegram", allowlist: [], features: [] };
+    const users = new Set(g.allowedUsers ?? []);
+    if (sub === "allow") {
+      users.add(id);
+      g.allowedUsers = [...users];
+      process.stdout.write(`User ID ${id} didaftarkan: bisa memakai bot tanpa pairing.\n`);
+    } else {
+      users.delete(id);
+      g.allowedUsers = [...users];
+      // A deny must close the legacy path too: drop any paired
+      // userId:chatId entries for this user, or the deny leaks.
+      g.allowlist = g.allowlist.filter((e) => !e.startsWith(`${id}:`));
+      process.stdout.write(`User ID ${id} dihapus dari akses bot (termasuk pairing lama).\n`);
+    }
+    c.gateways = { ...(c.gateways ?? {}), telegram: g };
+    saveConfig(c);
+    return 0;
+  }
+  if (sub === "allowlist") {
+    if (!gw) {
+      process.stdout.write("Gateway Telegram: belum dikonfigurasi.\n");
+      return 0;
+    }
+    process.stdout.write(`User ID terdaftar: ${(gw.allowedUsers ?? []).join(", ") || "(kosong)"}\nChat ter-pairing: ${gw.allowlist.join(", ") || "(kosong)"}\n`);
     return 0;
   }
   if (sub === "pair") {
@@ -330,6 +363,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     await runGatewayLoop({
       bot,
       allowlist: () => loadConfig().gateways?.telegram?.allowlist ?? [],
+      allowedUsers: () => loadConfig().gateways?.telegram?.allowedUsers ?? [],
       onPaired: async (userId, chatId) => {
         const c = loadConfig();
         const g = c.gateways?.telegram ?? { enabled: true, adapter: "telegram", allowlist: [], features: [] };
@@ -365,7 +399,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     });
     return 0;
   }
-  process.stderr.write("Usage: pansa gateway [status|pair|start]\n");
+  process.stderr.write("Usage: pansa gateway [status|pair|start|allow <user-id>|deny <user-id>|allowlist]\n");
   return 1;
 }
 

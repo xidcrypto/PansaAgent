@@ -65,7 +65,7 @@ export async function runDoctor(): Promise<DoctorCheck[]> {
     checks.push({
       name: "gateway",
       ok: true,
-      detail: gw ? `telegram dikonfigurasi (${gw.allowlist.length} chat di allowlist)` : "telegram belum dikonfigurasi",
+      detail: gw ? `telegram dikonfigurasi (${gw.allowlist.length} chat di allowlist, ${(gw.allowedUsers ?? []).length} user ID terdaftar)` : "telegram belum dikonfigurasi",
     });
     const servers = cfg.mcpServers ?? {};
     checks.push({ name: "mcp", ok: true, detail: `${Object.keys(servers).length} server dikonfigurasi` });
