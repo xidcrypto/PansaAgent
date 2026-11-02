@@ -92,7 +92,7 @@ document.getElementById("login-form").addEventListener("submit",async e=>{
     msg.textContent="Gagal menghubungi server — cek koneksi lalu coba lagi.";
     return;
   }
-  if(r.ok) location=location.pathname.replace(/\/login$/, "") || "/"; else location=location.pathname + "?error=1";
+  if(r.ok) { const p=location.pathname; location=p.endsWith("/login") ? p.slice(0, -6) || "/" : "/"; } else location=location.pathname + "?error=1";
 });
 </script></body></html>`;
 }
@@ -397,7 +397,7 @@ const fmtU=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.flo
 const trunc=(s,n)=>!s?"—":s.length>n?s.slice(0,n)+"…":s;
 const badge=st=>{const m={pending:["warn","pending"],active:["ok","aktif"],done:["ok","selesai"],triggered:["warn","terpicu"],failed:["bad","gagal"],cancelled:["muted","batal"]};const [c,l]=m[st]||["muted",st];return '<span class="badge '+c+'">'+esc(l)+'</span>';};
 const SECTIONS=["status","provider","model","dompet","tugas","alert","log"];
-const dashPrefix=location.pathname.replace(/\/$/, "");
+const dashPrefix=location.pathname.endsWith("/") ? location.pathname.slice(0, -1) : location.pathname;
 function showSection(id){
   if(!SECTIONS.includes(id)) id="status";
   SECTIONS.forEach(s=>{const el=document.getElementById("sec-"+s);if(el) el.style.display=s===id?"":"none";});
@@ -497,7 +497,7 @@ function render(d){
   document.getElementById("cfg").innerHTML='Model: '+esc(d.models.join(", ")||"(tidak ada)")+'<br>Gateway Telegram: '+(d.gatewayEnabled?"aktif":"nonaktif")+' · pengguna terdaftar: '+d.gatewayAllowedUsers+'<br>Testnet only: '+(d.testnetOnly===undefined?"tidak diketahui":d.testnetOnly?"ya":"tidak")+'<br>Tugas terjadwal pending: '+d.scheduledPending+' dari '+d.scheduledTotal+' · Price alert aktif: '+d.alertsActive+' dari '+d.alertsTotal;
   document.getElementById("tasks").innerHTML=d.tasks.length?d.tasks.map(t=>'<tr><td class="mono">'+esc(t.id.slice(0,8))+'</td><td title="'+esc(t.prompt)+'">'+esc(trunc(t.prompt,90))+'</td><td>'+esc(t.run_at)+'</td><td>'+badge(t.status)+'</td><td title="'+esc(t.last_result||"")+'">'+esc(trunc(t.last_result,60))+'</td></tr>').join(""):'<tr><td colspan="5">(belum ada tugas terjadwal)</td></tr>';
   document.getElementById("alerts").innerHTML=d.alerts.length?d.alerts.map(a=>'<tr><td class="mono">'+esc(a.token)+'</td><td>'+esc(a.op)+' $'+a.price_usd+'</td><td title="'+esc(a.note)+'">'+esc(trunc(a.note,60))+'</td><td>'+badge(a.status)+'</td><td>'+esc(a.created_at)+'</td></tr>').join(""):'<tr><td colspan="5">(belum ada price alert)</td></tr>';
-  document.getElementById("logs").textContent=d.logs.length?d.logs.join("\n"):"(tidak ada log yang dikonfigurasi — set PANSA_DASHBOARD_LOG ke path file log.)";
+  document.getElementById("logs").textContent=d.logs.length?d.logs.join("\\n"):"(tidak ada log yang dikonfigurasi — set PANSA_DASHBOARD_LOG ke path file log.)";
   document.getElementById("badge-tugas").textContent=d.scheduledPending>0?d.scheduledPending:"";
   document.getElementById("badge-alert").textContent=d.alertsActive>0?d.alertsActive:"";
   if(d.providers){
