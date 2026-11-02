@@ -111,6 +111,10 @@ export class TelegramBot {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+      // A stalled socket must never wedge the polling loop forever:
+      // abort well past Telegram's own 5s long-poll window so the loop
+      // retries instead of sleeping on a dead connection.
+      signal: AbortSignal.timeout(30000),
     });
     const data = (await res.json()) as { ok?: boolean; result?: T; description?: string };
     if (!data.ok) throw new Error(`Telegram ${method} gagal: ${data.description ?? res.status}`);
@@ -210,8 +214,11 @@ export async function runGatewayLoop(opts: {
     let updates: TelegramUpdate[];
     try {
       updates = await opts.bot.getUpdates(offset, 5);
-    } catch {
+    } catch (err) {
       if (opts.signal.aborted) break;
+      // Never swallow polling errors silently: a wedged loop looks
+      // exactly like a dead bot, so the failure must reach the log.
+      console.error(`Gateway poll gagal: ${err instanceof Error ? err.message : String(err)}`);
       await sleep(2000);
       continue;
     }
@@ -229,8 +236,10 @@ export async function runGatewayLoop(opts: {
           const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
           await opts.bot.sendMessage(action.chatId, answer);
         }
-      } catch {
+      } catch (err) {
         // A failed send must not kill the loop; the next poll continues.
+        // But it must be logged: silent send failures are invisible.
+        console.error(`Gateway kirim gagal: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
