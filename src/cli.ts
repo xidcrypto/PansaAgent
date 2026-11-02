@@ -15,7 +15,7 @@ import { walletRegistryLoad } from "./signer/keystore.js";
 import { getPolicy, savePolicy } from "./signer/policy.js";
 import { secretsLoad, secretsSave, secretsGet, secretsSet } from "./secrets.js";
 import { runDoctor, formatDoctor } from "./doctor.js";
-import { resolveEvmRpc, getEvmBalance, formatEth, evmPublicClient } from "./evm-rpc.js";
+import { resolveEvmRpc, getEvmBalance, getEvmChainId, formatEth, evmPublicClient } from "./evm-rpc.js";
 import { buildAgentToolsWithMcp } from "./tools.js";
 import { humanConfirm, humanReject } from "./human-confirm.js";
 import { TUI } from "./ui/index.js";
@@ -29,6 +29,10 @@ import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
 import type { ScoutRpc } from "./scout/index.js";
+import { getPortfolio, getWalletPortfolio, formatPortfolio, dexscreenerTokenPrice, dexscreenerNativePrice } from "./portfolio/index.js";
+import type { PortfolioDeps } from "./portfolio/index.js";
+import { selectBatchWallets, runBatch, formatBatchSummary } from "./batch/index.js";
+import { startDashboard } from "./dashboard/index.js";
 
 // Pure restore flags (no command, no other flags) open the TUI with a
 // session restore: `pansa -c` (last session) or `pansa --resume <id>`.
@@ -86,6 +90,9 @@ Usage:
   pansa wallet list|create <rantai> <nama>|use <nama>|unlock <nama>|lock <nama>
   pansa evm|solana|sui|aptos wallet [nama]
   pansa balance [evm]      Saldo dompet default (EVM via RPC)
+  pansa portfolio [nama...] [--token <alamat>]  Saldo + nilai semua dompet (read-only)
+  pansa batch balance|portfolio [nama...]  Satu perintah read-only untuk banyak dompet
+  pansa dashboard [--port N]  Halaman status lokal read-only (127.0.0.1 saja)
   pansa confirm <id>       Konfirmasi manusia + eksekusi transaksi
   pansa reject <id>        Tolak konfirmasi
   pansa secrets list|set <key> <value>|get <key>  Simpan/ambil secret terenkripsi
@@ -135,11 +142,11 @@ export async function main(argv: string[]): Promise<number> {
   const parsed = parseArgs({
     args: argv,
     boolean: ["help", "h", "plain", "no-color", "c", "continue"],
-    string: ["prompt", "p", "print", "resume"],
+    string: ["prompt", "p", "print", "resume", "port"],
     allowNegatives: false,
     strict: false,
   });
-  const values = parsed.values as { help?: boolean; h?: boolean; prompt?: string; plain?: boolean; "no-color"?: boolean; c?: boolean; continue?: boolean; p?: string; print?: string; resume?: string };
+  const values = parsed.values as { help?: boolean; h?: boolean; prompt?: string; plain?: boolean; "no-color"?: boolean; c?: boolean; continue?: boolean; p?: string; print?: string; resume?: string; port?: string | boolean };
   const positionals: string[] = parsed.positionals as string[];
 
   if (values.plain) process.env.PLAIN = "1";
@@ -209,6 +216,12 @@ export async function main(argv: string[]): Promise<number> {
       return secretsCmd(rest);
     case "balance":
       return balanceCmd(rest);
+    case "portfolio":
+      return portfolioCmd(rest);
+    case "batch":
+      return batchCmd(rest);
+    case "dashboard":
+      return dashboardCmd(rest, values.port);
     case "setup":
       return setupCmd(rest);
     case "daemon":
@@ -835,6 +848,171 @@ async function balanceCmd(rest: string[]): Promise<number> {
     process.stderr.write(`Gagal ambil saldo: ${err instanceof Error ? err.message : String(err)}\n`);
     return 1;
   }
+  return 0;
+}
+
+// Portfolio + batch share one dependency set: registry wallets, one RPC
+// endpoint, DexScreener prices. No unlock, no signing anywhere here.
+async function portfolioDeps(): Promise<PortfolioDeps | undefined> {
+  const rpcUrl = resolveEvmRpc();
+  if (!rpcUrl) return undefined;
+  let client: Awaited<ReturnType<typeof evmPublicClient>> | undefined;
+  const getClient = async () => (client ??= await evmPublicClient(rpcUrl));
+  return {
+    getNativeBalance: (address: string) => getEvmBalance(address, rpcUrl),
+    getChainId: () => getEvmChainId(rpcUrl),
+    call: async (to: string, data: string) => {
+      const c = await getClient();
+      const res = await c.call({ to: to as `0x${string}`, data: data as `0x${string}` });
+      return res.data ?? "0x";
+    },
+    priceFn: (token: string) => dexscreenerTokenPrice(token),
+    nativePriceFn: (chainId: number) => dexscreenerNativePrice(chainId),
+  };
+}
+
+function parseNameAndTokenArgs(rest: string[]): { names: string[]; tokens: string[] } {
+  const names: string[] = [];
+  const tokens: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--token" && rest[i + 1]) {
+      tokens.push(rest[++i]);
+    } else if (rest[i]?.startsWith("--token=")) {
+      tokens.push(rest[i].slice("--token=".length));
+    } else {
+      names.push(rest[i]);
+    }
+  }
+  return { names, tokens };
+}
+
+async function portfolioCmd(rest: string[]): Promise<number> {
+  const { names, tokens: flagTokens } = parseNameAndTokenArgs(rest);
+  const cfg = loadConfig();
+  const cfgTokens: string[] = ((cfg as any).portfolioTokens ?? []) as string[];
+  const tokens = [...new Set([...cfgTokens, ...flagTokens])];
+  const registry = walletRegistryLoad().filter((w) => w.family === "evm");
+  const wallets = names.length ? registry.filter((w) => names.includes(w.name)) : registry;
+  const missing = names.filter((n) => !registry.some((w) => w.name === n));
+  if (!wallets.length) {
+    process.stdout.write("Portfolio: (kosong — belum ada dompet EVM di registry)\n");
+    if (missing.length) process.stdout.write(`Dompet tidak ditemukan: ${missing.join(", ")}\n`);
+    return 0;
+  }
+  const deps = await portfolioDeps();
+  if (!deps) {
+    process.stderr.write("Tidak ada endpoint EVM RPC. Set PANSA_EVM_RPC atau evmRpc di ~/.pansa/config.json.\n");
+    return 1;
+  }
+  const portfolios = await getPortfolio(wallets, tokens, deps);
+  process.stdout.write(formatPortfolio(portfolios) + "\n");
+  if (missing.length) process.stdout.write(`Dompet tidak ditemukan: ${missing.join(", ")}\n`);
+  return 0;
+}
+
+async function batchCmd(rest: string[]): Promise<number> {
+  const [sub, ...rest2] = rest;
+  if (sub !== "balance" && sub !== "portfolio") {
+    process.stderr.write("Usage: pansa batch balance|portfolio [nama...] [--token <alamat>]\n");
+    return 1;
+  }
+  const { names, tokens: flagTokens } = parseNameAndTokenArgs(rest2);
+  const registry = walletRegistryLoad();
+  const { selected, unknown } = selectBatchWallets(names, registry);
+  if (!selected.length) {
+    process.stdout.write("Batch: (kosong — belum ada dompet di registry)\n");
+    if (unknown.length) process.stdout.write(`Dompet tidak ditemukan: ${unknown.join(", ")}\n`);
+    return 0;
+  }
+  const rpcUrl = resolveEvmRpc();
+  if (!rpcUrl) {
+    process.stderr.write("Tidak ada endpoint EVM RPC. Set PANSA_EVM_RPC atau evmRpc di ~/.pansa/config.json.\n");
+    return 1;
+  }
+  if (sub === "balance") {
+    const entries = await runBatch(selected, async (w) => {
+      if (w.family !== "evm") throw new Error(`hanya EVM (dompet ini ${w.family})`);
+      return `${await formatEth(await getEvmBalance(w.address, rpcUrl))}`;
+    });
+    for (const e of entries) {
+      process.stdout.write(e.ok ? `${e.wallet.family} ${e.wallet.name}: ${e.wallet.address}\n  Saldo: ${e.result}\n` : `${e.wallet.family} ${e.wallet.name}: gagal: ${e.error}\n`);
+    }
+    process.stdout.write(formatBatchSummary(entries, unknown) + "\n");
+    return 0;
+  }
+  const cfg = loadConfig();
+  const cfgTokens: string[] = ((cfg as any).portfolioTokens ?? []) as string[];
+  const tokens = [...new Set([...cfgTokens, ...flagTokens])];
+  const deps = await portfolioDeps();
+  if (!deps) {
+    process.stderr.write("Tidak ada endpoint EVM RPC. Set PANSA_EVM_RPC atau evmRpc di ~/.pansa/config.json.\n");
+    return 1;
+  }
+  const entries = await runBatch(selected, async (w) => {
+    const p = await getWalletPortfolio(w, tokens, deps);
+    if (p.error) throw new Error(p.error);
+    return p;
+  });
+  for (const e of entries) {
+    process.stdout.write(e.ok && e.result ? formatPortfolio([e.result]) + "\n" : `${e.wallet.family} ${e.wallet.name}: gagal: ${e.error}\n`);
+  }
+  process.stdout.write(formatBatchSummary(entries, unknown) + "\n");
+  return 0;
+}
+
+async function dashboardCmd(rest: string[], portArg?: string | boolean): Promise<number> {
+  let port = 18771;
+  // main()'s parseArgs runs strict:false with undeclared options, so a
+  // space-separated flag arrives as boolean true with its value left as
+  // the first positional (`--port 99999` -> portArg=true, rest=["99999"]),
+  // while `--port=99999` arrives as the string "99999". Both shapes are
+  // honoured here; a bare `--port N` inside rest covers direct calls.
+  if (typeof portArg === "string") port = Number(portArg);
+  else if (portArg === true && rest.length > 0 && /^\d+$/.test(rest[0])) port = Number(rest[0]);
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--port" && rest[i + 1]) port = Number(rest[++i]);
+    else if (rest[i]?.startsWith("--port=")) port = Number(rest[i].slice("--port=".length));
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    process.stderr.write("Usage: pansa dashboard [--port N]  (N = 1-65535)\n");
+    return 1;
+  }
+  const data = () => {
+    const cfg = loadConfig();
+    const registry = walletRegistryLoad();
+    const scheduled = listScheduled();
+    const alerts = listAlerts();
+    let testnetOnly: boolean | undefined;
+    try {
+      testnetOnly = (getPolicy() as any)?.testnetOnly;
+    } catch {
+      testnetOnly = undefined;
+    }
+    return {
+      wallets: registry.map((w) => ({ name: w.name, address: w.address, family: w.family })),
+      models: cfg.models ?? [],
+      gatewayEnabled: cfg.gateways?.telegram?.enabled ?? false,
+      gatewayAllowedUsers: cfg.gateways?.telegram?.allowedUsers?.length ?? 0,
+      testnetOnly,
+      scheduledPending: scheduled.filter((t) => t.status === "pending").length,
+      scheduledTotal: scheduled.length,
+      alertsActive: alerts.filter((a) => a.status === "active").length,
+      alertsTotal: alerts.length,
+    };
+  };
+  let handle: Awaited<ReturnType<typeof startDashboard>>;
+  try {
+    handle = await startDashboard({ port, data });
+  } catch (err) {
+    process.stderr.write(`Gagal menjalankan dashboard: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
+  process.stdout.write(`Dashboard PANSA (read-only, localhost saja): ${handle.url}\nTekan Ctrl+C untuk berhenti.\n`);
+  await new Promise<void>((resolve) => {
+    process.once("SIGINT", resolve);
+    process.once("SIGTERM", resolve);
+  });
+  await handle.close();
   return 0;
 }
 

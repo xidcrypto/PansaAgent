@@ -87,6 +87,9 @@ hanging or fabricating an answer.
 | `pansa wallet lock <nama>` | Drop the session unlock |
 | `pansa evm\|solana\|sui\|aptos wallet [nama]` | Create a wallet on a chain |
 | `pansa balance [evm]` | Default wallet balance (EVM via RPC only) |
+| `pansa portfolio [nama...] [--token <alamat>]` | Saldo + nilai semua dompet EVM (read-only) |
+| `pansa batch balance\|portfolio [nama...]` | Satu perintah read-only untuk banyak dompet |
+| `pansa dashboard [--port N]` | Halaman status lokal read-only (127.0.0.1 saja) |
 | `pansa confirm <id>` | Human confirmation + broadcast of a pending transaction |
 | `pansa reject <id>` | Reject a pending confirmation |
 | `pansa secrets list\|set <key> <value>\|get <key>` | Encrypted secrets (passphrase via `PANSA_PASSPHRASE`) |
