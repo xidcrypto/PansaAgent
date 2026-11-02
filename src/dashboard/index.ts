@@ -75,14 +75,23 @@ function loginPageHtml(error: boolean): string {
 <div class="label" style="margin-bottom:6px">Password dashboard</div>
 <input id="password" type="password" autocomplete="current-password" autofocus style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box">
 ${error ? `<p class="note" style="color:#cf222e;font-weight:700">Password salah.</p>` : ""}
-<div style="margin-top:14px"><button type="submit">Masuk</button></div>
+<div style="margin-top:14px"><button type="submit" style="background:#FFDC58">Masuk</button></div>
+<p class="note" id="login-msg" style="color:#cf222e;font-weight:700"></p>
 <p class="note">Password default: <code>password</code> — ganti lewat env PANSA_DASHBOARD_PASSWORD.</p>
 </form></div></div>
 <script>
 document.getElementById("login-form").addEventListener("submit",async e=>{
   e.preventDefault();
+  const msg=document.getElementById("login-msg");
+  msg.textContent="";
   const password=document.getElementById("password").value;
-  const r=await fetch("api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password})});
+  let r;
+  try {
+    r=await fetch("api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password})});
+  } catch (err) {
+    msg.textContent="Gagal menghubungi server — cek koneksi lalu coba lagi.";
+    return;
+  }
   if(r.ok) location=location.pathname.replace(/\/login$/, "") || "/"; else location=location.pathname + "?error=1";
 });
 </script></body></html>`;
@@ -341,7 +350,7 @@ function alertRows(alerts: DashboardAlert[]): string {
     .join("\n");
 }
 
-const CSS = `:root{--bg:#FFF6E9;--card:#fff;--text:#000;--muted:#333;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--yellow:#FFDC58}
+const CSS = `:root{--bg:#FFF6E9;--card:#fff;--text:#000;--muted:#333;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--yellow:#FFDC58;color-scheme:light}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}
 .wrap{max-width:1080px;margin:0 auto;padding:24px 16px 48px}
 header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
@@ -350,8 +359,9 @@ h2{font-size:.9rem;letter-spacing:.08em;text-transform:uppercase;margin:32px 0 1
 .live{display:flex;align-items:center;gap:8px;font-size:.9rem;font-weight:700}
 .dot{width:12px;height:12px;background:#B9FF66;border:2px solid #000}
 .dot.off{background:#FF6B6B}
-button{border:3px solid #000;background:#fff;border-radius:0;padding:8px 14px;cursor:pointer;font:inherit;font-weight:800;box-shadow:4px 4px 0 #000}
+button{border:3px solid #000;background:#fff;color:#000;border-radius:0;padding:8px 14px;cursor:pointer;font:inherit;font-weight:800;box-shadow:4px 4px 0 #000}
 button:active{transform:translate(4px,4px);box-shadow:0 0 0 #000}
+input,textarea,select{color:#000;background:#fff}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
 .card{background:var(--card);border:3px solid #000;border-radius:0;padding:16px 18px;box-shadow:4px 4px 0 #000}
 .label{font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;font-weight:800}
