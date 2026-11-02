@@ -1,24 +1,92 @@
-// Dashboard: a read-only local status page for this PANSA instance.
+// Dashboard: a local status + management page for this PANSA instance.
 //
 // Security posture, by design:
 // - Binds 127.0.0.1 only. Any other host is refused, not honoured — the
 //   page must never be reachable from the network on its own. (If an
 //   operator reverse-proxies it, e.g. nginx, that proxy is what makes it
 //   reachable, and the operator owns that exposure decision.)
-// - Read-only: GET / and GET /api/status exist, nothing else. Any other
-//   method gets 405, any other path 404. There is no endpoint that can
-//   mutate state, sign, approve, or broadcast, and none is planned: a
-//   dashboard that could move funds from a browser click would bypass
-//   the human-confirmation flow the signer is built around.
+// - Login gate: every route except /login and POST /api/login requires
+//   a session cookie issued after the dashboard password. Default
+//   password is "password" (the operator's explicit choice); override
+//   with PANSA_DASHBOARD_PASSWORD. Change it — anyone who finds the URL
+//   can guess the default.
+// - Provider CRUD only: POST/PUT/DELETE /api/providers manage the custom
+//   provider registry (config) and their keys (encrypted secrets store).
+//   There is still no endpoint that can move funds, sign, approve, or
+//   broadcast — a dashboard that could do that from a browser click
+//   would bypass the human-confirmation flow the signer is built around.
 // - No secrets in the output: wallet names and addresses only (the same
 //   data `pansa wallet list` and `pansa balance` already print to a
 //   terminal), task prompts and results as already redacted by the
 //   scheduler, and log lines passed through redactLogLine before they
-//   are served. Never mnemonics, keys, passphrases, or secret values.
+//   are served. Provider keys are never returned, never logged, and
+//   never appear in HTML or JSON. Never mnemonics, keys, passphrases,
+//   or secret values.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { cpus, freemem, loadavg, totalmem, uptime } from "node:os";
 import { statfsSync } from "node:fs";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import type { CustomProviderView, ProviderInput, ProviderTestResult } from "../providers/index.js";
+
+export interface ProviderStore {
+  list(): CustomProviderView[];
+  create(input: ProviderInput): CustomProviderView;
+  update(id: string, patch: Partial<ProviderInput>): CustomProviderView;
+  remove(id: string): void;
+  test(id: string): Promise<ProviderTestResult>;
+}
+
+function sha256(s: string): Buffer {
+  return createHash("sha256").update(s, "utf8").digest();
+}
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (header ?? "").split(";")) {
+    const idx = part.indexOf("=");
+    if (idx > 0) out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+async function readJsonBody(req: IncomingMessage, limit = 65536): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > limit) throw new Error("Body terlalu besar.");
+    chunks.push(chunk as Buffer);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (!text.trim()) return {};
+  return JSON.parse(text) as unknown;
+}
+
+function loginPageHtml(error: boolean): string {
+  return `<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PANSA Dashboard — Masuk</title>
+<style>${CSS}</style>
+</head><body><div class="wrap" style="max-width:420px;margin-top:80px">
+<h1>PANSA Dashboard</h1>
+<div class="card"><form id="login-form">
+<div class="label" style="margin-bottom:6px">Password dashboard</div>
+<input id="password" type="password" autocomplete="current-password" autofocus style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box">
+${error ? `<p class="note" style="color:#cf222e;font-weight:700">Password salah.</p>` : ""}
+<div style="margin-top:14px"><button type="submit">Masuk</button></div>
+<p class="note">Password default: <code>password</code> — ganti lewat env PANSA_DASHBOARD_PASSWORD.</p>
+</form></div></div>
+<script>
+document.getElementById("login-form").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const password=document.getElementById("password").value;
+  const r=await fetch("api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password})});
+  if(r.ok) location=location.pathname.replace(/\/login$/, "") || "/"; else location=location.pathname + "?error=1";
+});
+</script></body></html>`;
+}
 
 export interface DashboardWallet {
   name: string;
@@ -307,7 +375,10 @@ nav a .count{background:#000;color:#fff;padding:0 7px;font-size:.8rem;font-weigh
 .dot-nav{width:10px;height:10px;border:2px solid #000;background:#B9FF66;flex-shrink:0}
 .dot-nav.off{background:#FF6B6B}
 main{flex:1;min-width:0}
-@media (max-width:820px){.layout{flex-direction:column}.sidebar{width:auto;height:auto;position:static;border-right:0;border-bottom:3px solid #000;padding:12px 0}nav{display:flex;overflow-x:auto}nav a{white-space:nowrap;border-bottom:0;border-right:2px solid #000}}`;
+.sidebar{transition:transform .2s}
+.backdrop{display:none}
+@media (min-width:821px){.layout.sidebar-collapsed .sidebar{display:none}}
+@media (max-width:820px){.layout{flex-direction:column}.sidebar{position:fixed;top:0;left:0;height:100vh;z-index:10;transform:translateX(-105%);border-right:3px solid #000;box-shadow:8px 0 0 rgba(0,0,0,.2)}.layout.sidebar-open .sidebar{transform:none}.layout.sidebar-open .backdrop{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9}}`;
 
 const JS = `const esc=s=>String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fmtB=n=>n>=(1<<30)?(n/(1<<30)).toFixed(1)+" GB":n>=(1<<20)?(n/(1<<20)).toFixed(0)+" MB":(n/1024).toFixed(0)+" KB";
@@ -316,6 +387,7 @@ const fmtU=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.flo
 const trunc=(s,n)=>!s?"—":s.length>n?s.slice(0,n)+"…":s;
 const badge=st=>{const m={pending:["warn","pending"],active:["ok","aktif"],done:["ok","selesai"],triggered:["warn","terpicu"],failed:["bad","gagal"],cancelled:["muted","batal"]};const [c,l]=m[st]||["muted",st];return '<span class="badge '+c+'">'+esc(l)+'</span>';};
 const SECTIONS=["status","provider","model","dompet","tugas","alert","log"];
+const dashPrefix=location.pathname.replace(/\/$/, "");
 function showSection(id){
   if(!SECTIONS.includes(id)) id="status";
   SECTIONS.forEach(s=>{const el=document.getElementById("sec-"+s);if(el) el.style.display=s===id?"":"none";});
@@ -344,6 +416,68 @@ function modelRows(p){
   if(!all.length) return '<tr><td colspan="5">(tidak ada model — daemon tidak terjangkau atau katalog kosong)</td></tr>';
   return all.map(m=>'<tr><td class="mono" title="'+esc(m.name||"")+'">'+esc(m.id)+'</td><td>'+esc(m.source)+'</td><td>'+(m.context?m.context.toLocaleString("id-ID")+" token":"—")+'</td><td>'+(m.reasoning?"ya":"tidak")+'</td><td>'+(m.tools?"ya":"tidak")+'</td></tr>').join("");
 }
+const layoutEl=document.querySelector(".layout");
+const isMobile=()=>window.innerWidth<=820;
+try{ if(localStorage.getItem("pansa-sidebar-collapsed")==="1"&&!isMobile()) layoutEl.classList.add("sidebar-collapsed"); }catch(e){}
+document.getElementById("sidebar-toggle").addEventListener("click",()=>{
+  if(isMobile()){ layoutEl.classList.toggle("sidebar-open"); }
+  else{
+    const collapsed=layoutEl.classList.toggle("sidebar-collapsed");
+    try{ localStorage.setItem("pansa-sidebar-collapsed",collapsed?"1":"0"); }catch(e){}
+  }
+});
+document.getElementById("backdrop").addEventListener("click",()=>layoutEl.classList.remove("sidebar-open"));
+document.getElementById("logout").addEventListener("click",async()=>{ await fetch("api/logout",{method:"POST"}); location=dashPrefix + "/login"; });
+async function api(path,method,body){
+  const r=await fetch(path,{method,headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined});
+  if(r.status===401){ location=dashPrefix + "/login"; throw new Error("Belum masuk."); }
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+  return j;
+}
+let customCache=[];
+function customRowsHtml(list){
+  if(!list.length) return '<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>';
+  return list.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="mono">'+esc(p.baseUrl)+'</td><td>'+esc(p.models.join(", "))+'</td><td>'+(p.enabled?'<span class="badge ok">aktif</span>':'<span class="badge muted">nonaktif</span>')+'</td><td>'+(p.hasKey?"ada":"tidak ada")+'</td><td><button type="button" data-act="test" data-id="'+esc(p.id)+'">Uji</button> <button type="button" data-act="edit" data-id="'+esc(p.id)+'">Edit</button> <button type="button" data-act="toggle" data-id="'+esc(p.id)+'">'+(p.enabled?"Nonaktifkan":"Aktifkan")+'</button> <button type="button" data-act="del" data-id="'+esc(p.id)+'">Hapus</button></td></tr>').join("");
+}
+function renderCustom(list){
+  customCache=list;
+  document.getElementById("custom-rows").innerHTML=customRowsHtml(list);
+}
+async function refreshCustom(){
+  const j=await api("api/providers","GET");
+  renderCustom(j.providers||[]);
+}
+document.getElementById("custom-rows").addEventListener("click",async e=>{
+  const btn=e.target.closest("button[data-act]"); if(!btn) return;
+  const id=btn.getAttribute("data-id"); const act=btn.getAttribute("data-act");
+  const msg=document.getElementById("provider-msg");
+  try{
+    if(act==="del"){ if(!confirm("Hapus provider ini?")) return; await api("api/providers/"+encodeURIComponent(id),"DELETE"); }
+    else if(act==="toggle"){ const cur=customCache.find(x=>x.id===id); if(!cur) return; await api("api/providers/"+encodeURIComponent(id),"PUT",{enabled:!cur.enabled}); }
+    else if(act==="test"){ const res=await api("api/providers/"+encodeURIComponent(id)+"/test","POST"); msg.textContent=res.ok?("Uji OK: "+res.count+" model ("+(res.sample||[]).join(", ")+")"):("Uji gagal: "+res.error); return; }
+    else if(act==="edit"){ const p=customCache.find(x=>x.id===id); if(!p) return; document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
+    msg.textContent="";
+    await refreshCustom();
+  }catch(err){ msg.textContent="Error: "+err.message; }
+});
+document.getElementById("provider-form").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const msg=document.getElementById("provider-msg");
+  const id=document.getElementById("pf-id").value;
+  const payload={name:document.getElementById("pf-name").value,baseUrl:document.getElementById("pf-base").value,models:document.getElementById("pf-models").value.split(","),enabled:document.getElementById("pf-enabled").checked};
+  const key=document.getElementById("pf-key").value; if(key) payload.apiKey=key;
+  try{
+    if(id) await api("api/providers/"+encodeURIComponent(id),"PUT",payload);
+    else await api("api/providers","POST",payload);
+    document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
+    msg.textContent="Provider tersimpan.";
+    await refreshCustom();
+  }catch(err){ msg.textContent="Error: "+err.message; }
+});
+document.getElementById("provider-cancel").addEventListener("click",()=>{
+  document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
+});
 function render(d){
   document.getElementById("m-cpu").innerHTML=d.system.cpuLoad1.toFixed(2)+' <span class="sub">/ '+d.system.cpuCount+' core</span>';
   document.getElementById("m-ram").innerHTML=fmtP(d.system.memUsedPct)+' <span class="sub">'+fmtB(d.system.memTotal-d.system.memFree)+' / '+fmtB(d.system.memTotal)+'</span>';
@@ -362,6 +496,9 @@ function render(d){
     document.getElementById("provider-rows").innerHTML=providerRows(d.providers);
     document.getElementById("model-pinned").innerHTML='Model terkunci (config): '+esc(d.models.join(", ")||"(tidak ada — daemon memilih)");
     document.getElementById("model-rows").innerHTML=modelRows(d.providers);
+  }
+  if(d.customProviders){
+    renderCustom(d.customProviders);
   }
 }
 async function tick(){
@@ -410,15 +547,26 @@ function modelRows(providers: ProvidersInfo): string {
     .join("\n");
 }
 
-const ADD_PROVIDER_NOTE = `Provider di PANSA berasal dari daemon bansos (keyless, v1). Daemon ini tidak punya perintah atau API untuk menambah provider ber-API-key — gateway lokal bertoken (mis. 9Router) adalah roadmap M5 yang belum dirilis. Jadi provider baru saat ini ditambahkan lewat dashboard 9Router sendiri, bukan dari halaman ini atau lewat Telegram. API key tidak pernah dikirim lewat Telegram maupun lewat halaman ini: halaman ini tanpa login dan dipublikasikan lewat proxy, jadi form kunci di sini akan dibaca siapa pun yang punya URL.`;
+function customRows(custom: CustomProviderView[]): string {
+  if (!custom.length) return `<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>`;
+  return custom
+    .map(
+      (p) =>
+        `<tr><td>${escapeHtml(p.name)}</td><td class="mono">${escapeHtml(p.baseUrl)}</td><td>${escapeHtml(p.models.join(", "))}</td><td>${p.enabled ? '<span class="badge ok">aktif</span>' : '<span class="badge muted">nonaktif</span>'}</td><td>${p.hasKey ? "ada" : "tidak ada"}</td><td><button type="button" data-act="test" data-id="${escapeHtml(p.id)}">Uji</button> <button type="button" data-act="edit" data-id="${escapeHtml(p.id)}">Edit</button> <button type="button" data-act="toggle" data-id="${escapeHtml(p.id)}">${p.enabled ? "Nonaktifkan" : "Aktifkan"}</button> <button type="button" data-act="del" data-id="${escapeHtml(p.id)}">Hapus</button></td></tr>`,
+    )
+    .join("\n");
+}
 
-export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, providers: ProvidersInfo): string {
+const PROVIDER_KEY_NOTE = `Kunci API provider disimpan terenkripsi di secrets store (bukan di config) dan tidak pernah ditampilkan kembali — form edit yang dikosongkan berarti kunci lama tetap dipakai. Tombol Uji memanggil /v1/models endpoint provider untuk memastikan ia menjawab.`;
+
+export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, providers: ProvidersInfo, customProviders: CustomProviderView[]): string {
   return `<!DOCTYPE html>
 <html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PANSA Dashboard</title>
 <style>${CSS}</style>
 </head><body><div class="layout">
+<div class="backdrop" id="backdrop"></div>
 <aside class="sidebar"><div class="brand">PANSA<small>Dashboard</small></div><nav>
 <a href="#status" data-sec="status" class="active">Status</a>
 <a href="#provider" data-sec="provider">Provider <span class="dot-nav${providers.reachable ? "" : " off"}" id="dot-provider"></span></a>
@@ -429,8 +577,8 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 <a href="#log" data-sec="log">Log</a>
 </nav></aside>
 <main><div class="wrap">
-<header><h1>PANSA Dashboard</h1><div class="live"><span id="dot" class="dot"></span><span id="updated">live · refresh tiap 3 detik</span><button id="refresh" type="button">Perbarui sekarang</button></div></header>
-<p class="note">Read-only · halaman ini tidak bisa memindahkan dana, sign, atau approve apa pun.</p>
+<header><button id="sidebar-toggle" type="button" aria-label="Buka/tutup sidebar">☰</button><h1>PANSA Dashboard</h1><div class="live"><span id="dot" class="dot"></span><span id="updated">live · refresh tiap 3 detik</span><button id="refresh" type="button">Perbarui sekarang</button><button id="logout" type="button">Keluar</button></div></header>
+<p class="note">Halaman ini tidak bisa memindahkan dana, sign, atau approve apa pun — yang bisa diubah hanya registry provider custom.</p>
 <section id="sec-status">
 <h2>Status</h2>
 <div class="grid">
@@ -448,7 +596,24 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 <div class="tablewrap"><table><tr><th>Sumber</th><th>Jumlah</th><th>Contoh model</th></tr><tbody id="provider-rows">
 ${providerRows(providers)}</tbody></table></div>
 <h2>Tambah provider</h2>
-<div class="card">${escapeHtml(ADD_PROVIDER_NOTE)}</div>
+<div class="card">${escapeHtml(PROVIDER_KEY_NOTE)}</div>
+<h2>Provider custom (CRUD)</h2>
+<div class="tablewrap"><table><tr><th>Nama</th><th>Base URL</th><th>Model</th><th>Status</th><th>Kunci</th><th>Aksi</th></tr><tbody id="custom-rows">
+${customRows(customProviders)}</tbody></table></div>
+<div class="card"><form id="provider-form">
+<input type="hidden" id="pf-id">
+<div class="label" style="margin-bottom:6px">Nama</div>
+<input id="pf-name" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="mis. openrouter">
+<div class="label" style="margin-bottom:6px">Base URL (OpenAI-compatible)</div>
+<input id="pf-base" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="https://openrouter.ai/api/v1">
+<div class="label" style="margin-bottom:6px">Model (pisahkan koma)</div>
+<input id="pf-models" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="model-a, model-b">
+<div class="label" style="margin-bottom:6px">API key (kosongkan = pakai kunci lama / tanpa kunci)</div>
+<input id="pf-key" type="password" autocomplete="off" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px">
+<label style="font-weight:700"><input id="pf-enabled" type="checkbox" checked> Aktif</label>
+<div style="margin-top:14px"><button type="submit">Simpan provider</button> <button type="button" id="provider-cancel">Batal</button></div>
+<p class="note" id="provider-msg"></p>
+</form></div>
 </section>
 <section id="sec-model">
 <h2>Model</h2>
@@ -483,6 +648,8 @@ export async function startDashboard(opts: {
   port: number;
   host?: string;
   daemonBase?: string;
+  password?: string;
+  providers?: ProviderStore;
   data: () => DashboardData | Promise<DashboardData>;
 }): Promise<DashboardHandle> {
   // Loopback-only, unconditionally: a dashboard reachable from the
@@ -490,12 +657,115 @@ export async function startDashboard(opts: {
   if (opts.host !== undefined && opts.host !== "127.0.0.1" && opts.host !== "localhost") {
     throw new Error("Dashboard hanya boleh bind ke 127.0.0.1 (loopback).");
   }
+  const expectedHash = sha256(opts.password ?? process.env.PANSA_DASHBOARD_PASSWORD ?? "password");
+  const sessions = new Set<string>();
+  const isAuthed = (req: IncomingMessage): boolean => {
+    const token = parseCookies(req.headers.cookie).pansa_session;
+    return typeof token === "string" && sessions.has(token);
+  };
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      // Public: login page + login/logout actions.
+      if (url.pathname === "/login" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(loginPageHtml(url.searchParams.get("error") === "1"));
+        return;
+      }
+      if (url.pathname === "/api/login" && req.method === "POST") {
+        const body = (await readJsonBody(req)) as { password?: unknown };
+        const provided = typeof body.password === "string" ? body.password : "";
+        if (timingSafeEqual(sha256(provided), expectedHash)) {
+          const token = randomBytes(32).toString("hex");
+          sessions.add(token);
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Set-Cookie": `pansa_session=${token}; HttpOnly; Path=/; SameSite=Lax`,
+          });
+          res.end(JSON.stringify({ ok: true }));
+        } else {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Password salah." }));
+        }
+        return;
+      }
+      if (url.pathname === "/api/logout" && req.method === "POST") {
+        const token = parseCookies(req.headers.cookie).pansa_session;
+        if (token) sessions.delete(token);
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Set-Cookie": "pansa_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
+        });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      // Everything else requires a session.
+      if (!isAuthed(req)) {
+        if (url.pathname.startsWith("/api/")) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Belum masuk." }));
+        } else {
+          res.writeHead(302, { Location: "/login" });
+          res.end();
+        }
+        return;
+      }
+      // Provider CRUD (session-gated; keys never leave the server).
+      if (url.pathname === "/api/providers" || url.pathname.startsWith("/api/providers/")) {
+        if (!opts.providers) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Provider store tidak dikonfigurasi." }));
+          return;
+        }
+        const rest = url.pathname.slice("/api/providers".length);
+        try {
+          if (rest === "" && req.method === "GET") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ providers: opts.providers.list() }));
+            return;
+          }
+          if (rest === "" && req.method === "POST") {
+            const input = (await readJsonBody(req)) as ProviderInput;
+            const created = opts.providers.create(input);
+            res.writeHead(201, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ provider: created }));
+            return;
+          }
+          const m = rest.match(/^\/([^/]+)(\/test)?$/);
+          if (m) {
+            const id = decodeURIComponent(m[1]!);
+            if (m[2] === "/test" && req.method === "POST") {
+              const result = await opts.providers.test(id);
+              res.writeHead(result.ok ? 200 : 502, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(result));
+              return;
+            }
+            if (req.method === "PUT") {
+              const patch = (await readJsonBody(req)) as Partial<ProviderInput>;
+              const updated = opts.providers.update(id, patch);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ provider: updated }));
+              return;
+            }
+            if (req.method === "DELETE") {
+              opts.providers.remove(id);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true }));
+              return;
+            }
+          }
+        } catch (err) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+          return;
+        }
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Tidak ditemukan.\n");
+        return;
+      }
       if (req.method !== "GET") {
         res.writeHead(405, { "Content-Type": "text/plain" });
-        res.end("Method tidak diizinkan (dashboard read-only).\n");
+        res.end("Method tidak diizinkan.\n");
         return;
       }
       if (url.pathname === "/" || url.pathname === "/api/status") {
@@ -505,12 +775,13 @@ export async function startDashboard(opts: {
         const providers = await getProvidersInfo(
           opts.daemonBase ?? process.env.PANSA_LLM_BASE ?? "http://127.0.0.1:17070",
         );
+        const customProviders = opts.providers ? opts.providers.list() : [];
         if (url.pathname === "/") {
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(renderDashboardHtml(data, system, providers));
+          res.end(renderDashboardHtml(data, system, providers, customProviders));
         } else {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ...data, system, providers, readOnly: true, host: "127.0.0.1" }));
+          res.end(JSON.stringify({ ...data, system, providers, customProviders, readOnly: false, host: "127.0.0.1" }));
         }
         return;
       }

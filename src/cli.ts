@@ -33,6 +33,7 @@ import { getPortfolio, getWalletPortfolio, formatPortfolio, dexscreenerTokenPric
 import type { PortfolioDeps } from "./portfolio/index.js";
 import { selectBatchWallets, runBatch, formatBatchSummary } from "./batch/index.js";
 import { startDashboard } from "./dashboard/index.js";
+import { listProviders, createProvider, updateProvider, deleteProvider, testProviderById } from "./providers/index.js";
 
 // Pure restore flags (no command, no other flags) open the TUI with a
 // session restore: `pansa -c` (last session) or `pansa --resume <id>`.
@@ -1046,12 +1047,23 @@ async function dashboardCmd(rest: string[], portArg?: string | boolean): Promise
   };
   let handle: Awaited<ReturnType<typeof startDashboard>>;
   try {
-    handle = await startDashboard({ port, data });
+    const pass = process.env.PANSA_PASSPHRASE;
+    handle = await startDashboard({
+      port,
+      data,
+      providers: {
+        list: () => listProviders(pass),
+        create: (input) => createProvider(input, pass),
+        update: (id, patch) => updateProvider(id, patch, pass),
+        remove: (id) => deleteProvider(id, pass),
+        test: (id) => testProviderById(id, pass),
+      },
+    });
   } catch (err) {
     process.stderr.write(`Gagal menjalankan dashboard: ${err instanceof Error ? err.message : String(err)}\n`);
     return 1;
   }
-  process.stdout.write(`Dashboard PANSA (read-only, localhost saja): ${handle.url}\nTekan Ctrl+C untuk berhenti.\n`);
+  process.stdout.write(`Dashboard PANSA (localhost saja, login pakai password): ${handle.url}\nTekan Ctrl+C untuk berhenti.\n`);
   await new Promise<void>((resolve) => {
     process.once("SIGINT", resolve);
     process.once("SIGTERM", resolve);

@@ -89,7 +89,7 @@ hanging or fabricating an answer.
 | `pansa balance [evm]` | Default wallet balance (EVM via RPC only) |
 | `pansa portfolio [nama...] [--token <alamat>]` | Saldo + nilai semua dompet EVM (read-only) |
 | `pansa batch balance\|portfolio [nama...]` | Satu perintah read-only untuk banyak dompet |
-| `pansa dashboard [--port N]` | Dashboard neobrutalis realtime + sidebar (Status, Provider, Model, Dompet, Tugas, Alert, Log), read-only, 127.0.0.1 saja |
+| `pansa dashboard [--port N]` | Dashboard neobrutalis realtime + sidebar toggle (drawer di HP, collapse di desktop), login password (default `password`, env `PANSA_DASHBOARD_PASSWORD`), CRUD provider custom (kunci terenkripsi di secrets store), 127.0.0.1 saja |
 | `pansa confirm <id>` | Human confirmation + broadcast of a pending transaction |
 | `pansa reject <id>` | Reject a pending confirmation |
 | `pansa secrets list\|set <key> <value>\|get <key>` | Encrypted secrets (passphrase via `PANSA_PASSPHRASE`) |

@@ -1,5 +1,7 @@
 import { DEFAULT_MODEL_PREF, REASONING_MODELS, CHEAP_MODELS } from "./config.js";
 import { spawnRouter } from "./router.js";
+import { findCustomProvider, getProviderKey } from "./providers/index.js";
+import type { CustomProviderConfig } from "./providers/index.js";
 
 // Overridable for tests (PANSA_LLM_BASE): points fetchJson/streamChat at
 // a local test server instead of the real daemon port.
@@ -178,6 +180,7 @@ async function* streamChat(
   tools: ToolDef[],
   toolChoice: ChatOptions["toolChoice"],
   signal: AbortSignal,
+  endpoint?: { baseUrl: string; apiKey?: string },
 ): AsyncGenerator<string, ChatMessage, unknown> {
   const body: Record<string, unknown> = {
     model,
@@ -198,9 +201,11 @@ async function* streamChat(
   // when the provider sends one, falling back to call_<index>.
   const accCalls = new Map<string, { id: string; name: string; args: string }>();
   try {
-    const res = await fetch(`${BASE}${CHAT_PATH}`, {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (endpoint?.apiKey) headers.Authorization = `Bearer ${endpoint.apiKey}`;
+    const res = await fetch(`${endpoint ? endpoint.baseUrl.replace(/\/$/, "") : BASE}${CHAT_PATH}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
@@ -326,20 +331,40 @@ export interface ChatResult {
 export async function chat(
   opts: ChatOptions & { onChunk?: (text: string) => void },
   liveModels: string[],
-  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[] },
+  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[]; providers?: CustomProviderConfig[] },
 ): Promise<ChatResult> {
   const candidates = modelsForKind(opts.kind, liveModels, cfg);
-  if (candidates.length === 0) throw new LlmError("no live model available", { code: "no_model", retryable: false });
+  // Custom providers: a model served by an enabled custom provider that
+  // the daemon does NOT serve goes first (the user pinned it explicitly).
+  // A model that is ALSO daemon-live stays on the daemon path, so
+  // existing behavior never changes for daemon models.
+  const liveSet = new Set(liveModels);
+  const preferred = opts.kind === "reasoning" ? (cfg.preferReasoning ?? REASONING_MODELS) : (cfg.preferCheap ?? CHEAP_MODELS);
+  const allCfg = cfg.models ?? [...DEFAULT_MODEL_PREF];
+  const customModels: string[] = [];
+  for (const m of [...preferred, ...allCfg]) {
+    if (!liveSet.has(m) && !customModels.includes(m) && findCustomProvider(m, cfg.providers)) {
+      customModels.push(m);
+    }
+  }
+  const ordered = [...customModels, ...candidates.filter((m) => !customModels.includes(m))];
+  if (ordered.length === 0) throw new LlmError("no live model available", { code: "no_model", retryable: false });
 
   // Failover, not retry: each candidate gets one attempt; a failure moves
   // to the NEXT model instead of hammering the same one 3 times (M17).
   let lastErr: unknown;
   let attempt = 0;
-  for (const model of candidates) {
+  for (const model of ordered) {
     if (circuitOpen(model)) continue;
     try {
       const signal = opts.signal ?? new AbortController().signal;
-      const gen = streamChat(model, opts.messages, opts.tools, opts.toolChoice, signal);
+      const custom = !liveSet.has(model) ? findCustomProvider(model, cfg.providers) : undefined;
+      const gen = custom
+        ? streamChat(model, opts.messages, opts.tools, opts.toolChoice, signal, {
+            baseUrl: custom.baseUrl,
+            apiKey: getProviderKey(custom.id, process.env.PANSA_PASSPHRASE),
+          })
+        : streamChat(model, opts.messages, opts.tools, opts.toolChoice, signal);
       let step = await gen.next();
       while (!step.done) {
         if (typeof step.value === "string") opts.onChunk?.(step.value);

@@ -62,6 +62,9 @@ export interface PansaConfig {
   models?: string[];
   preferReasoning?: string[];
   preferCheap?: string[];
+  /** Custom OpenAI-compatible providers (keys live in the secrets store,
+   *  never here). See src/providers/index.ts. */
+  providers?: import("./providers/index.js").CustomProviderConfig[];
   concurrency?: number;
   ttlMs?: number;
   // EVM JSON-RPC endpoint for balance lookup, testnet detection,
