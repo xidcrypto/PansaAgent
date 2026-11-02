@@ -301,12 +301,28 @@ export interface GatewayCommandDeps {
   alertText: () => string;
 }
 
+// Sapaan ringan dijawab deterministik (tanpa LLM): agen dengan
+// toolChoice "required" tidak bisa menjawab sapaan dalam teks biasa
+// — ia dipaksa memanggil tool sampai batas langkah. Hanya sapaan
+// persis (bukan "halo, tolong ...") yang masuk sini.
+export function isGreeting(text: string): boolean {
+  const t = text.trim().toLowerCase().replace(/[!?.]+$/, "");
+  return [
+    "halo", "hai", "hi", "hello", "hey", "helo",
+    "selamat pagi", "selamat siang", "selamat sore", "selamat malam",
+    "assalamualaikum", "assalamu'alaikum", "salam",
+  ].includes(t);
+}
+
 // Deterministic gateway commands: answered without an LLM call (fast,
 // no model cost). Anything else falls through to the agent (null).
 // /balance and /portfolio are intentionally NOT deterministic here: they
 // need a configured wallet backend, and the agent's baw tool answers
 // them honestly when one is configured.
 export async function handleGatewayCommand(text: string, deps: GatewayCommandDeps): Promise<string | null> {
+  if (isGreeting(text)) {
+    return "Halo! Ada yang bisa PANSA bantu? Pakai tombol di bawah, atau kirim /status untuk ringkasan dan /help untuk daftar perintah.";
+  }
   const cmd = text.trim().split(/\s+/)[0];
   if (cmd === "/help") {
     return [
@@ -467,7 +483,7 @@ export async function runGatewayLoop(opts: {
               // A template failure must not block the answer.
             }
             const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
-            const keyboard = action.text.trim() === "/help" ? mainMenuKeyboard() : undefined;
+            const keyboard = action.text.trim() === "/help" || isGreeting(action.text) ? mainMenuKeyboard() : undefined;
             await opts.bot.sendMessage(action.chatId, answer, keyboard);
           } finally {
             clearInterval(typing);
