@@ -705,7 +705,9 @@ export async function startDashboard(opts: {
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: "Belum masuk." }));
         } else {
-          res.writeHead(302, { Location: "/login" });
+          // Redirect relatif (bukan "/login" absolut) supaya tetap benar
+          // saat dashboard di-mount di balik prefix seperti /pansa/.
+          res.writeHead(302, { Location: "login" });
           res.end();
         }
         return;
