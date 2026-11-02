@@ -2,6 +2,10 @@ import { SkillsManager, Skill } from "./manager.js";
 import { scamCheck } from "../research/index.js";
 import { createTrackerTool, createReportTool } from "../tracker/tools.js";
 import { createSignTool } from "../signer/tools.js";
+import { analyzeContract } from "../analyst/index.js";
+import type { AnalystRpc } from "../analyst/index.js";
+import { resolveScoutTarget } from "../scout/index.js";
+import { resolveEvmRpc, evmPublicClient } from "../evm-rpc.js";
 
 // Scout Skill - NOT IMPLEMENTED. There is no on-chain scanning in this
 // codebase, so scout honestly reports that instead of returning a stub
@@ -137,11 +141,47 @@ class MintSkill implements Skill {
 	}
 }
 
+// Analyst Skill - delegates to the real on-chain analyst module. Read-only:
+// it never signs or moves funds. It needs a configured EVM RPC and fails
+// closed without one, instead of returning a guessed verdict.
+class AnalystSkill implements Skill {
+	name = "analyst";
+	description = "Audit a token or contract from on-chain evidence (proxy, owner, blacklist, pause, verification, liquidity) and return a CLEAR, CAUTION, TRAP, or UNVERIFIED verdict";
+	parameters = {
+		address: { type: "string" },
+		wallet: { type: "string" },
+	};
+
+	async execute(args: Record<string, unknown>) {
+		const target = String(args.address ?? args.target ?? "");
+		if (!target) return { ok: false, data: null, error: "Butuh address kontrak (atau URL proyek)." };
+		const resolved = await resolveScoutTarget(target).catch(() => null);
+		if (!resolved) return { ok: false, data: null, error: "Target tidak dapat diurai: butuh alamat kontrak 0x… atau URL proyek." };
+		const rpcUrl = resolveEvmRpc();
+		if (!rpcUrl) return { ok: false, data: null, error: "RPC EVM tidak terkonfigurasi (set PANSA_EVM_RPC atau config)." };
+		const client = await evmPublicClient(rpcUrl);
+		const rpc: AnalystRpc = {
+			getCode: (address: string) => client.getCode({ address: address as `0x${string}` }),
+			call: async (to: string, data: string) => {
+				const res = await client.call({ to: to as `0x${string}`, data: data as `0x${string}` });
+				return res.data ?? "0x";
+			},
+			getStorageAt: async (address: string, slot: string) =>
+				(await client.getStorageAt({ address: address as `0x${string}`, slot: slot as `0x${string}` })) ?? "0x",
+		};
+		const chainId = await client.getChainId().catch(() => undefined);
+		const wallet = typeof args.wallet === "string" && args.wallet ? args.wallet : undefined;
+		const report = await analyzeContract(resolved.address, rpc, { wallet, chainId });
+		return { ok: true, data: report };
+	}
+}
+
 // Export skills manager instance
 const skillsManager = new SkillsManager();
 
 // Register built-in skills
 skillsManager.register(new ScoutSkill());
+skillsManager.register(new AnalystSkill());
 skillsManager.register(new ScamCheckSkill());
 skillsManager.register(new TrackerSkill());
 skillsManager.register(new ReportSkill());

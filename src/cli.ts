@@ -29,6 +29,8 @@ import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
 import type { ScoutRpc } from "./scout/index.js";
+import { analyzeContract, formatAnalystReport } from "./analyst/index.js";
+import type { AnalystRpc } from "./analyst/index.js";
 import { getPortfolio, getWalletPortfolio, formatPortfolio, dexscreenerTokenPrice, dexscreenerNativePrice } from "./portfolio/index.js";
 import type { PortfolioDeps } from "./portfolio/index.js";
 import { selectBatchWallets, runBatch, formatBatchSummary } from "./batch/index.js";
@@ -79,6 +81,7 @@ Usage:
   pansa schedule [add|list|cancel|run-once|watch]
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
+  pansa analyst <kontrak-atau-url> [wallet]  Audit kontrak read-only (verdict CLEAR/CAUTION/TRAP/UNVERIFIED)
   pansa mcp [list|tools|call]
   pansa browse <url>       Baca halaman web (butuh browser: true + playwright)
   pansa setup              Buat direktori + config/policy default
@@ -245,6 +248,8 @@ export async function main(argv: string[]): Promise<number> {
       return alertCmd(rest);
     case "scout":
       return scoutCmd(rest);
+    case "analyst":
+      return analystCmd(rest);
     case "mcp":
       return mcpCmd(rest);
     case "browse":
@@ -641,6 +646,39 @@ async function scoutCmd(rest: string[]): Promise<number> {
   };
   const report = await inspectContract(resolved.address, rpc, dexscreenerPrice);
   process.stdout.write(`${formatScoutReport(report)}\n`);
+  return 0;
+}
+
+async function analystCmd(rest: string[]): Promise<number> {
+  const target = rest[0];
+  if (!target) {
+    process.stderr.write("Usage: pansa analyst <contract-address-atau-url> [wallet]\n");
+    return 1;
+  }
+  const resolved = await resolveScoutTarget(target).catch(() => null);
+  if (!resolved) {
+    process.stderr.write("Target tidak dapat diurai: butuh alamat kontrak 0x… atau URL proyek yang memuat alamat kontrak.\n");
+    return 1;
+  }
+  const rpcUrl = resolveEvmRpc();
+  if (!rpcUrl) {
+    process.stderr.write("RPC EVM tidak terkonfigurasi (set PANSA_EVM_RPC atau config).\n");
+    return 1;
+  }
+  const client = await evmPublicClient(rpcUrl);
+  const rpc: AnalystRpc = {
+    getCode: (address: string) => client.getCode({ address: address as `0x${string}` }),
+    call: async (to: string, data: string) => {
+      const res = await client.call({ to: to as `0x${string}`, data: data as `0x${string}` });
+      return res.data ?? "0x";
+    },
+    getStorageAt: async (address: string, slot: string) =>
+      (await client.getStorageAt({ address: address as `0x${string}`, slot: slot as `0x${string}` })) ?? "0x",
+  };
+  const chainId = await client.getChainId().catch(() => undefined);
+  const wallet = rest[1];
+  const report = await analyzeContract(resolved.address, rpc, { wallet, chainId });
+  process.stdout.write(`${formatAnalystReport(report)}\n`);
   return 0;
 }
 
