@@ -7,7 +7,7 @@ export const CONFIG_FILE = `${PANSA_DIR}/config.json`;
 export const POLICY_FILE = `${PANSA_DIR}/policy.json`;
 export const KEYSTORE_DIR = `${PANSA_DIR}/keystore`;
 export const WALLETS_FILE = `${PANSA_DIR}/wallets.json`;
-export const SECRETS_FILE = `${PANSA_DIR}/secrets.json`;
+export const SECRETS_FILE = `${PANSA_DIR}/secrets.json`; // Legacy path only: one-time migration source for the SQLite secrets store.
 export const DB_FILE = `${PANSA_DIR}/db.sqlite`;
 
 export const REASONING_MODELS = [

@@ -168,8 +168,9 @@ error for Solana, Sui, and Aptos instead of a fake success.
 
 - **Never** shares mnemonics or private keys with the LLM.
 - All confirmations require an explicit human `CONFIRM <id>`.
-- Secrets are stored encrypted in the file `~/.pansa/secrets.json`
-  (not a directory). Wrong passphrase fails hard on encrypted values.
+- Secrets are stored encrypted per-value in SQLite (`~/.pansa/db.sqlite`,
+  table `secrets`; the old `~/.pansa/secrets.json` migrates once, then is
+  deleted). Wrong passphrase fails hard on encrypted values.
 - Policy engine enforces spending limits; see `pansa policy show`.
 - Testnet by default; mainnet requires `testnetOnly false` via
   `pansa policy set testnetOnly false`.
