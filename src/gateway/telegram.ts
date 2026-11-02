@@ -133,18 +133,78 @@ export class TelegramBot {
     return result ?? [];
   }
 
-  async sendMessage(chatId: number, text: string): Promise<void> {
-    for (const chunk of splitMessage(text)) {
-      await this.api("sendMessage", { chat_id: chatId, text: chunk });
+  async sendMessage(chatId: number, text: string, replyMarkup?: InlineKeyboardMarkup): Promise<void> {
+    const chunks = splitMessage(text);
+    for (let i = 0; i < chunks.length; i++) {
+      const body: Record<string, unknown> = { chat_id: chatId, text: chunks[i] };
+      if (replyMarkup && i === chunks.length - 1) body.reply_markup = replyMarkup;
+      await this.api("sendMessage", body);
     }
   }
+
+  // Typing indicator: Telegram shows it ~5s, so the loop re-sends it
+  // every 4s while the agent is working.
+  async sendChatAction(chatId: number, action = "typing"): Promise<void> {
+    await this.api("sendChatAction", { chat_id: chatId, action });
+  }
+
+  // Dismiss the button spinner. Must be called for every handled
+  // callback, or the button looks stuck.
+  async answerCallbackQuery(callbackId: string): Promise<void> {
+    await this.api("answerCallbackQuery", { callback_query_id: callbackId });
+  }
+}
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+export interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
+}
+
+export function mainMenuKeyboard(): InlineKeyboardMarkup {
+  const b = (text: string, data: string): InlineKeyboardButton => ({ text, callback_data: data });
+  return {
+    inline_keyboard: [
+      [b("⚙️ Settings", "settings"), b("🤖 Model", "model")],
+      [b("➕ Provider", "provider"), b("📊 Status", "status")],
+      [b("📋 Schedule", "schedule"), b("🔔 Alerts", "alerts")],
+      [b("❓ Help", "help")],
+    ],
+  };
+}
+
+export function settingsKeyboard(): InlineKeyboardMarkup {
+  const b = (text: string, data: string): InlineKeyboardButton => ({ text, callback_data: data });
+  return {
+    inline_keyboard: [
+      [b("🤖 Model", "model"), b("➕ Provider", "provider")],
+      [b("⬅️ Kembali ke menu", "menu")],
+    ],
+  };
+}
+
+// Model buttons: callback_data is capped at 64 bytes by Telegram, so
+// over-long model ids are listed as text only, never as buttons.
+export function modelKeyboard(models: string[], pinned?: string): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  for (const m of models.slice(0, 10)) {
+    if (`model:${m}`.length > 64) continue;
+    const label = (pinned === m ? "✓ " : "") + (m.length > 40 ? m.slice(0, 37) + "…" : m);
+    rows.push([{ text: label, callback_data: `model:${m}` }]);
+  }
+  rows.push([{ text: "⬅️ Kembali ke menu", callback_data: "menu" }]);
+  return { inline_keyboard: rows };
 }
 
 export type GatewayAction =
   | { kind: "ignore" }
-  | { kind: "reply"; chatId: number; text: string }
+  | { kind: "reply"; chatId: number; text: string; keyboard?: InlineKeyboardMarkup }
   | { kind: "paired"; userId: number; chatId: number; text: string }
-  | { kind: "agent"; userId: number; chatId: number; text: string };
+  | { kind: "agent"; userId: number; chatId: number; text: string }
+  | { kind: "callback"; callbackId: string; userId: number; chatId: number; data: string };
 
 // Connect template: the notification a user gets when they connect.
 // Sent on /start, on the first served message from a user, and by
@@ -198,6 +258,19 @@ export function markUserSeen(userId: number): boolean {
 //   3. everyone else is ignored silently (no info leak — not even the
 //      confirm refusal, which would confirm the bot is listening).
 export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[], allowedUsers: number[] = []): GatewayAction {
+  // Button taps arrive as callback_query, not messages. Gate them with
+  // the same rule as messages; the loop answers the callback (dismisses
+  // the spinner) and routes the button data.
+  const cb = update.callback_query;
+  if (cb) {
+    const userId = cb.from?.id;
+    const chatId = cb.message?.chat.id ?? userId;
+    const data = cb.data ?? "";
+    if (userId === undefined || chatId === undefined || !data) return { kind: "ignore" };
+    if (cb.message?.chat.type && cb.message.chat.type !== "private") return { kind: "ignore" };
+    if (!allowedUsers.includes(userId) && !isAllowlisted(allowlist, userId, chatId)) return { kind: "ignore" };
+    return { kind: "callback", callbackId: cb.id, userId, chatId, data };
+  }
   const msg = update.message;
   if (!msg || typeof msg.text !== "string") return { kind: "ignore" };
   const userId = msg.from?.id;
@@ -217,7 +290,7 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]
     return { kind: "reply", chatId, text: "Konfirmasi hanya bisa dilakukan manusia di TUI/CLI, bukan lewat gateway." };
   }
   if (text === "/start") {
-    return { kind: "reply", chatId, text: connectTemplate() };
+    return { kind: "reply", chatId, text: connectTemplate(), keyboard: mainMenuKeyboard() };
   }
   return { kind: "agent", userId, chatId, text };
 }
@@ -251,6 +324,88 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
   return null;
 }
 
+export interface GatewayCallbackDeps {
+  doctorText: () => Promise<string>;
+  scheduleText: () => string;
+  alertText: () => string;
+  listModels: () => Promise<string[]>;
+  pinnedModel: () => string | undefined;
+  setModel: (id: string) => void;
+  confirmText: string;
+  allowedCount: number;
+}
+
+// Button taps route through the same deterministic handlers as the
+// text commands (plus model pinning, which only writes the owner's own
+// config). Unknown button data returns null (ignored).
+export async function handleGatewayCallback(
+  data: string,
+  deps: GatewayCallbackDeps,
+): Promise<{ text: string; keyboard?: InlineKeyboardMarkup } | null> {
+  if (data === "menu") return { text: "Menu PANSA — pilih:", keyboard: mainMenuKeyboard() };
+  if (data === "settings") {
+    return {
+      text: [
+        "⚙️ Settings gateway:",
+        `Model terkunci: ${deps.pinnedModel() ?? "(tidak ada — daemon memilih)"}`,
+        `Konfirmasi via gateway: ${deps.confirmText}`,
+        `User ID terdaftar: ${deps.allowedCount}`,
+        "Tanda tangan tidak pernah lewat bot; konfirmasi tetap di TUI/CLI.",
+      ].join("\n"),
+      keyboard: settingsKeyboard(),
+    };
+  }
+  if (data === "model") {
+    const models = await deps.listModels().catch((): string[] => []);
+    const shown = models.filter((m) => `model:${m}`.length <= 64).slice(0, 10);
+    const skipped = models.filter((m) => `model:${m}`.length > 64);
+    return {
+      text: [
+        "🤖 Pilih model untuk agen gateway (klik untuk mengunci):",
+        ...(shown.length ? shown.map((m) => (deps.pinnedModel() === m ? `✓ ${m}` : m)) : ["(tidak ada model live dari daemon)"]),
+        ...(skipped.length ? [`(${skipped.length} model lain tidak bisa jadi tombol — id melebihi 64 byte)`] : []),
+      ].join("\n"),
+      keyboard: modelKeyboard(models, deps.pinnedModel()),
+    };
+  }
+  if (data.startsWith("model:")) {
+    const id = data.slice("model:".length);
+    if (!id) return null;
+    deps.setModel(id);
+    return { text: `Model gateway dikunci ke: ${id}\nJawaban agen berikutnya memakai model ini.`, keyboard: mainMenuKeyboard() };
+  }
+  if (data === "provider") {
+    const models = await deps.listModels().catch((): string[] => []);
+    return {
+      text: [
+        "➕ Provider & model:",
+        `Model live dari daemon: ${models.length}`,
+        `Model terkunci: ${deps.pinnedModel() ?? "(tidak ada — daemon memilih)"}`,
+        "Provider dikelola di konfigurasi daemon LLM (port 17070) di VPS, bukan lewat chat.",
+        "API key tidak boleh dikirim lewat Telegram — tambah provider langsung di daemon.",
+        "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
+      ].join("\n"),
+      keyboard: mainMenuKeyboard(),
+    };
+  }
+  if (data === "status") return { text: await deps.doctorText(), keyboard: mainMenuKeyboard() };
+  if (data === "schedule") return { text: deps.scheduleText(), keyboard: mainMenuKeyboard() };
+  if (data === "alerts") return { text: deps.alertText(), keyboard: mainMenuKeyboard() };
+  if (data === "help") {
+    return {
+      text: [
+        "Perintah PANSA:",
+        "/status — ringkasan doctor (node, config, daemon, scheduler, gateway)",
+        "/schedule — tugas terjadwal yang masih pending",
+        "/alerts — price alert yang masih aktif",
+        "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
+      ].join("\n"),
+      keyboard: mainMenuKeyboard(),
+    };
+  }
+  return null;
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function runGatewayLoop(opts: {
@@ -259,6 +414,7 @@ export async function runGatewayLoop(opts: {
   allowedUsers?: () => number[];
   onPaired: (userId: number, chatId: number) => Promise<void> | void;
   onAgentText: (userId: number, chatId: number, text: string) => Promise<string>;
+  onCallback: (userId: number, chatId: number, data: string) => Promise<{ text: string; keyboard?: InlineKeyboardMarkup } | null>;
   signal: AbortSignal;
 }): Promise<void> {
   let offset: number | undefined;
@@ -280,22 +436,42 @@ export async function runGatewayLoop(opts: {
       if (action.kind === "ignore") continue;
       try {
         if (action.kind === "reply") {
-          await opts.bot.sendMessage(action.chatId, action.text);
+          await opts.bot.sendMessage(action.chatId, action.text, action.keyboard);
         } else if (action.kind === "paired") {
           await opts.onPaired(action.userId, action.chatId);
           await opts.bot.sendMessage(action.chatId, action.text);
-        } else if (action.kind === "agent") {
-          // First served message from this user: send the connect
-          // template once, then the actual answer.
+        } else if (action.kind === "callback") {
+          // Dismiss the spinner first, then route the button.
           try {
-            if (markUserSeen(action.userId)) {
-              await opts.bot.sendMessage(action.chatId, connectTemplate());
-            }
+            await opts.bot.answerCallbackQuery(action.callbackId);
           } catch {
-            // A template failure must not block the answer.
+            // A failed dismiss must not block the button's answer.
           }
-          const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
-          await opts.bot.sendMessage(action.chatId, answer);
+          const res = await opts.onCallback(action.userId, action.chatId, action.data).catch(() => null);
+          if (res) await opts.bot.sendMessage(action.chatId, res.text, res.keyboard);
+        } else if (action.kind === "agent") {
+          // Typing indicator while the agent works: Telegram shows it
+          // ~5s, so refresh every 4s until the answer is sent.
+          const typing = setInterval(() => {
+            opts.bot.sendChatAction(action.chatId, "typing").catch(() => {});
+          }, 4000);
+          try {
+            await opts.bot.sendChatAction(action.chatId, "typing").catch(() => {});
+            // First served message from this user: send the connect
+            // template once, then the actual answer.
+            try {
+              if (markUserSeen(action.userId)) {
+                await opts.bot.sendMessage(action.chatId, connectTemplate(), mainMenuKeyboard());
+              }
+            } catch {
+              // A template failure must not block the answer.
+            }
+            const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
+            const keyboard = action.text.trim() === "/help" ? mainMenuKeyboard() : undefined;
+            await opts.bot.sendMessage(action.chatId, answer, keyboard);
+          } finally {
+            clearInterval(typing);
+          }
         }
       } catch (err) {
         // A failed send must not kill the loop; the next poll continues.

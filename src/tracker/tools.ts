@@ -102,9 +102,12 @@ export function createReportTool(): Tool {
     name: "report",
     description: "Generate airdrop farming reports",
     parameters: {
-      type: { type: "string", description: "Report type: summary, earnings, tasks, campaign" },
-      period: { type: "string", description: "Time period: 7d, 30d, all" },
-      campaign: { type: "string", description: "Specific campaign (optional)" },
+      type: "object",
+      properties: {
+        type: { type: "string", description: "Report type: summary, earnings, tasks, campaign" },
+        period: { type: "string", description: "Time period: 7d, 30d, all" },
+        campaign: { type: "string", description: "Specific campaign (optional)" },
+      },
     },
     signs: false,
     async execute(args: Record<string, unknown>): Promise<{ ok: boolean; data: unknown; error?: string; signs?: boolean }> {

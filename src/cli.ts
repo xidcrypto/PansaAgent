@@ -24,7 +24,7 @@ import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, connectTemplate } from "./gateway/telegram.js";
+import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, connectTemplate, mainMenuKeyboard } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -350,7 +350,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     const bot = new TelegramBot(token);
     try {
       // Private chats with a bot use chat_id == user_id.
-      await bot.sendMessage(id, connectTemplate());
+      await bot.sendMessage(id, connectTemplate(), mainMenuKeyboard());
       process.stdout.write(`Notifikasi connect terkirim ke user ${id}.\n`);
       return 0;
     } catch (err) {
@@ -381,7 +381,14 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     // always stays human-only (TUI/CLI CONFIRM).
     const confirmTestnet = loadConfig().gateways?.telegram?.confirmTestnet === true;
     const tools = await buildAgentToolsWithMcp();
-    if (!gatewayConfirmAllowed(true, confirmTestnet)) tools.delete("sign");
+    // NOTE: the signing tools are named sign_transaction /
+    // reject_transaction — deleting a bare "sign" was a no-op that left
+    // the gateway agent able to propose signing. When the gateway
+    // confirm path is not allowed, both go.
+    if (!gatewayConfirmAllowed(true, confirmTestnet)) {
+      tools.delete("sign_transaction");
+      tools.delete("reject_transaction");
+    }
     const bot = new TelegramBot(token);
     const abort = new AbortController();
     process.on("SIGINT", () => abort.abort());
@@ -421,6 +428,30 @@ async function gatewayCmd(rest: string[]): Promise<number> {
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
+      },
+      onCallback: async (_userId, _chatId, data) => {
+        return handleGatewayCallback(data, {
+          doctorText: async () => formatDoctor(await runDoctor()),
+          scheduleText: () => {
+            const pending = listScheduled("pending");
+            if (!pending.length) return "Tugas terjadwal: (kosong)";
+            return pending.map((t) => `${t.id} | ${t.run_at} | ${t.prompt.slice(0, 80)}`).join("\n");
+          },
+          alertText: () => {
+            const active = listAlerts("active");
+            if (!active.length) return "Price alert aktif: (kosong)";
+            return active.map((a) => `${a.id} | ${a.token} ${a.op} $${a.price_usd}${a.note ? ` | ${a.note}` : ""}`).join("\n");
+          },
+          listModels: () => fetchLiveModels().catch((): string[] => []),
+          pinnedModel: () => loadConfig().models?.[0],
+          setModel: (id) => {
+            const c = loadConfig();
+            c.models = [id];
+            saveConfig(c);
+          },
+          confirmText: `mainnet selalu ditolak; testnet ${confirmTestnet ? "diizinkan" : "tidak diizinkan"}`,
+          allowedCount: (loadConfig().gateways?.telegram?.allowedUsers ?? []).length,
+        });
       },
       signal: abort.signal,
     });
