@@ -7,10 +7,14 @@
 import { loadConfig, saveConfig } from "../config.js";
 import { secretsLoad, secretsSave, secretsSet, secretsHas } from "../secrets.js";
 
+export type ProviderApi = "openai" | "anthropic";
+
 export interface CustomProviderConfig {
   id: string;
   name: string;
   baseUrl: string;
+  /** Wire format: OpenAI-compatible (default, legacy) or Anthropic. */
+  api?: ProviderApi;
   models: string[];
   /** Model ids from models[] that are switched off. Absent = none off. */
   disabledModels?: string[];
@@ -21,6 +25,7 @@ export interface CustomProviderView {
   id: string;
   name: string;
   baseUrl: string;
+  api: ProviderApi;
   models: string[];
   /** Always present in views, even for legacy configs without the field. */
   disabledModels: string[];
@@ -31,6 +36,7 @@ export interface CustomProviderView {
 export interface ProviderInput {
   name: string;
   baseUrl: string;
+  api?: ProviderApi;
   models?: string[];
   /** Model ids to switch off. Only entries also in models survive. */
   disabledModels?: string[];
@@ -39,6 +45,10 @@ export interface ProviderInput {
   apiKey?: string;
   /** When true, delete the stored key (update only). */
   clearKey?: boolean;
+}
+
+function normalizeApi(api: unknown): ProviderApi {
+  return api === "anthropic" ? "anthropic" : "openai";
 }
 
 export function slugify(name: string): string {
@@ -134,6 +144,7 @@ export function listProviders(passphrase?: string): CustomProviderView[] {
     id: p.id,
     name: p.name,
     baseUrl: p.baseUrl,
+    api: normalizeApi(p.api),
     models: [...p.models],
     disabledModels: normalizeDisabledModels(p.models, p.disabledModels),
     enabled: p.enabled,
@@ -168,6 +179,7 @@ export function createProvider(input: ProviderInput, passphrase?: string): Custo
     id,
     name,
     baseUrl,
+    api: normalizeApi(input.api),
     models,
     disabledModels: normalizeDisabledModels(models, input.disabledModels),
     enabled: input.enabled ?? true,
@@ -175,7 +187,7 @@ export function createProvider(input: ProviderInput, passphrase?: string): Custo
   providers.push(provider);
   saveConfig({ ...cfg, providers });
   if (input.apiKey) storeKey(id, input.apiKey, passphrase);
-  return { ...provider, disabledModels: [...(provider.disabledModels ?? [])], hasKey: Boolean(input.apiKey) };
+  return { ...provider, api: provider.api ?? "openai", disabledModels: [...(provider.disabledModels ?? [])], hasKey: Boolean(input.apiKey) };
 }
 
 export function updateProvider(
@@ -194,6 +206,7 @@ export function updateProvider(
     ...current,
     name: patch.name?.trim() ?? current.name,
     baseUrl: patch.baseUrl !== undefined ? normalizeBaseUrl(patch.baseUrl) : current.baseUrl,
+    api: patch.api !== undefined ? normalizeApi(patch.api) : normalizeApi(current.api),
     models: nextModels,
     disabledModels:
       patch.disabledModels !== undefined
@@ -211,7 +224,7 @@ export function updateProvider(
   saveConfig({ ...cfg, providers });
   if (patch.clearKey) deleteStoredKey(id, passphrase);
   else if (patch.apiKey) storeKey(id, patch.apiKey, passphrase);
-  return { ...next, disabledModels: [...(next.disabledModels ?? [])], hasKey: patch.clearKey ? false : patch.apiKey ? true : hasStoredKey(id, passphrase) };
+  return { ...next, api: next.api ?? "openai", disabledModels: [...(next.disabledModels ?? [])], hasKey: patch.clearKey ? false : patch.apiKey ? true : hasStoredKey(id, passphrase) };
 }
 
 export function deleteProvider(id: string, passphrase?: string): void {
@@ -275,16 +288,26 @@ export interface FetchModelsResult {
   error?: string;
 }
 
-/** Fetch the full model list from an OpenAI-compatible endpoint (the
- *  Connect step). Never logs or returns the key; only ids come back.
- *  Accepts the OpenAI shape {data:[{id}]}, {models:[...]}, and a plain
- *  string array, because providers vary. */
-export async function fetchProviderModels(baseUrl: string, apiKey?: string): Promise<FetchModelsResult> {
+/** Fetch the full model list from a provider endpoint (the Connect and
+ *  Test-connection steps). Never logs or returns the key; only ids come
+ *  back. OpenAI shape: Bearer auth, {data:[{id}]}. Anthropic shape:
+ *  x-api-key + anthropic-version headers, {data:[{id}]}. Also accepts
+ *  {models:[...]} and a plain string array, because providers vary. */
+export async function fetchProviderModels(
+  baseUrl: string,
+  apiKey?: string,
+  api: ProviderApi = "openai",
+): Promise<FetchModelsResult> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 10000);
   try {
     const headers: Record<string, string> = {};
-    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    if (api === "anthropic") {
+      if (apiKey) headers["x-api-key"] = apiKey;
+      headers["anthropic-version"] = "2023-06-01";
+    } else if (apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
     const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/models`, {
       signal: ctrl.signal,
       headers,
@@ -314,13 +337,13 @@ export async function fetchProviderModels(baseUrl: string, apiKey?: string): Pro
   }
 }
 
-/** Probe a provider's /v1/models endpoint (OpenAI-compatible). Never
- *  logs or returns the key; only counts and sample ids come back. */
+/** Probe a provider's /v1/models endpoint. Never logs or returns the
+ *  key; only counts and sample ids come back. */
 export async function testProvider(
   provider: CustomProviderConfig,
   apiKey?: string,
 ): Promise<ProviderTestResult> {
-  const fetched = await fetchProviderModels(provider.baseUrl, apiKey);
+  const fetched = await fetchProviderModels(provider.baseUrl, apiKey, normalizeApi(provider.api));
   if (!fetched.ok) return { ok: false, error: fetched.error };
   const ids = fetched.models ?? [];
   return { ok: true, count: ids.length, sample: ids.slice(0, 10) };

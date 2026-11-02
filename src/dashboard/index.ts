@@ -28,7 +28,9 @@ import { cpus, freemem, loadavg, totalmem, uptime, homedir } from "node:os";
 import { statfsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult } from "../providers/index.js";
+import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult, ProviderApi } from "../providers/index.js";
+import { getUsageTotals } from "../usage.js";
+import type { UsageTotals } from "../usage.js";
 
 export interface ProviderStore {
   list(): CustomProviderView[];
@@ -36,7 +38,7 @@ export interface ProviderStore {
   update(id: string, patch: Partial<ProviderInput>): CustomProviderView;
   remove(id: string): void;
   test(id: string): Promise<ProviderTestResult>;
-  fetchModels(baseUrl: string, apiKey?: string): Promise<FetchModelsResult>;
+  fetchModels(baseUrl: string, apiKey?: string, api?: ProviderApi): Promise<FetchModelsResult>;
   setModel(id: string, model: string, enabled: boolean): CustomProviderView;
 }
 
@@ -525,7 +527,7 @@ document.getElementById("custom-rows").addEventListener("click",async e=>{
     else if(act==="toggle"){ const cur=customCache.find(x=>x.id===id); if(!cur) return; await api("api/providers/"+encodeURIComponent(id),"PUT",{enabled:!cur.enabled}); lastTouchedId=id; doneMsg="Status provider diubah."; }
     else if(act==="model"){ const model=btn.getAttribute("data-model"); const cur=customCache.find(x=>x.id===id); if(!cur||!model) return; const off=(cur.disabledModels||[]).includes(model); await api("api/providers/"+encodeURIComponent(id)+"/model","POST",{model,enabled:off}); lastTouchedId=id; doneMsg=off?("Model diaktifkan: "+model):("Model dinonaktifkan: "+model); }
     else if(act==="test"){ const res=await api("api/providers/"+encodeURIComponent(id)+"/test","POST"); msg.textContent=res.ok?("Uji OK: "+res.count+" model ("+(res.sample||[]).join(", ")+")"):("Uji gagal: "+res.error); toast(msg.textContent,res.ok?"ok":"bad"); return; }
-    else if(act==="edit"){ let p=customCache.find(x=>x.id===id); if(!p){ await refreshCustom(); p=customCache.find(x=>x.id===id); } if(!p){ msg.textContent="Error: provider tidak ditemukan, coba muat ulang halaman."; toast(msg.textContent,"bad"); return; } document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); renderModelList(p.models,p.disabledModels||[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
+    else if(act==="edit"){ let p=customCache.find(x=>x.id===id); if(!p){ await refreshCustom(); p=customCache.find(x=>x.id===id); } if(!p){ msg.textContent="Error: provider tidak ditemukan, coba muat ulang halaman."; toast(msg.textContent,"bad"); return; } document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-api").value=p.api||"openai"; document.getElementById("pf-models").value=p.models.join(", "); renderModelList(p.models,p.disabledModels||[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
     await refreshCustom();
     msg.textContent=doneMsg;
     if(doneMsg) toast(doneMsg,"ok");
@@ -550,17 +552,34 @@ function readModelList(){
 document.getElementById("provider-connect").addEventListener("click",async()=>{
   const btn=document.getElementById("provider-connect"); if(btn.disabled) return;
   const msg=document.getElementById("provider-msg");
-  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value;
+  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value; const api=document.getElementById("pf-api").value;
   if(!baseUrl){ msg.textContent="Error: isi Base URL dulu sebelum Connect."; toast(msg.textContent,"bad"); return; }
   btn.disabled=true; const oldLabel=btn.textContent; btn.textContent="Menghubungkan…";
   msg.textContent="Menghubungkan, mengambil daftar model…";
   try{
-    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined});
+    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined,api});
     if(!res.ok){ msg.textContent="Connect gagal: "+(res.error||"tidak diketahui"); toast(msg.textContent,"bad"); return; }
     const models=res.models||[];
     document.getElementById("pf-models").value=models.join(", ");
     renderModelList(models,[]);
     msg.textContent=models.length?("Connect OK: "+models.length+" model ditemukan, centang yang aktif lalu Simpan."):("Connect OK: endpoint tidak mengembalikan model, isi manual di kolom Model.");
+    toast(msg.textContent,"ok");
+  }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
+  finally{ btn.disabled=false; btn.textContent=oldLabel; }
+});
+document.getElementById("provider-testconn").addEventListener("click",async()=>{
+  const btn=document.getElementById("provider-testconn"); if(btn.disabled) return;
+  const msg=document.getElementById("provider-msg");
+  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value; const api=document.getElementById("pf-api").value;
+  if(!baseUrl){ msg.textContent="Error: isi Base URL dulu sebelum Test koneksi."; toast(msg.textContent,"bad"); return; }
+  btn.disabled=true; const oldLabel=btn.textContent; btn.textContent="Menguji…";
+  const started=Date.now();
+  try{
+    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined,api});
+    const ms=Date.now()-started;
+    if(!res.ok){ msg.textContent="Test koneksi gagal: "+(res.error||"tidak diketahui")+" ("+ms+" ms)"; toast(msg.textContent,"bad"); return; }
+    const models=res.models||[];
+    msg.textContent="Test koneksi OK ("+api+"): "+models.length+" model, "+ms+" ms"+(models.length?" — contoh: "+models.slice(0,5).join(", "):"");
     toast(msg.textContent,"ok");
   }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
   finally{ btn.disabled=false; btn.textContent=oldLabel; }
@@ -574,7 +593,7 @@ document.getElementById("provider-form").addEventListener("submit",async e=>{
   const msg=document.getElementById("provider-msg");
   const id=document.getElementById("pf-id").value;
   const picked=readModelList();
-  const payload={name:document.getElementById("pf-name").value,baseUrl:document.getElementById("pf-base").value,models:picked?picked.models:document.getElementById("pf-models").value.split(","),enabled:document.getElementById("pf-enabled").checked};
+  const payload={name:document.getElementById("pf-name").value,baseUrl:document.getElementById("pf-base").value,api:document.getElementById("pf-api").value,models:picked?picked.models:document.getElementById("pf-models").value.split(","),enabled:document.getElementById("pf-enabled").checked};
   if(picked) payload.disabledModels=picked.disabled;
   const key=document.getElementById("pf-key").value; if(key) payload.apiKey=key;
   try{
@@ -582,7 +601,7 @@ document.getElementById("provider-form").addEventListener("submit",async e=>{
     if(id) saved=await api("api/providers/"+encodeURIComponent(id),"PUT",payload);
     else saved=await api("api/providers","POST",payload);
     if(saved&&saved.provider) lastTouchedId=saved.provider.id;
-    document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
+    document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-api").value="openai"; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
     await refreshCustom();
     msg.textContent="Provider tersimpan.";
     toast(msg.textContent,"ok");
@@ -590,7 +609,7 @@ document.getElementById("provider-form").addEventListener("submit",async e=>{
   finally{ submitting=false; if(submitBtn) submitBtn.disabled=false; }
 });
 document.getElementById("provider-cancel").addEventListener("click",()=>{
-  document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
+  document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-api").value="openai"; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
 });
 function render(d){
   document.getElementById("m-cpu").innerHTML=d.system.cpuLoad1.toFixed(2)+' <span class="sub">/ '+d.system.cpuCount+' core</span>';
@@ -613,6 +632,12 @@ function render(d){
   }
   if(d.customProviders){
     renderCustom(d.customProviders);
+  }
+  if(d.usage){
+    const fmtN=n=>n.toLocaleString("id-ID");
+    const fmtC=c=>c===null?"—":"$"+c.toFixed(4);
+    document.getElementById("usage-totals").textContent='Total: '+fmtN(d.usage.totalTokens)+' token · in '+fmtN(d.usage.inputTokens)+' · out '+fmtN(d.usage.outputTokens)+' · '+d.usage.calls+' panggilan · estimasi biaya $'+d.usage.costUsd.toFixed(4)+' (hanya model yang harganya diketahui; model lain tidak dihitung, bukan nol)';
+    document.getElementById("usage-rows").innerHTML=d.usage.byModel.length?d.usage.byModel.map(r=>'<tr><td class="mono">'+esc(r.model)+'</td><td>'+esc(r.provider)+'</td><td>'+fmtN(r.inputTokens)+'</td><td>'+fmtN(r.outputTokens)+'</td><td>'+fmtN(r.totalTokens)+'</td><td>'+fmtC(r.costUsd)+'</td><td>'+r.calls+'</td></tr>').join(""):'<tr><td colspan="7">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>';
   }
 }
 async function manualRefresh(){
@@ -697,6 +722,28 @@ function modelChipsHtml(p: CustomProviderView): string {
     .join(" ");
 }
 
+function fmtNum(n: number): string {
+  return n.toLocaleString("id-ID");
+}
+
+function fmtCost(cost: number | null): string {
+  return cost === null ? "—" : `$${cost.toFixed(4)}`;
+}
+
+function usageTotalsHtml(usage: UsageTotals): string {
+  return `Total: ${fmtNum(usage.totalTokens)} token · in ${fmtNum(usage.inputTokens)} · out ${fmtNum(usage.outputTokens)} · ${usage.calls} panggilan · estimasi biaya $${usage.costUsd.toFixed(4)} (hanya model yang harganya diketahui; model lain tidak dihitung, bukan nol)`;
+}
+
+function usageRowsHtml(usage: UsageTotals): string {
+  if (!usage.byModel.length) return `<tr><td colspan="7">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>`;
+  return usage.byModel
+    .map(
+      (r) =>
+        `<tr><td class="mono">${escapeHtml(r.model)}</td><td>${escapeHtml(r.provider)}</td><td>${fmtNum(r.inputTokens)}</td><td>${fmtNum(r.outputTokens)}</td><td>${fmtNum(r.totalTokens)}</td><td>${fmtCost(r.costUsd)}</td><td>${r.calls}</td></tr>`,
+    )
+    .join("\n");
+}
+
 function customRows(custom: CustomProviderView[]): string {
   if (!custom.length) return `<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>`;
   return custom
@@ -709,7 +756,7 @@ function customRows(custom: CustomProviderView[]): string {
 
 const PROVIDER_KEY_NOTE = `Kunci API provider disimpan terenkripsi di secrets store (bukan di config) dan tidak pernah ditampilkan kembali — form edit yang dikosongkan berarti kunci lama tetap dipakai. Tombol Uji memanggil /v1/models endpoint provider untuk memastikan ia menjawab.`;
 
-export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, providers: ProvidersInfo, customProviders: CustomProviderView[]): string {
+export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, providers: ProvidersInfo, customProviders: CustomProviderView[], usage?: UsageTotals): string {
   return `<!DOCTYPE html>
 <html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -739,6 +786,10 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 </div>
 <h2>Konfigurasi</h2>
 <div class="card" id="cfg">Model: ${escapeHtml(data.models.join(", ") || "(tidak ada)")}<br>Gateway Telegram: ${data.gatewayEnabled ? "aktif" : "nonaktif"} · pengguna terdaftar: ${data.gatewayAllowedUsers}<br>Testnet only: ${data.testnetOnly === undefined ? "tidak diketahui" : data.testnetOnly ? "ya" : "tidak"}<br>Tugas terjadwal pending: ${data.scheduledPending} dari ${data.scheduledTotal} · Price alert aktif: ${data.alertsActive} dari ${data.alertsTotal}</div>
+<h2>Penggunaan LLM</h2>
+<div class="card" id="usage-totals">${usage ? usageTotalsHtml(usage) : "(tidak ada data)"}</div>
+<div class="tablewrap"><table><tr><th>Model</th><th>Provider</th><th>In</th><th>Out</th><th>Total</th><th>Estimasi biaya</th><th>Panggilan</th></tr><tbody id="usage-rows">
+${usage ? usageRowsHtml(usage) : `<tr><td colspan="7">(tidak ada data)</td></tr>`}</tbody></table></div>
 <h2>Ganti password</h2>
 <div class="card"><form id="password-form">
 <div class="label" style="margin-bottom:6px">Password saat ini</div>
@@ -767,7 +818,9 @@ ${customRows(customProviders)}</tbody></table></div>
 <input id="pf-name" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="mis. openrouter">
 <div class="label" style="margin-bottom:6px">Base URL (OpenAI-compatible)</div>
 <input id="pf-base" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="https://openrouter.ai/api/v1">
-<div style="margin-bottom:10px"><button type="button" id="provider-connect">Connect (ambil semua model)</button></div>
+<div class="label" style="margin-bottom:6px">Jenis API</div>
+<select id="pf-api" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px"><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic</option></select>
+<div style="margin-bottom:10px"><button type="button" id="provider-connect">Connect (ambil semua model)</button> <button type="button" id="provider-testconn">Test koneksi</button></div>
 <div class="label" style="margin-bottom:6px">Model (pisahkan koma)</div>
 <input id="pf-models" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="model-a, model-b">
 <div id="pf-models-list" style="margin-bottom:10px"></div>
@@ -837,7 +890,13 @@ export async function startDashboard(opts: {
       opts.daemonBase ?? process.env.PANSA_LLM_BASE ?? "http://127.0.0.1:17070",
     );
     const customProviders = opts.providers ? opts.providers.list() : [];
-    return { ...data, system, providers, customProviders, readOnly: false, host: "127.0.0.1" };
+    let usage: UsageTotals;
+    try {
+      usage = getUsageTotals();
+    } catch {
+      usage = { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, byModel: [] };
+    }
+    return { ...data, system, providers, customProviders, usage, readOnly: false, host: "127.0.0.1" };
   };
   // SSE, bukan polling: client membuka SATU stream; server yang mendorong
   // snapshot. Satu timer server melayani semua tab (bukan satu timer per
@@ -1022,9 +1081,9 @@ export async function startDashboard(opts: {
             return;
           }
           if (rest === "/fetch-models" && req.method === "POST") {
-            const body = (await readJsonBody(req)) as { baseUrl?: string; apiKey?: string };
+            const body = (await readJsonBody(req)) as { baseUrl?: string; apiKey?: string; api?: ProviderApi };
             if (!body.baseUrl) throw new Error("baseUrl wajib diisi.");
-            const result = await opts.providers.fetchModels(body.baseUrl, body.apiKey);
+            const result = await opts.providers.fetchModels(body.baseUrl, body.apiKey, body.api);
             res.writeHead(result.ok ? 200 : 502, { "Content-Type": "application/json" });
             res.end(JSON.stringify(result));
             return;
@@ -1081,7 +1140,7 @@ export async function startDashboard(opts: {
         const status = await buildStatus();
         if (url.pathname === "/") {
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(renderDashboardHtml(status, status.system, status.providers, status.customProviders));
+          res.end(renderDashboardHtml(status, status.system, status.providers, status.customProviders, status.usage));
         } else {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));

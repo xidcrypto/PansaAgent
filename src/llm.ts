@@ -2,6 +2,7 @@ import { DEFAULT_MODEL_PREF, REASONING_MODELS, CHEAP_MODELS } from "./config.js"
 import { spawnRouter } from "./router.js";
 import { findCustomProvider, getProviderKey } from "./providers/index.js";
 import type { CustomProviderConfig } from "./providers/index.js";
+import { recordUsage } from "./usage.js";
 
 // Overridable for tests (PANSA_LLM_BASE): points fetchJson/streamChat at
 // a local test server instead of the real daemon port.
@@ -34,6 +35,10 @@ export interface ChatMessage {
   content: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
+  /** Token usage of the assistant message that produced this message.
+   *  Set only on generator return values; never sent back to an API
+   *  (request builders strip it). */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 export interface ToolCall {
@@ -172,25 +177,46 @@ function backoffDelay(attempt: number): number {
 
 interface StreamChunk {
   choices?: Array<{ delta?: { content?: string; tool_calls?: unknown[] } }>;
+  usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
-async function* streamChat(
+interface StreamEndpoint {
+  baseUrl: string;
+  apiKey?: string;
+  api?: "openai" | "anthropic";
+}
+
+/** Strip fields an API never accepts (usage lives only on returned
+ *  messages) so a strict provider cannot reject the request. */
+function sanitizeMessages(messages: ChatMessage[]): Array<Record<string, unknown>> {
+  return messages.map((m) => {
+    const out: Record<string, unknown> = { role: m.role, content: m.content };
+    if (m.tool_calls) out.tool_calls = m.tool_calls;
+    if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+    return out;
+  });
+}
+
+async function* streamChatOpenAI(
   model: string,
   messages: ChatMessage[],
   tools: ToolDef[],
   toolChoice: ChatOptions["toolChoice"],
   signal: AbortSignal,
-  endpoint?: { baseUrl: string; apiKey?: string },
+  endpoint?: StreamEndpoint,
 ): AsyncGenerator<string, ChatMessage, unknown> {
   const body: Record<string, unknown> = {
     model,
-    messages,
+    messages: sanitizeMessages(messages),
     stream: true,
   };
   if (tools.length > 0) body.tools = tools.map((t) => ({ type: "function", function: t }));
   if (toolChoice === "required" && tools.length > 0) body.tool_choice = "required";
   else if (toolChoice === "none") body.tool_choice = "none";
   else body.tool_choice = "auto";
+  // Usage tokens arrive only when asked (final chunk). Ask only custom
+  // endpoints: the daemon path must keep its exact historical request.
+  if (endpoint) body.stream_options = { include_usage: true };
 
   const ctrl = new AbortController();
   signal?.addEventListener("abort", () => ctrl.abort());
@@ -200,6 +226,7 @@ async function* streamChat(
   // Keyed by stream index; the entry keeps the REAL streamed tool-call id
   // when the provider sends one, falling back to call_<index>.
   const accCalls = new Map<string, { id: string; name: string; args: string }>();
+  let usage: { inputTokens: number; outputTokens: number } | undefined;
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (endpoint?.apiKey) headers.Authorization = `Bearer ${endpoint.apiKey}`;
@@ -239,6 +266,12 @@ async function* streamChat(
           } catch {
             continue;
           }
+          if (parsed.usage) {
+            usage = {
+              inputTokens: parsed.usage.prompt_tokens ?? 0,
+              outputTokens: parsed.usage.completion_tokens ?? 0,
+            };
+          }
           for (const choice of parsed.choices ?? []) {
             const delta = choice.delta ?? {};
             if (typeof delta.content === "string") {
@@ -273,7 +306,174 @@ async function* streamChat(
   for (const entry of accCalls.values()) {
     if (entry.name) toolCalls.push({ id: entry.id, type: "function", function: { name: entry.name, arguments: entry.args } });
   }
-  return { role: "assistant", content: accContent, tool_calls: toolCalls.length > 0 ? toolCalls : undefined };
+  return {
+    role: "assistant",
+    content: accContent,
+    tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+    usage,
+  };
+}
+
+interface AnthropicContentBlock {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+  tool_use_id?: string;
+  content?: unknown;
+}
+
+/** Convert PANSA messages to Anthropic's wire format. Anthropic needs
+ *  strict user/assistant alternation and tool calls as content blocks,
+ *  so consecutive same-role messages merge and tool results attach to
+ *  the surrounding user turn. */
+function toAnthropicMessages(messages: ChatMessage[]): {
+  system: string;
+  messages: Array<{ role: "user" | "assistant"; content: AnthropicContentBlock[] }>;
+} {
+  const systemParts: string[] = [];
+  const out: Array<{ role: "user" | "assistant"; content: AnthropicContentBlock[] }> = [];
+  const push = (role: "user" | "assistant", block: AnthropicContentBlock) => {
+    const last = out[out.length - 1];
+    if (last && last.role === role) last.content.push(block);
+    else out.push({ role, content: [block] });
+  };
+  for (const m of messages) {
+    if (m.role === "system") {
+      if (m.content) systemParts.push(m.content);
+    } else if (m.role === "assistant") {
+      if (m.content) push("assistant", { type: "text", text: m.content });
+      for (const tc of m.tool_calls ?? []) {
+        let input: unknown = {};
+        try {
+          input = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+        } catch {
+          input = {};
+        }
+        push("assistant", { type: "tool_use", id: tc.id, name: tc.function.name, input });
+      }
+    } else if (m.role === "tool") {
+      push("user", { type: "tool_result", tool_use_id: m.tool_call_id ?? "", content: m.content });
+    } else {
+      if (m.content) push("user", { type: "text", text: m.content });
+    }
+  }
+  return { system: systemParts.join("\n\n"), messages: out };
+}
+
+async function* streamChatAnthropic(
+  model: string,
+  messages: ChatMessage[],
+  tools: ToolDef[],
+  toolChoice: ChatOptions["toolChoice"],
+  signal: AbortSignal,
+  endpoint: StreamEndpoint,
+): AsyncGenerator<string, ChatMessage, unknown> {
+  const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: 4096,
+    stream: true,
+    messages: anthropicMessages,
+  };
+  if (system) body.system = system;
+  if (tools.length > 0) {
+    body.tools = tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
+    if (toolChoice === "required") body.tool_choice = { type: "any" };
+    else if (toolChoice === "none") body.tool_choice = { type: "none" };
+    else body.tool_choice = { type: "auto" };
+  }
+
+  const ctrl = new AbortController();
+  signal?.addEventListener("abort", () => ctrl.abort());
+  const t = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+
+  let accContent = "";
+  const accTools = new Map<number, { id: string; name: string; args: string }>();
+  let usage: { inputTokens: number; outputTokens: number } | undefined;
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json", "anthropic-version": "2023-06-01" };
+    if (endpoint.apiKey) headers["x-api-key"] = endpoint.apiKey;
+    const res = await fetch(`${endpoint.baseUrl.replace(/\/$/, "")}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new LlmError(`HTTP ${res.status}: ${txt}`, {
+        code: "http_error",
+        status: res.status,
+        retryable: res.status >= 500 || res.status === 429,
+      });
+    }
+    const stream = res.body as ReadableStream<Uint8Array>;
+    const reader = stream.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const eventLine = frame.split("\n").find((l) => l.startsWith("event: "));
+          const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
+          if (!dataLine) continue;
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(dataLine.slice(6)) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+          const event = eventLine?.slice(7).trim();
+          if (event === "message_start") {
+            const u = (parsed.message as { usage?: { input_tokens?: number } } | undefined)?.usage;
+            if (u) usage = { inputTokens: u.input_tokens ?? 0, outputTokens: 0 };
+          } else if (event === "content_block_start") {
+            const block = parsed.content_block as { type?: string; id?: string; name?: string } | undefined;
+            const index = parsed.index as number | undefined;
+            if (block?.type === "tool_use" && typeof index === "number") {
+              accTools.set(index, { id: block.id ?? `call_${index}`, name: block.name ?? "", args: "" });
+            }
+          } else if (event === "content_block_delta") {
+            const delta = parsed.delta as { type?: string; text?: string; partial_json?: string } | undefined;
+            const index = parsed.index as number | undefined;
+            if (delta?.type === "text_delta" && typeof delta.text === "string") {
+              accContent += delta.text;
+              yield delta.text;
+            } else if (delta?.type === "input_json_delta" && typeof index === "number") {
+              const entry = accTools.get(index);
+              if (entry && typeof delta.partial_json === "string") entry.args += delta.partial_json;
+            }
+          } else if (event === "message_delta") {
+            const u = (parsed.usage as { output_tokens?: number } | undefined);
+            if (u && usage) usage = { ...usage, outputTokens: u.output_tokens ?? 0 };
+            else if (u) usage = { inputTokens: 0, outputTokens: u.output_tokens ?? 0 };
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  } finally {
+    clearTimeout(t);
+  }
+  const toolCalls: ToolCall[] = [];
+  for (const entry of accTools.values()) {
+    if (entry.name) toolCalls.push({ id: entry.id, type: "function", function: { name: entry.name, arguments: entry.args } });
+  }
+  return {
+    role: "assistant",
+    content: accContent,
+    tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+    usage,
+  };
 }
 
 const TOOL_FENCE = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
@@ -359,18 +559,28 @@ export async function chat(
     try {
       const signal = opts.signal ?? new AbortController().signal;
       const custom = !liveSet.has(model) ? findCustomProvider(model, cfg.providers) : undefined;
-      const gen = custom
-        ? streamChat(model, opts.messages, opts.tools, opts.toolChoice, signal, {
-            baseUrl: custom.baseUrl,
-            apiKey: getProviderKey(custom.id, process.env.PANSA_PASSPHRASE),
-          })
-        : streamChat(model, opts.messages, opts.tools, opts.toolChoice, signal);
+      const endpoint: StreamEndpoint | undefined = custom
+        ? { baseUrl: custom.baseUrl, apiKey: getProviderKey(custom.id, process.env.PANSA_PASSPHRASE), api: custom.api ?? "openai" }
+        : undefined;
+      const gen =
+        endpoint?.api === "anthropic"
+          ? streamChatAnthropic(model, opts.messages, opts.tools, opts.toolChoice, signal, endpoint)
+          : streamChatOpenAI(model, opts.messages, opts.tools, opts.toolChoice, signal, endpoint);
       let step = await gen.next();
       while (!step.done) {
         if (typeof step.value === "string") opts.onChunk?.(step.value);
         step = await gen.next();
       }
       const final = step.value as ChatMessage;
+      // Usage tracking never breaks a chat: record best-effort, ignore failures.
+      try {
+        const usage = final.usage;
+        if (usage && (usage.inputTokens > 0 || usage.outputTokens > 0)) {
+          recordUsage({ provider: custom ? custom.id : "daemon", model, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens });
+        }
+      } catch {
+        // ignore
+      }
       circuitReset(model);
       return { message: final, model };
     } catch (err) {

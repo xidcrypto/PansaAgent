@@ -1101,7 +1101,7 @@ async function dashboardCmd(rest: string[], portArg?: string | boolean): Promise
         update: (id, patch) => updateProvider(id, patch, pass),
         remove: (id) => deleteProvider(id, pass),
         test: (id) => testProviderById(id, pass),
-        fetchModels: (baseUrl, apiKey) => fetchProviderModels(baseUrl, apiKey),
+        fetchModels: (baseUrl, apiKey, api) => fetchProviderModels(baseUrl, apiKey, api),
         setModel: (id, model, enabled) => setModelEnabled(id, model, enabled, pass),
       },
     });
