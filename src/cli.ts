@@ -234,15 +234,23 @@ export async function main(argv: string[]): Promise<number> {
 
 // Headless agent run returning the final answer (scheduler, gateway).
 // No streaming, no session persistence: the caller owns reporting.
+// The MCP-augmented tool set is built once per process: a long-running
+// `schedule watch` must not spawn a fresh MCP server per task.
+let cachedMcpTools: Promise<Map<string, import("./agent.js").Tool>> | null = null;
+
 async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>): Promise<string> {
   const cfg = loadConfig();
   await ensureDaemon();
   const live = await fetchLiveModels().catch((): string[] => []);
   const ctx = new ContextManager();
   for (const f of loadContextFiles()) ctx.appendFileContext(f);
+  if (!tools) {
+    if (!cachedMcpTools) cachedMcpTools = buildAgentToolsWithMcp();
+    tools = await cachedMcpTools;
+  }
   const agent = new Agent({
     context: ctx,
-    tools: tools ?? (await buildAgentToolsWithMcp()),
+    tools,
     liveModels: live,
     cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models },
   });
@@ -381,12 +389,23 @@ async function scheduleCmd(rest: string[]): Promise<number> {
     const abort = new AbortController();
     process.on("SIGINT", () => abort.abort());
     process.on("SIGTERM", () => abort.abort());
+    // Abort-aware sleep: Ctrl+C stops promptly instead of waiting out
+    // the full 60s interval.
+    const sleepAbortable = (ms: number) =>
+      new Promise<void>((resolve) => {
+        if (abort.signal.aborted) return resolve();
+        const timer = setTimeout(() => resolve(), ms);
+        abort.signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
     while (!abort.signal.aborted) {
       const due = await runDue((prompt) => agentAnswer(prompt));
       for (const t of due) {
         process.stdout.write(`${t.id}: dijalankan @ ${new Date().toISOString()}.\n`);
       }
-      await new Promise((r) => setTimeout(r, 60000));
+      await sleepAbortable(60000);
     }
     return 0;
   }
