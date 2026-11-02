@@ -286,7 +286,7 @@ async function gatewayListModels(): Promise<string[]> {
 // `schedule watch` must not spawn a fresh MCP server per task.
 let cachedMcpTools: Promise<Map<string, import("./agent.js").Tool>> | null = null;
 
-async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>, opts?: { onlyModel?: string }): Promise<string> {
+async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>, opts?: { onlyModel?: string; onlySource?: "default" | "custom" }): Promise<string> {
   const cfg = loadConfig();
   await ensureDaemon();
   const live = await fetchLiveModels().catch((): string[] => []);
@@ -300,7 +300,7 @@ async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.j
     context: ctx,
     tools,
     liveModels: live,
-    cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models, providers: cfg.providers, onlyModel: opts?.onlyModel },
+    cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models, providers: cfg.providers, onlyModel: opts?.onlyModel, onlySource: opts?.onlySource },
   });
   return agent.run(prompt);
 }
@@ -484,9 +484,11 @@ async function gatewayCmd(rest: string[]): Promise<number> {
           listDefaultModels: () => fetchLiveModels().catch((): string[] => []),
           listCustomModels: () => Promise.resolve(gatewayCustomModels()),
           pinnedModel: () => loadConfig().models?.[0],
-          setModel: (id) => {
+          setModel: (id, source) => {
             const c = loadConfig();
             c.models = [id];
+            if (source) c.pinnedSource = source;
+            else delete c.pinnedSource;
             saveConfig(c);
           },
         }).catch(() => null);
@@ -524,10 +526,12 @@ async function gatewayCmd(rest: string[]): Promise<number> {
         try {
           // A gateway pin is a strict choice: exactly one configured
           // model means "use this one, or say it failed" — never answer
-          // silently from another model.
-          const pinned = loadConfig().models;
+          // silently from another model. The recorded source decides
+          // which endpoint serves it when both have the model.
+          const pinnedCfg = loadConfig();
+          const pinned = pinnedCfg.models;
           const onlyModel = pinned?.length === 1 ? pinned[0] : undefined;
-          return { text: await agentAnswer(text, tools, { onlyModel }), keyboard: mainReplyKeyboard() };
+          return { text: await agentAnswer(text, tools, { onlyModel, onlySource: pinnedCfg.pinnedSource }), keyboard: mainReplyKeyboard() };
         } catch (err) {
           return { text: `Error: ${err instanceof Error ? err.message : String(err)}`, keyboard: mainReplyKeyboard() };
         }
@@ -550,6 +554,9 @@ async function gatewayCmd(rest: string[]): Promise<number> {
           setModel: (id) => {
             const c = loadConfig();
             c.models = [id];
+            // A pin from an old inline button carries no source: fall
+            // back to the default routing (daemon-live stays on daemon).
+            delete c.pinnedSource;
             saveConfig(c);
           },
           confirmText: `mainnet selalu ditolak; testnet ${confirmTestnet ? "diizinkan" : "tidak diizinkan"}`,

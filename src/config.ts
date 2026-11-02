@@ -60,6 +60,10 @@ export interface GatewayConfig {
 
 export interface PansaConfig {
   models?: string[];
+  /** Where a single-model pin came from: "default" (daemon) or "custom"
+   *  (provider). Only meaningful when models has exactly one entry; it
+   *  decides which endpoint serves the pin when the model exists on both. */
+  pinnedSource?: "default" | "custom";
   preferReasoning?: string[];
   preferCheap?: string[];
   /** Custom OpenAI-compatible providers (keys live in the secrets store,

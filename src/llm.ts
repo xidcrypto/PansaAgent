@@ -531,7 +531,7 @@ export interface ChatResult {
 export async function chat(
   opts: ChatOptions & { onChunk?: (text: string) => void },
   liveModels: string[],
-  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[]; providers?: CustomProviderConfig[]; onlyModel?: string },
+  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[]; providers?: CustomProviderConfig[]; onlyModel?: string; onlySource?: "default" | "custom" },
 ): Promise<ChatResult> {
   const candidates = modelsForKind(opts.kind, liveModels, cfg);
   // Custom providers: a model served by an enabled custom provider that
@@ -551,8 +551,15 @@ export async function chat(
   // pin), that model is the ONLY candidate. A silent fallback to another
   // model would lie about what served the answer, so any failure here
   // throws instead of moving on. Callers without a pin keep failover.
+  // A pin from the Custom panel additionally forces the custom endpoint
+  // even when the daemon also serves the model; otherwise a daemon-live
+  // model stays on the daemon path.
   const onlyModel = cfg.onlyModel;
-  if (onlyModel && !liveSet.has(onlyModel) && !findCustomProvider(onlyModel, cfg.providers)) {
+  const onlySource = cfg.onlySource;
+  if (onlyModel && onlySource === "custom" && !findCustomProvider(onlyModel, cfg.providers)) {
+    throw new LlmError(`Model ${onlyModel} tidak tersedia di provider custom`, { code: "model_failed", retryable: false });
+  }
+  if (onlyModel && onlySource !== "custom" && !liveSet.has(onlyModel) && !findCustomProvider(onlyModel, cfg.providers)) {
     throw new LlmError(`Model ${onlyModel} tidak tersedia di daemon maupun provider custom`, { code: "model_failed", retryable: false });
   }
   const ordered = onlyModel ? [onlyModel] : [...customModels, ...candidates.filter((m) => !customModels.includes(m))];
@@ -568,7 +575,12 @@ export async function chat(
     if (!onlyModel && circuitOpen(model)) continue;
     try {
       const signal = opts.signal ?? new AbortController().signal;
-      const custom = !liveSet.has(model) ? findCustomProvider(model, cfg.providers) : undefined;
+      const custom =
+        onlyModel === model && onlySource === "custom"
+          ? findCustomProvider(model, cfg.providers)
+          : !liveSet.has(model)
+            ? findCustomProvider(model, cfg.providers)
+            : undefined;
       const endpoint: StreamEndpoint | undefined = custom
         ? { baseUrl: custom.baseUrl, apiKey: getProviderKey(custom.id, process.env.PANSA_PASSPHRASE), api: custom.api ?? "openai" }
         : undefined;

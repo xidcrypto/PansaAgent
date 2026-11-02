@@ -268,7 +268,7 @@ export interface GatewayKeyboardDeps {
   listDefaultModels: () => Promise<string[]>;
   listCustomModels: () => Promise<string[]>;
   pinnedModel: () => string | undefined;
-  setModel: (id: string) => void;
+  setModel: (id: string, source?: "default" | "custom") => void;
 }
 
 function sourceLabel(source: "default" | "custom"): string {
@@ -339,7 +339,7 @@ export async function handleReplyKeyboardText(
       return { text: modelPageText(models, deps.pinnedModel(), page, true, sourceLabel(state.source)), keyboard: modelReplyKeyboard(models, page) };
     }
     if (models.includes(t)) {
-      deps.setModel(t);
+      deps.setModel(t, state.source);
       keyboardPanelState.set(chatId, { kind: "menu", page: 0 });
       return { text: `Model gateway dikunci ke: ${t}\nJawaban agen berikutnya memakai model ini.`, keyboard: mainReplyKeyboard() };
     }
