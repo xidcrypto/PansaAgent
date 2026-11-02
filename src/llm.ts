@@ -531,7 +531,7 @@ export interface ChatResult {
 export async function chat(
   opts: ChatOptions & { onChunk?: (text: string) => void },
   liveModels: string[],
-  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[]; providers?: CustomProviderConfig[] },
+  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[]; providers?: CustomProviderConfig[]; onlyModel?: string },
 ): Promise<ChatResult> {
   const candidates = modelsForKind(opts.kind, liveModels, cfg);
   // Custom providers: a model served by an enabled custom provider that
@@ -547,7 +547,15 @@ export async function chat(
       customModels.push(m);
     }
   }
-  const ordered = [...customModels, ...candidates.filter((m) => !customModels.includes(m))];
+  // Strict pin: when the caller names one model explicitly (the gateway
+  // pin), that model is the ONLY candidate. A silent fallback to another
+  // model would lie about what served the answer, so any failure here
+  // throws instead of moving on. Callers without a pin keep failover.
+  const onlyModel = cfg.onlyModel;
+  if (onlyModel && !liveSet.has(onlyModel) && !findCustomProvider(onlyModel, cfg.providers)) {
+    throw new LlmError(`Model ${onlyModel} tidak tersedia di daemon maupun provider custom`, { code: "model_failed", retryable: false });
+  }
+  const ordered = onlyModel ? [onlyModel] : [...customModels, ...candidates.filter((m) => !customModels.includes(m))];
   if (ordered.length === 0) throw new LlmError("no live model available", { code: "no_model", retryable: false });
 
   // Failover, not retry: each candidate gets one attempt; a failure moves
@@ -555,7 +563,9 @@ export async function chat(
   let lastErr: unknown;
   let attempt = 0;
   for (const model of ordered) {
-    if (circuitOpen(model)) continue;
+    // An explicit pin overrides the circuit breaker: the user asked for
+    // this model now, so a past failure must not skip it silently.
+    if (!onlyModel && circuitOpen(model)) continue;
     try {
       const signal = opts.signal ?? new AbortController().signal;
       const custom = !liveSet.has(model) ? findCustomProvider(model, cfg.providers) : undefined;
@@ -585,6 +595,9 @@ export async function chat(
       return { message: final, model };
     } catch (err) {
       lastErr = err;
+      if (onlyModel) {
+        throw new LlmError(`Model ${onlyModel} gagal: ${err instanceof Error ? err.message : String(err)}`, { code: "model_failed", retryable: false });
+      }
       if (err instanceof LlmError && !err.retryable) throw err;
       circuitRecordFailure(model);
       await sleep(backoffDelay(attempt++));

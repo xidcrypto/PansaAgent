@@ -26,7 +26,7 @@ export interface AgentOptions {
   context: ContextManager;
   tools: Map<string, Tool>;
   liveModels: string[];
-  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[]; providers?: CustomProviderConfig[] };
+  cfg: { preferReasoning?: string[]; preferCheap?: string[]; models?: string[]; providers?: CustomProviderConfig[]; onlyModel?: string };
   onChunk?: (text: string) => void;
   // Compact tool-call reporting for the TUI (U3): one line per tool
   // execution with timing. Never carries secrets (summary is redacted).

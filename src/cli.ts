@@ -286,7 +286,7 @@ async function gatewayListModels(): Promise<string[]> {
 // `schedule watch` must not spawn a fresh MCP server per task.
 let cachedMcpTools: Promise<Map<string, import("./agent.js").Tool>> | null = null;
 
-async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>): Promise<string> {
+async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>, opts?: { onlyModel?: string }): Promise<string> {
   const cfg = loadConfig();
   await ensureDaemon();
   const live = await fetchLiveModels().catch((): string[] => []);
@@ -300,7 +300,7 @@ async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.j
     context: ctx,
     tools,
     liveModels: live,
-    cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models, providers: cfg.providers },
+    cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models, providers: cfg.providers, onlyModel: opts?.onlyModel },
   });
   return agent.run(prompt);
 }
@@ -522,7 +522,12 @@ async function gatewayCmd(rest: string[]): Promise<number> {
         }).catch(() => null);
         if (direct !== null) return { text: direct, keyboard: mainReplyKeyboard() };
         try {
-          return { text: await agentAnswer(text, tools), keyboard: mainReplyKeyboard() };
+          // A gateway pin is a strict choice: exactly one configured
+          // model means "use this one, or say it failed" — never answer
+          // silently from another model.
+          const pinned = loadConfig().models;
+          const onlyModel = pinned?.length === 1 ? pinned[0] : undefined;
+          return { text: await agentAnswer(text, tools, { onlyModel }), keyboard: mainReplyKeyboard() };
         } catch (err) {
           return { text: `Error: ${err instanceof Error ? err.message : String(err)}`, keyboard: mainReplyKeyboard() };
         }
