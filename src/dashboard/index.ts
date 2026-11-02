@@ -27,7 +27,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { cpus, freemem, loadavg, totalmem, uptime } from "node:os";
 import { statfsSync } from "node:fs";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { CustomProviderView, ProviderInput, ProviderTestResult } from "../providers/index.js";
+import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult } from "../providers/index.js";
 
 export interface ProviderStore {
   list(): CustomProviderView[];
@@ -35,6 +35,8 @@ export interface ProviderStore {
   update(id: string, patch: Partial<ProviderInput>): CustomProviderView;
   remove(id: string): void;
   test(id: string): Promise<ProviderTestResult>;
+  fetchModels(baseUrl: string, apiKey?: string): Promise<FetchModelsResult>;
+  setModel(id: string, model: string, enabled: boolean): CustomProviderView;
 }
 
 function sha256(s: string): Buffer {
@@ -447,9 +449,10 @@ async function api(path,method,body){
 }
 let customCache=[];
 let armedDel="";
+function modelChips(p){ const off=new Set(p.disabledModels||[]); if(!p.models.length) return "(tidak ada model)"; return p.models.map(m=>'<button type="button" data-act="model" data-id="'+esc(p.id)+'" data-model="'+esc(m)+'">'+(off.has(m)?'✗ ':'✓ ')+esc(m)+'</button>').join(" "); }
 function customRowsHtml(list){
   if(!list.length) return '<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>';
-  return list.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="mono">'+esc(p.baseUrl)+'</td><td>'+esc(p.models.join(", "))+'</td><td>'+(p.enabled?'<span class="badge ok">aktif</span>':'<span class="badge muted">nonaktif</span>')+'</td><td>'+(p.hasKey?"ada":"tidak ada")+'</td><td><button type="button" data-act="test" data-id="'+esc(p.id)+'">Uji</button> <button type="button" data-act="edit" data-id="'+esc(p.id)+'">Edit</button> <button type="button" data-act="toggle" data-id="'+esc(p.id)+'">'+(p.enabled?"Nonaktifkan":"Aktifkan")+'</button> <button type="button" data-act="del" data-id="'+esc(p.id)+'">'+(armedDel===p.id?"Yakin hapus?":"Hapus")+'</button></td></tr>').join("");
+  return list.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="mono">'+esc(p.baseUrl)+'</td><td>'+modelChips(p)+'</td><td>'+(p.enabled?'<span class="badge ok">aktif</span>':'<span class="badge muted">nonaktif</span>')+'</td><td>'+(p.hasKey?"ada":"tidak ada")+'</td><td><button type="button" data-act="test" data-id="'+esc(p.id)+'">Uji</button> <button type="button" data-act="edit" data-id="'+esc(p.id)+'">Edit</button> <button type="button" data-act="toggle" data-id="'+esc(p.id)+'">'+(p.enabled?"Nonaktifkan":"Aktifkan")+'</button> <button type="button" data-act="del" data-id="'+esc(p.id)+'">'+(armedDel===p.id?"Yakin hapus?":"Hapus")+'</button></td></tr>').join("");
 }
 function renderCustom(list){
   customCache=list;
@@ -467,28 +470,60 @@ document.getElementById("custom-rows").addEventListener("click",async e=>{
     let doneMsg="";
     if(act==="del"){ if(armedDel!==id){ armedDel=id; renderCustom(customCache); setTimeout(()=>{ if(armedDel===id){ armedDel=""; renderCustom(customCache); } },5000); return; } armedDel=""; await api("api/providers/"+encodeURIComponent(id),"DELETE"); doneMsg="Provider dihapus."; }
     else if(act==="toggle"){ const cur=customCache.find(x=>x.id===id); if(!cur) return; await api("api/providers/"+encodeURIComponent(id),"PUT",{enabled:!cur.enabled}); doneMsg="Status provider diubah."; }
+    else if(act==="model"){ const model=btn.getAttribute("data-model"); const cur=customCache.find(x=>x.id===id); if(!cur||!model) return; const off=(cur.disabledModels||[]).includes(model); await api("api/providers/"+encodeURIComponent(id)+"/model","POST",{model,enabled:off}); doneMsg=off?("Model diaktifkan: "+model):("Model dinonaktifkan: "+model); }
     else if(act==="test"){ const res=await api("api/providers/"+encodeURIComponent(id)+"/test","POST"); msg.textContent=res.ok?("Uji OK: "+res.count+" model ("+(res.sample||[]).join(", ")+")"):("Uji gagal: "+res.error); return; }
-    else if(act==="edit"){ let p=customCache.find(x=>x.id===id); if(!p){ await refreshCustom(); p=customCache.find(x=>x.id===id); } if(!p){ msg.textContent="Error: provider tidak ditemukan, coba muat ulang halaman."; return; } document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
+    else if(act==="edit"){ let p=customCache.find(x=>x.id===id); if(!p){ await refreshCustom(); p=customCache.find(x=>x.id===id); } if(!p){ msg.textContent="Error: provider tidak ditemukan, coba muat ulang halaman."; return; } document.getElementById("pf-id").value=p.id; document.getElementById("pf-name").value=p.name; document.getElementById("pf-base").value=p.baseUrl; document.getElementById("pf-models").value=p.models.join(", "); renderModelList(p.models,p.disabledModels||[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=!!p.enabled; document.getElementById("provider-form").scrollIntoView(); return; }
     await refreshCustom();
     msg.textContent=doneMsg;
+  }catch(err){ msg.textContent="Error: "+err.message; }
+});
+function renderModelList(models,disabled){
+  const box=document.getElementById("pf-models-list"); if(!box) return;
+  const off=new Set(disabled||[]);
+  if(!models.length){ box.innerHTML=""; return; }
+  box.innerHTML='<div style="margin-bottom:6px"><button type="button" id="pf-models-all">Semua</button> <button type="button" id="pf-models-none">Tidak ada</button></div>'+models.map(m=>'<label style="display:block;font-weight:400;margin:3px 0"><input type="checkbox" data-model-item value="'+esc(m)+'"'+(off.has(m)?"":" checked")+"> "+esc(m)+'</label>').join("");
+  const allBtn=document.getElementById("pf-models-all"); if(allBtn) allBtn.addEventListener("click",()=>{ box.querySelectorAll("input[data-model-item]").forEach(c=>{ c.checked=true; }); });
+  const noneBtn=document.getElementById("pf-models-none"); if(noneBtn) noneBtn.addEventListener("click",()=>{ box.querySelectorAll("input[data-model-item]").forEach(c=>{ c.checked=false; }); });
+}
+function readModelList(){
+  const box=document.getElementById("pf-models-list"); if(!box) return null;
+  const items=box.querySelectorAll("input[data-model-item]"); if(!items.length) return null;
+  const models=[]; const disabled=[];
+  items.forEach(c=>{ models.push(c.value); if(!c.checked) disabled.push(c.value); });
+  return {models,disabled};
+}
+document.getElementById("provider-connect").addEventListener("click",async()=>{
+  const msg=document.getElementById("provider-msg");
+  const baseUrl=document.getElementById("pf-base").value; const key=document.getElementById("pf-key").value;
+  if(!baseUrl){ msg.textContent="Error: isi Base URL dulu sebelum Connect."; return; }
+  msg.textContent="Menghubungkan, mengambil daftar model…";
+  try{
+    const res=await api("api/providers/fetch-models","POST",{baseUrl,apiKey:key||undefined});
+    if(!res.ok){ msg.textContent="Connect gagal: "+(res.error||"tidak diketahui"); return; }
+    const models=res.models||[];
+    document.getElementById("pf-models").value=models.join(", ");
+    renderModelList(models,[]);
+    msg.textContent=models.length?("Connect OK: "+models.length+" model ditemukan, centang yang aktif lalu Simpan."):("Connect OK: endpoint tidak mengembalikan model, isi manual di kolom Model.");
   }catch(err){ msg.textContent="Error: "+err.message; }
 });
 document.getElementById("provider-form").addEventListener("submit",async e=>{
   e.preventDefault();
   const msg=document.getElementById("provider-msg");
   const id=document.getElementById("pf-id").value;
-  const payload={name:document.getElementById("pf-name").value,baseUrl:document.getElementById("pf-base").value,models:document.getElementById("pf-models").value.split(","),enabled:document.getElementById("pf-enabled").checked};
+  const picked=readModelList();
+  const payload={name:document.getElementById("pf-name").value,baseUrl:document.getElementById("pf-base").value,models:picked?picked.models:document.getElementById("pf-models").value.split(","),enabled:document.getElementById("pf-enabled").checked};
+  if(picked) payload.disabledModels=picked.disabled;
   const key=document.getElementById("pf-key").value; if(key) payload.apiKey=key;
   try{
     if(id) await api("api/providers/"+encodeURIComponent(id),"PUT",payload);
     else await api("api/providers","POST",payload);
-    document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
+    document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
     await refreshCustom();
     msg.textContent="Provider tersimpan.";
   }catch(err){ msg.textContent="Error: "+err.message; }
 });
 document.getElementById("provider-cancel").addEventListener("click",()=>{
-  document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
+  document.getElementById("pf-id").value=""; document.getElementById("pf-name").value=""; document.getElementById("pf-base").value=""; document.getElementById("pf-models").value=""; renderModelList([],[]); document.getElementById("pf-key").value=""; document.getElementById("pf-enabled").checked=true;
 });
 function render(d){
   document.getElementById("m-cpu").innerHTML=d.system.cpuLoad1.toFixed(2)+' <span class="sub">/ '+d.system.cpuCount+' core</span>';
@@ -560,12 +595,23 @@ function modelRows(providers: ProvidersInfo): string {
     .join("\n");
 }
 
+function modelChipsHtml(p: CustomProviderView): string {
+  const off = new Set(p.disabledModels ?? []);
+  if (!p.models.length) return "(tidak ada model)";
+  return p.models
+    .map(
+      (m) =>
+        `<button type="button" data-act="model" data-id="${escapeHtml(p.id)}" data-model="${escapeHtml(m)}">${off.has(m) ? "✗ " : "✓ "}${escapeHtml(m)}</button>`,
+    )
+    .join(" ");
+}
+
 function customRows(custom: CustomProviderView[]): string {
   if (!custom.length) return `<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>`;
   return custom
     .map(
       (p) =>
-        `<tr><td>${escapeHtml(p.name)}</td><td class="mono">${escapeHtml(p.baseUrl)}</td><td>${escapeHtml(p.models.join(", "))}</td><td>${p.enabled ? '<span class="badge ok">aktif</span>' : '<span class="badge muted">nonaktif</span>'}</td><td>${p.hasKey ? "ada" : "tidak ada"}</td><td><button type="button" data-act="test" data-id="${escapeHtml(p.id)}">Uji</button> <button type="button" data-act="edit" data-id="${escapeHtml(p.id)}">Edit</button> <button type="button" data-act="toggle" data-id="${escapeHtml(p.id)}">${p.enabled ? "Nonaktifkan" : "Aktifkan"}</button> <button type="button" data-act="del" data-id="${escapeHtml(p.id)}">Hapus</button></td></tr>`,
+        `<tr><td>${escapeHtml(p.name)}</td><td class="mono">${escapeHtml(p.baseUrl)}</td><td>${modelChipsHtml(p)}</td><td>${p.enabled ? '<span class="badge ok">aktif</span>' : '<span class="badge muted">nonaktif</span>'}</td><td>${p.hasKey ? "ada" : "tidak ada"}</td><td><button type="button" data-act="test" data-id="${escapeHtml(p.id)}">Uji</button> <button type="button" data-act="edit" data-id="${escapeHtml(p.id)}">Edit</button> <button type="button" data-act="toggle" data-id="${escapeHtml(p.id)}">${p.enabled ? "Nonaktifkan" : "Aktifkan"}</button> <button type="button" data-act="del" data-id="${escapeHtml(p.id)}">Hapus</button></td></tr>`,
     )
     .join("\n");
 }
@@ -619,8 +665,10 @@ ${customRows(customProviders)}</tbody></table></div>
 <input id="pf-name" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="mis. openrouter">
 <div class="label" style="margin-bottom:6px">Base URL (OpenAI-compatible)</div>
 <input id="pf-base" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="https://openrouter.ai/api/v1">
+<div style="margin-bottom:10px"><button type="button" id="provider-connect">Connect (ambil semua model)</button></div>
 <div class="label" style="margin-bottom:6px">Model (pisahkan koma)</div>
 <input id="pf-models" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="model-a, model-b">
+<div id="pf-models-list" style="margin-bottom:10px"></div>
 <div class="label" style="margin-bottom:6px">API key (kosongkan = pakai kunci lama / tanpa kunci)</div>
 <input id="pf-key" type="password" autocomplete="off" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px">
 <label style="font-weight:700"><input id="pf-enabled" type="checkbox" checked> Aktif</label>
@@ -746,13 +794,29 @@ export async function startDashboard(opts: {
             res.end(JSON.stringify({ provider: created }));
             return;
           }
-          const m = rest.match(/^\/([^/]+)(\/test)?$/);
+          if (rest === "/fetch-models" && req.method === "POST") {
+            const body = (await readJsonBody(req)) as { baseUrl?: string; apiKey?: string };
+            if (!body.baseUrl) throw new Error("baseUrl wajib diisi.");
+            const result = await opts.providers.fetchModels(body.baseUrl, body.apiKey);
+            res.writeHead(result.ok ? 200 : 502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(result));
+            return;
+          }
+          const m = rest.match(/^\/([^/]+)(\/test|\/model)?$/);
           if (m) {
             const id = decodeURIComponent(m[1]!);
             if (m[2] === "/test" && req.method === "POST") {
               const result = await opts.providers.test(id);
               res.writeHead(result.ok ? 200 : 502, { "Content-Type": "application/json" });
               res.end(JSON.stringify(result));
+              return;
+            }
+            if (m[2] === "/model" && req.method === "POST") {
+              const body = (await readJsonBody(req)) as { model?: string; enabled?: boolean };
+              if (!body.model || typeof body.enabled !== "boolean") throw new Error("Butuh model dan enabled.");
+              const updated = opts.providers.setModel(id, body.model, body.enabled);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ provider: updated }));
               return;
             }
             if (req.method === "PUT") {

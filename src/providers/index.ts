@@ -12,6 +12,8 @@ export interface CustomProviderConfig {
   name: string;
   baseUrl: string;
   models: string[];
+  /** Model ids from models[] that are switched off. Absent = none off. */
+  disabledModels?: string[];
   enabled: boolean;
 }
 
@@ -20,6 +22,8 @@ export interface CustomProviderView {
   name: string;
   baseUrl: string;
   models: string[];
+  /** Always present in views, even for legacy configs without the field. */
+  disabledModels: string[];
   enabled: boolean;
   hasKey: boolean;
 }
@@ -28,6 +32,8 @@ export interface ProviderInput {
   name: string;
   baseUrl: string;
   models?: string[];
+  /** Model ids to switch off. Only entries also in models survive. */
+  disabledModels?: string[];
   enabled?: boolean;
   /** Plaintext key, only accepted when a passphrase is available. */
   apiKey?: string;
@@ -62,6 +68,21 @@ function normalizeModels(models: unknown): string[] {
   for (const m of list) {
     const id = String(m).trim();
     if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/** Keep only disabled ids that are actually registered models. */
+function normalizeDisabledModels(models: string[], disabled: unknown): string[] {
+  const list = Array.isArray(disabled)
+    ? disabled
+    : typeof disabled === "string"
+      ? disabled.split(",")
+      : [];
+  const out: string[] = [];
+  for (const m of list) {
+    const id = String(m).trim();
+    if (id && models.includes(id) && !out.includes(id)) out.push(id);
   }
   return out;
 }
@@ -114,6 +135,7 @@ export function listProviders(passphrase?: string): CustomProviderView[] {
     name: p.name,
     baseUrl: p.baseUrl,
     models: [...p.models],
+    disabledModels: normalizeDisabledModels(p.models, p.disabledModels),
     enabled: p.enabled,
     hasKey: hasStoredKey(p.id, passphrase),
   }));
@@ -147,12 +169,13 @@ export function createProvider(input: ProviderInput, passphrase?: string): Custo
     name,
     baseUrl,
     models,
+    disabledModels: normalizeDisabledModels(models, input.disabledModels),
     enabled: input.enabled ?? true,
   };
   providers.push(provider);
   saveConfig({ ...cfg, providers });
   if (input.apiKey) storeKey(id, input.apiKey, passphrase);
-  return { ...provider, hasKey: Boolean(input.apiKey) };
+  return { ...provider, disabledModels: [...(provider.disabledModels ?? [])], hasKey: Boolean(input.apiKey) };
 }
 
 export function updateProvider(
@@ -166,11 +189,16 @@ export function updateProvider(
   if (idx === -1) throw new Error(`Provider tidak ditemukan: ${id}`);
   const current = providers[idx]!;
   if (patch.name !== undefined && !patch.name.trim()) throw new Error("Nama provider tidak boleh kosong.");
+  const nextModels = patch.models !== undefined ? normalizeModels(patch.models) : current.models;
   const next: CustomProviderConfig = {
     ...current,
     name: patch.name?.trim() ?? current.name,
     baseUrl: patch.baseUrl !== undefined ? normalizeBaseUrl(patch.baseUrl) : current.baseUrl,
-    models: patch.models !== undefined ? normalizeModels(patch.models) : current.models,
+    models: nextModels,
+    disabledModels:
+      patch.disabledModels !== undefined
+        ? normalizeDisabledModels(nextModels, patch.disabledModels)
+        : normalizeDisabledModels(nextModels, current.disabledModels),
     enabled: patch.enabled ?? current.enabled,
   };
   if (!next.models.length) throw new Error("Minimal satu model wajib diisi.");
@@ -183,7 +211,7 @@ export function updateProvider(
   saveConfig({ ...cfg, providers });
   if (patch.clearKey) deleteStoredKey(id, passphrase);
   else if (patch.apiKey) storeKey(id, patch.apiKey, passphrase);
-  return { ...next, hasKey: patch.clearKey ? false : patch.apiKey ? true : hasStoredKey(id, passphrase) };
+  return { ...next, disabledModels: [...(next.disabledModels ?? [])], hasKey: patch.clearKey ? false : patch.apiKey ? true : hasStoredKey(id, passphrase) };
 }
 
 export function deleteProvider(id: string, passphrase?: string): void {
@@ -207,12 +235,31 @@ export function getProviderKey(id: string, passphrase?: string): string | undefi
   }
 }
 
-/** Find the enabled custom provider serving a model id, if any. */
+/** Find the enabled custom provider serving a model id, if any. A model
+ *  switched off in disabledModels is never served, even when registered. */
 export function findCustomProvider(
   model: string,
   providers?: CustomProviderConfig[],
 ): CustomProviderConfig | undefined {
-  return (providers ?? []).find((p) => p.enabled && p.models.includes(model));
+  return (providers ?? []).find(
+    (p) => p.enabled && p.models.includes(model) && !(p.disabledModels ?? []).includes(model),
+  );
+}
+
+/** Switch one registered model on or off without touching the rest. */
+export function setModelEnabled(
+  id: string,
+  model: string,
+  enabled: boolean,
+  passphrase?: string,
+): CustomProviderView {
+  const cfg = loadConfig();
+  const current = (cfg.providers ?? []).find((p) => p.id === id);
+  if (!current) throw new Error(`Provider tidak ditemukan: ${id}`);
+  if (!current.models.includes(model)) throw new Error(`Model tidak terdaftar di provider ini: ${model}`);
+  const disabled = normalizeDisabledModels(current.models, current.disabledModels);
+  const next = enabled ? disabled.filter((m) => m !== model) : [...disabled, model].filter((m, i, a) => a.indexOf(m) === i);
+  return updateProvider(id, { disabledModels: next }, passphrase);
 }
 
 export interface ProviderTestResult {
@@ -222,32 +269,61 @@ export interface ProviderTestResult {
   error?: string;
 }
 
+export interface FetchModelsResult {
+  ok: boolean;
+  models?: string[];
+  error?: string;
+}
+
+/** Fetch the full model list from an OpenAI-compatible endpoint (the
+ *  Connect step). Never logs or returns the key; only ids come back.
+ *  Accepts the OpenAI shape {data:[{id}]}, {models:[...]}, and a plain
+ *  string array, because providers vary. */
+export async function fetchProviderModels(baseUrl: string, apiKey?: string): Promise<FetchModelsResult> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const headers: Record<string, string> = {};
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/models`, {
+      signal: ctrl.signal,
+      headers,
+    });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    const json = (await res.json()) as unknown;
+    let raw: unknown[] = [];
+    if (Array.isArray(json)) raw = json;
+    else if (json && typeof json === "object") {
+      const obj = json as { data?: unknown; models?: unknown };
+      if (Array.isArray(obj.data)) raw = obj.data;
+      else if (Array.isArray(obj.models)) raw = obj.models;
+    }
+    const ids = raw
+      .map((d) => (typeof d === "string" ? d : (d as { id?: unknown } | null)?.id))
+      .filter((id): id is string => typeof id === "string");
+    const out: string[] = [];
+    for (const id of ids) {
+      const trimmed = id.trim();
+      if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+    }
+    return { ok: true, models: out };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Probe a provider's /v1/models endpoint (OpenAI-compatible). Never
  *  logs or returns the key; only counts and sample ids come back. */
 export async function testProvider(
   provider: CustomProviderConfig,
   apiKey?: string,
 ): Promise<ProviderTestResult> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 10000);
-  try {
-    const headers: Record<string, string> = {};
-    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    const res = await fetch(`${provider.baseUrl.replace(/\/$/, "")}/v1/models`, {
-      signal: ctrl.signal,
-      headers,
-    });
-    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-    const json = (await res.json()) as { data?: { id?: unknown }[] };
-    const ids = Array.isArray(json.data)
-      ? json.data.map((d) => d.id).filter((id): id is string => typeof id === "string")
-      : [];
-    return { ok: true, count: ids.length, sample: ids.slice(0, 10) };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  } finally {
-    clearTimeout(timer);
-  }
+  const fetched = await fetchProviderModels(provider.baseUrl, apiKey);
+  if (!fetched.ok) return { ok: false, error: fetched.error };
+  const ids = fetched.models ?? [];
+  return { ok: true, count: ids.length, sample: ids.slice(0, 10) };
 }
 
 export async function testProviderById(

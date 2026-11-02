@@ -35,7 +35,7 @@ import { getPortfolio, getWalletPortfolio, formatPortfolio, dexscreenerTokenPric
 import type { PortfolioDeps } from "./portfolio/index.js";
 import { selectBatchWallets, runBatch, formatBatchSummary } from "./batch/index.js";
 import { startDashboard } from "./dashboard/index.js";
-import { listProviders, createProvider, updateProvider, deleteProvider, testProviderById } from "./providers/index.js";
+import { listProviders, createProvider, updateProvider, deleteProvider, testProviderById, fetchProviderModels, setModelEnabled } from "./providers/index.js";
 
 // Pure restore flags (no command, no other flags) open the TUI with a
 // session restore: `pansa -c` (last session) or `pansa --resume <id>`.
@@ -1095,6 +1095,8 @@ async function dashboardCmd(rest: string[], portArg?: string | boolean): Promise
         update: (id, patch) => updateProvider(id, patch, pass),
         remove: (id) => deleteProvider(id, pass),
         test: (id) => testProviderById(id, pass),
+        fetchModels: (baseUrl, apiKey) => fetchProviderModels(baseUrl, apiKey),
+        setModel: (id, model, enabled) => setModelEnabled(id, model, enabled, pass),
       },
     });
   } catch (err) {
