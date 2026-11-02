@@ -441,7 +441,7 @@ const fmtP=n=>n===null||n===undefined?"—":n.toFixed(1)+"%";
 const fmtU=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+"h "+h+"j":h>0?h+"j "+m+"m":m+"m";};
 const trunc=(s,n)=>!s?"—":s.length>n?s.slice(0,n)+"…":s;
 const badge=st=>{const m={pending:["warn","pending"],active:["ok","aktif"],done:["ok","selesai"],triggered:["warn","terpicu"],failed:["bad","gagal"],cancelled:["muted","batal"]};const [c,l]=m[st]||["muted",st];return '<span class="badge '+c+'">'+esc(l)+'</span>';};
-const SECTIONS=["status","provider","model","dompet","tugas","alert","log"];
+const SECTIONS=["status","provider","model","usage","dompet","tugas","alert","log"];
 const dashPrefix=location.pathname.endsWith("/") ? location.pathname.slice(0, -1) : location.pathname;
 function showSection(id){
   if(!SECTIONS.includes(id)) id="status";
@@ -637,7 +637,15 @@ function render(d){
     const fmtN=n=>n.toLocaleString("id-ID");
     const fmtC=c=>c===null?"—":"$"+c.toFixed(4);
     document.getElementById("usage-summary").textContent=d.usage.calls===0?"(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)":'Total: '+fmtN(d.usage.totalTokens)+' token · in '+fmtN(d.usage.inputTokens)+' · out '+fmtN(d.usage.outputTokens)+' · '+d.usage.calls+' panggilan · estimasi biaya $'+d.usage.costUsd.toFixed(4)+' — rincian per model dan per provider ada di halaman Penggunaan.';
-    document.getElementById("usage-totals").textContent='Total: '+fmtN(d.usage.totalTokens)+' token · in '+fmtN(d.usage.inputTokens)+' · out '+fmtN(d.usage.outputTokens)+' · '+d.usage.calls+' panggilan · estimasi biaya $'+d.usage.costUsd.toFixed(4)+' (hanya model yang harganya diketahui; model lain tidak dihitung, bukan nol)';
+    document.getElementById("usage-card-total").textContent=fmtN(d.usage.totalTokens);
+    document.getElementById("usage-card-in").textContent=fmtN(d.usage.inputTokens);
+    document.getElementById("usage-card-out").textContent=fmtN(d.usage.outputTokens);
+    document.getElementById("usage-card-cost").innerHTML="$"+d.usage.costUsd.toFixed(4)+' <span class="sub">hanya model yang harganya diketahui</span>';
+    document.getElementById("usage-card-calls").textContent=String(d.usage.calls);
+    document.getElementById("usage-card-avg").textContent=d.usage.calls?fmtN(Math.round(d.usage.totalTokens/d.usage.calls)):"—";
+    const topM=d.usage.byModel[0], topP=d.usage.byProvider[0];
+    document.getElementById("usage-card-topmodel").innerHTML=topM?esc(topM.model)+' <span class="sub">'+fmtN(topM.totalTokens)+' token</span>':"—";
+    document.getElementById("usage-card-topprovider").innerHTML=topP?esc(topP.provider)+' <span class="sub">'+fmtN(topP.totalTokens)+' token</span>':"—";
     document.getElementById("usage-rows").innerHTML=d.usage.byModel.length?d.usage.byModel.map(r=>'<tr><td class="mono">'+esc(r.model)+'</td><td>'+esc(r.provider)+'</td><td>'+fmtN(r.inputTokens)+'</td><td>'+fmtN(r.outputTokens)+'</td><td>'+fmtN(r.totalTokens)+'</td><td>'+fmtC(r.costUsd)+'</td><td>'+r.calls+'</td></tr>').join(""):'<tr><td colspan="7">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>';
     document.getElementById("usage-provider-rows").innerHTML=d.usage.byProvider.length?d.usage.byProvider.map(r=>'<tr><td>'+esc(r.provider)+'</td><td>'+fmtN(r.inputTokens)+'</td><td>'+fmtN(r.outputTokens)+'</td><td>'+fmtN(r.totalTokens)+'</td><td>'+fmtC(r.costUsd)+'</td><td>'+r.calls+'</td></tr>').join(""):'<tr><td colspan="6">(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)</td></tr>';
   }
@@ -732,8 +740,21 @@ function fmtCost(cost: number | null): string {
   return cost === null ? "—" : `$${cost.toFixed(4)}`;
 }
 
-function usageTotalsHtml(usage: UsageTotals): string {
-  return `Total: ${fmtNum(usage.totalTokens)} token · in ${fmtNum(usage.inputTokens)} · out ${fmtNum(usage.outputTokens)} · ${usage.calls} panggilan · estimasi biaya $${usage.costUsd.toFixed(4)} (hanya model yang harganya diketahui; model lain tidak dihitung, bukan nol)`;
+function usageCardsHtml(usage: UsageTotals | null | undefined): string {
+  const topModel = usage?.byModel[0];
+  const topProvider = usage?.byProvider[0];
+  const card = (label: string, id: string, value: string, sub?: string): string =>
+    `<div class="card"><div class="label">${label}</div><div class="value" id="${id}">${value}${sub ? ` <span class="sub">${sub}</span>` : ""}</div></div>`;
+  return [
+    card("Total token", "usage-card-total", usage ? fmtNum(usage.totalTokens) : "—"),
+    card("Token masuk (in)", "usage-card-in", usage ? fmtNum(usage.inputTokens) : "—"),
+    card("Token keluar (out)", "usage-card-out", usage ? fmtNum(usage.outputTokens) : "—"),
+    card("Estimasi biaya", "usage-card-cost", usage ? `$${usage.costUsd.toFixed(4)}` : "—", usage ? "hanya model yang harganya diketahui" : undefined),
+    card("Panggilan", "usage-card-calls", usage ? String(usage.calls) : "—"),
+    card("Rata-rata token / panggilan", "usage-card-avg", usage && usage.calls ? fmtNum(Math.round(usage.totalTokens / usage.calls)) : "—"),
+    card("Model teratas", "usage-card-topmodel", topModel ? escapeHtml(topModel.model) : "—", topModel ? `${fmtNum(topModel.totalTokens)} token` : undefined),
+    card("Provider teratas", "usage-card-topprovider", topProvider ? escapeHtml(topProvider.provider) : "—", topProvider ? `${fmtNum(topProvider.totalTokens)} token` : undefined),
+  ].join("\n");
 }
 
 function usageSummaryHtml(usage: UsageTotals): string {
@@ -855,7 +876,7 @@ ${modelRows(providers)}</tbody></table></div>
 </section>
 <section id="sec-usage">
 <h2>Penggunaan LLM</h2>
-<div class="card" id="usage-totals">${usage ? usageTotalsHtml(usage) : "(tidak ada data)"}</div>
+<div class="grid" id="usage-cards">${usageCardsHtml(usage)}</div>
 <h2>Per model</h2>
 <div class="tablewrap"><table><tr><th>Model</th><th>Provider</th><th>In</th><th>Out</th><th>Total</th><th>Estimasi biaya</th><th>Panggilan</th></tr><tbody id="usage-rows">
 ${usage ? usageRowsHtml(usage) : `<tr><td colspan="7">(tidak ada data)</td></tr>`}</tbody></table></div>
