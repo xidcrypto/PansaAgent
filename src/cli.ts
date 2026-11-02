@@ -264,16 +264,20 @@ export async function main(argv: string[]): Promise<number> {
 // then enabled custom-provider models that are not disabled and not
 // already listed. Previously the bot only offered daemon models, so a
 // custom provider's model could never be picked from Telegram.
-async function gatewayListModels(): Promise<string[]> {
-  const live = await fetchLiveModels().catch((): string[] => []);
+function gatewayCustomModels(): string[] {
   const custom: string[] = [];
   for (const p of listProviders()) {
     if (!p.enabled) continue;
     for (const m of p.models) {
-      if (!p.disabledModels.includes(m) && !live.includes(m) && !custom.includes(m)) custom.push(m);
+      if (!p.disabledModels.includes(m) && !custom.includes(m)) custom.push(m);
     }
   }
-  return [...live, ...custom];
+  return custom;
+}
+
+async function gatewayListModels(): Promise<string[]> {
+  const live = await fetchLiveModels().catch((): string[] => []);
+  return [...live, ...gatewayCustomModels().filter((m) => !live.includes(m))];
 }
 
 // Headless agent run returning the final answer (scheduler, gateway).
@@ -477,7 +481,8 @@ async function gatewayCmd(rest: string[]): Promise<number> {
               "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
             ].join("\n");
           },
-          listModels: () => gatewayListModels(),
+          listDefaultModels: () => fetchLiveModels().catch((): string[] => []),
+          listCustomModels: () => Promise.resolve(gatewayCustomModels()),
           pinnedModel: () => loadConfig().models?.[0],
           setModel: (id) => {
             const c = loadConfig();

@@ -229,15 +229,31 @@ export function modelReplyKeyboard(models: string[], page = 0): ReplyKeyboardMar
   if (safePage > 0) nav.push({ text: "⬅️ Sebelumnya" });
   if (safePage < maxPage) nav.push({ text: "➡️ Lagi" });
   if (nav.length) rows.push(nav);
-  rows.push([{ text: "⬅️ Kembali ke menu" }]);
+  rows.push([{ text: "⬅️ Kembali" }]);
   return { keyboard: rows, resize_keyboard: true, one_time_keyboard: false, is_persistent: true };
 }
 
-// Per-chat picker state: which panel the user currently sees. Only
-// needed to tell a model-id tap apart from an ordinary chat message
-// that happens to equal a model id. Memory-only: a gateway restart
-// clears it, and a tap then falls through to the agent (harmless).
-type KeyboardPanelState = { kind: "menu" | "models"; page: number };
+// Choice panel before the picker: Default = daemon live models,
+// Custom = enabled custom-provider models. Tapping one opens that
+// source's picker; picking a model there pins it immediately.
+export function modelSourceKeyboard(): ReplyKeyboardMarkup {
+  return {
+    keyboard: [
+      [{ text: "Default" }, { text: "Custom" }],
+      [{ text: "⬅️ Kembali ke menu" }],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+    is_persistent: true,
+  };
+}
+
+// Per-chat picker state: which panel the user currently sees, and for
+// the model picker, which source (default/custom) and page. Only needed
+// to tell a model-id tap apart from an ordinary chat message that
+// happens to equal a model id. Memory-only: a gateway restart clears
+// it, and a tap then falls through to the agent (harmless).
+type KeyboardPanelState = { kind: "menu" | "model-source" | "models"; source?: "default" | "custom"; page: number };
 const keyboardPanelState = new Map<number, KeyboardPanelState>();
 
 export function resetGatewayKeyboardPanelState(): void {
@@ -249,14 +265,21 @@ export interface GatewayKeyboardDeps {
   scheduleText: () => string;
   alertText: () => string;
   providerText: () => Promise<string>;
-  listModels: () => Promise<string[]>;
+  listDefaultModels: () => Promise<string[]>;
+  listCustomModels: () => Promise<string[]>;
   pinnedModel: () => string | undefined;
   setModel: (id: string) => void;
 }
 
+function sourceLabel(source: "default" | "custom"): string {
+  return source === "default" ? "Default (daemon)" : "Custom (provider)";
+}
+
 // Route a reply-keyboard tap (arrives as plain message text). Returns
 // null for anything that is not a panel button, so it falls through to
-// deterministic commands and then the agent.
+// deterministic commands and then the agent. Flow: Model -> choose
+// Default/Custom -> pick a model -> pinned immediately, and the next
+// agent answer uses it (config is re-read per message).
 export async function handleReplyKeyboardText(
   text: string,
   chatId: number,
@@ -265,21 +288,55 @@ export async function handleReplyKeyboardText(
   const state = keyboardPanelState.get(chatId) ?? { kind: "menu", page: 0 };
   const t = text.trim();
   if (t === "🤖 Model") {
-    const models = await deps.listModels().catch((): string[] => []);
-    keyboardPanelState.set(chatId, { kind: "models", page: 0 });
-    return { text: modelPageText(models, deps.pinnedModel(), 0), keyboard: modelReplyKeyboard(models, 0) };
+    keyboardPanelState.set(chatId, { kind: "model-source", page: 0 });
+    return {
+      text: [
+        "🤖 Pilih sumber model:",
+        "Default — model dari daemon.",
+        "Custom — model dari provider custom yang aktif (mis. beat-4).",
+        "Ketuk salah satu, lalu ketuk modelnya — model itu langsung dipakai untuk chat berikutnya.",
+      ].join("\n"),
+      keyboard: modelSourceKeyboard(),
+    };
   }
   if (t === "⬅️ Kembali ke menu") {
     keyboardPanelState.set(chatId, { kind: "menu", page: 0 });
     return { text: "Menu PANSA — pilih:", keyboard: mainReplyKeyboard() };
   }
-  if (state.kind === "models") {
-    const models = await deps.listModels().catch((): string[] => []);
+  if (t === "Default" || t === "Custom") {
+    const source = t === "Default" ? "default" : "custom";
+    const models = await (source === "default" ? deps.listDefaultModels() : deps.listCustomModels()).catch((): string[] => []);
+    if (!models.length) {
+      keyboardPanelState.set(chatId, { kind: "model-source", page: 0 });
+      return {
+        text:
+          source === "custom"
+            ? "Belum ada model provider custom yang aktif. Tambah provider lewat dashboard PANSA, lalu kembali ke sini."
+            : "Tidak ada model default dari daemon. Pastikan daemon berjalan, lalu coba lagi.",
+        keyboard: modelSourceKeyboard(),
+      };
+    }
+    keyboardPanelState.set(chatId, { kind: "models", source, page: 0 });
+    return { text: modelPageText(models, deps.pinnedModel(), 0, true, sourceLabel(source)), keyboard: modelReplyKeyboard(models, 0) };
+  }
+  if (t === "⬅️ Kembali" && state.kind === "models") {
+    keyboardPanelState.set(chatId, { kind: "model-source", page: 0 });
+    return {
+      text: [
+        "🤖 Pilih sumber model:",
+        "Default — model dari daemon.",
+        "Custom — model dari provider custom yang aktif (mis. beat-4).",
+      ].join("\n"),
+      keyboard: modelSourceKeyboard(),
+    };
+  }
+  if (state.kind === "models" && state.source) {
+    const models = await (state.source === "default" ? deps.listDefaultModels() : deps.listCustomModels()).catch((): string[] => []);
     if (t === "➡️ Lagi" || t === "⬅️ Sebelumnya") {
       const maxPage = Math.max(0, Math.ceil(models.length / MODEL_PAGE_SIZE) - 1);
       const page = Math.min(Math.max(0, state.page + (t === "➡️ Lagi" ? 1 : -1)), maxPage);
-      keyboardPanelState.set(chatId, { kind: "models", page });
-      return { text: modelPageText(models, deps.pinnedModel(), page), keyboard: modelReplyKeyboard(models, page) };
+      keyboardPanelState.set(chatId, { kind: "models", source: state.source, page });
+      return { text: modelPageText(models, deps.pinnedModel(), page, true, sourceLabel(state.source)), keyboard: modelReplyKeyboard(models, page) };
     }
     if (models.includes(t)) {
       deps.setModel(t);
@@ -363,14 +420,17 @@ export function modelKeyboard(models: string[], pinned?: string, page = 0): Inli
   return { inline_keyboard: rows };
 }
 
-function modelPageText(models: string[], pinned: string | undefined, page: number): string {
-  const buttonable = models.filter((m) => `model:${m}`.length <= 64);
-  const skipped = models.filter((m) => `model:${m}`.length > 64);
+function modelPageText(models: string[], pinned: string | undefined, page: number, forReply = false, sourceLabel?: string): string {
+  // Reply-keyboard buttons have no 64-byte cap, so the inline filter
+  // must not apply there: every model is tappable from the panel.
+  const buttonable = forReply ? models : models.filter((m) => `model:${m}`.length <= 64);
+  const skipped = forReply ? [] : models.filter((m) => `model:${m}`.length > 64);
   const maxPage = Math.max(0, Math.ceil(buttonable.length / MODEL_PAGE_SIZE) - 1);
   const safePage = Math.min(Math.max(0, page), maxPage);
   const slice = buttonable.slice(safePage * MODEL_PAGE_SIZE, safePage * MODEL_PAGE_SIZE + MODEL_PAGE_SIZE);
   return [
     "🤖 Pilih model untuk agen gateway (klik untuk mengunci):",
+    ...(sourceLabel ? [`Sumber: ${sourceLabel}`] : []),
     ...(slice.length ? slice.map((m) => (pinned === m ? `✓ ${m}` : m)) : ["(tidak ada model yang bisa dipilih)"]),
     ...(maxPage > 0 ? [`Halaman ${safePage + 1} dari ${maxPage + 1} (${buttonable.length} model)`] : []),
     ...(skipped.length ? [`(${skipped.length} model lain tidak bisa jadi tombol — id melebihi 64 byte)`] : []),
