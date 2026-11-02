@@ -434,6 +434,19 @@ async function gatewayCmd(rest: string[]): Promise<number> {
             if (!active.length) return "Price alert aktif: (kosong)";
             return active.map((a) => `${a.id} | ${a.token} ${a.op} $${a.price_usd}${a.note ? ` | ${a.note}` : ""}`).join("\n");
           },
+          providerText: async () => {
+            const models = await fetchLiveModels().catch((): string[] => []);
+            const pinned = loadConfig().models?.[0];
+            return [
+              "➕ Provider & model:",
+              `Model live dari daemon: ${models.length}`,
+              `Model terkunci: ${pinned ?? "(tidak ada — daemon memilih)"}`,
+              "Provider dikelola di konfigurasi daemon LLM (port 17070) di VPS, bukan lewat chat.",
+              "Daemon bansos v1 hanya keyless — gateway lokal bertoken (mis. 9Router) adalah roadmap M5 yang belum dirilis.",
+              "API key tidak boleh dikirim lewat Telegram — tambah provider lewat dashboard 9Router sendiri.",
+              "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
+            ].join("\n");
+          },
         }).catch(() => null);
         if (direct !== null) return direct;
         try {

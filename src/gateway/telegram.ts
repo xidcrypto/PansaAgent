@@ -228,6 +228,7 @@ export function connectTemplate(nowMs: number = Date.now()): string {
     "/status — ringkasan kesehatan PANSA",
     "/schedule — tugas terjadwal yang masih pending",
     "/alerts — price alert yang masih aktif",
+    "/provider — provider & model dari daemon",
     "/help — daftar perintah lengkap",
     "",
     "Atau kirim pesan bebas — agen PANSA akan menjawabnya.",
@@ -299,6 +300,7 @@ export interface GatewayCommandDeps {
   doctorText: () => Promise<string>;
   scheduleText: () => string;
   alertText: () => string;
+  providerText: () => Promise<string>;
 }
 
 // Sapaan ringan dijawab deterministik (tanpa LLM): agen dengan
@@ -330,6 +332,7 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
       "/status — ringkasan doctor (node, config, daemon, scheduler, gateway)",
       "/schedule — tugas terjadwal yang masih pending",
       "/alerts — price alert yang masih aktif",
+      "/provider — provider & model dari daemon (tanpa kirim API key)",
       "/pair <kode> — hubungkan chat ini (kode dari `pansa gateway pair`)",
       "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
     ].join("\n");
@@ -337,6 +340,7 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
   if (cmd === "/status") return deps.doctorText();
   if (cmd === "/schedule") return deps.scheduleText();
   if (cmd === "/alerts") return deps.alertText();
+  if (cmd === "/provider") return deps.providerText();
   return null;
 }
 
@@ -414,6 +418,7 @@ export async function handleGatewayCallback(
         "/status — ringkasan doctor (node, config, daemon, scheduler, gateway)",
         "/schedule — tugas terjadwal yang masih pending",
         "/alerts — price alert yang masih aktif",
+        "/provider — provider & model dari daemon (tanpa kirim API key)",
         "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
       ].join("\n"),
       keyboard: mainMenuKeyboard(),
