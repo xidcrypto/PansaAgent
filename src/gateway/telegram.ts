@@ -150,7 +150,7 @@ export class TelegramBot {
     });
   }
 
-  async sendMessage(chatId: number, text: string, replyMarkup?: InlineKeyboardMarkup): Promise<void> {
+  async sendMessage(chatId: number, text: string, replyMarkup?: InlineKeyboardMarkup | ReplyKeyboardMarkup): Promise<void> {
     const chunks = splitMessage(text);
     for (let i = 0; i < chunks.length; i++) {
       const body: Record<string, unknown> = { chat_id: chatId, text: chunks[i] };
@@ -179,6 +179,142 @@ export interface InlineKeyboardButton {
 
 export interface InlineKeyboardMarkup {
   inline_keyboard: InlineKeyboardButton[][];
+}
+
+// Persistent reply keyboard: the panel that opens from the grid icon
+// next to the message field (NOT buttons inside a chat bubble). Once a
+// bot sends one, Telegram keeps the panel until another keyboard
+// replaces it, so every bot reply re-attaches the main panel. Tapping a
+// button sends its text as an ordinary message, which the gateway
+// routes in handleReplyKeyboardText. Unlike inline callback_data, reply
+// button text has no 64-byte cap, so every model id is tappable.
+export interface ReplyKeyboardButton {
+  text: string;
+}
+
+export interface ReplyKeyboardMarkup {
+  keyboard: ReplyKeyboardButton[][];
+  resize_keyboard?: boolean;
+  one_time_keyboard?: boolean;
+  is_persistent?: boolean;
+}
+
+export type ReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup;
+
+export function mainReplyKeyboard(): ReplyKeyboardMarkup {
+  const b = (text: string): ReplyKeyboardButton => ({ text });
+  return {
+    keyboard: [
+      [b("🤖 Model"), b("➕ Provider")],
+      [b("📊 Status"), b("📋 Schedule")],
+      [b("🔔 Alerts"), b("❓ Help")],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+    is_persistent: true,
+  };
+}
+
+// Model picker as a reply keyboard: one model per row (button text is
+// the raw model id, so a tap sends exactly that id back), plus page
+// navigation and a back-to-menu row. The pinned model is marked in the
+// accompanying message text, not in the button, so the text stays an
+// exact model id.
+export function modelReplyKeyboard(models: string[], page = 0): ReplyKeyboardMarkup {
+  const maxPage = Math.max(0, Math.ceil(models.length / MODEL_PAGE_SIZE) - 1);
+  const safePage = Math.min(Math.max(0, page), maxPage);
+  const slice = models.slice(safePage * MODEL_PAGE_SIZE, safePage * MODEL_PAGE_SIZE + MODEL_PAGE_SIZE);
+  const rows: ReplyKeyboardButton[][] = slice.map((m) => [{ text: m }]);
+  const nav: ReplyKeyboardButton[] = [];
+  if (safePage > 0) nav.push({ text: "⬅️ Sebelumnya" });
+  if (safePage < maxPage) nav.push({ text: "➡️ Lagi" });
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: "⬅️ Kembali ke menu" }]);
+  return { keyboard: rows, resize_keyboard: true, one_time_keyboard: false, is_persistent: true };
+}
+
+// Per-chat picker state: which panel the user currently sees. Only
+// needed to tell a model-id tap apart from an ordinary chat message
+// that happens to equal a model id. Memory-only: a gateway restart
+// clears it, and a tap then falls through to the agent (harmless).
+type KeyboardPanelState = { kind: "menu" | "models"; page: number };
+const keyboardPanelState = new Map<number, KeyboardPanelState>();
+
+export function resetGatewayKeyboardPanelState(): void {
+  keyboardPanelState.clear();
+}
+
+export interface GatewayKeyboardDeps {
+  doctorText: () => Promise<string>;
+  scheduleText: () => string;
+  alertText: () => string;
+  providerText: () => Promise<string>;
+  listModels: () => Promise<string[]>;
+  pinnedModel: () => string | undefined;
+  setModel: (id: string) => void;
+}
+
+// Route a reply-keyboard tap (arrives as plain message text). Returns
+// null for anything that is not a panel button, so it falls through to
+// deterministic commands and then the agent.
+export async function handleReplyKeyboardText(
+  text: string,
+  chatId: number,
+  deps: GatewayKeyboardDeps,
+): Promise<{ text: string; keyboard: ReplyKeyboardMarkup } | null> {
+  const state = keyboardPanelState.get(chatId) ?? { kind: "menu", page: 0 };
+  const t = text.trim();
+  if (t === "🤖 Model") {
+    const models = await deps.listModels().catch((): string[] => []);
+    keyboardPanelState.set(chatId, { kind: "models", page: 0 });
+    return { text: modelPageText(models, deps.pinnedModel(), 0), keyboard: modelReplyKeyboard(models, 0) };
+  }
+  if (t === "⬅️ Kembali ke menu") {
+    keyboardPanelState.set(chatId, { kind: "menu", page: 0 });
+    return { text: "Menu PANSA — pilih:", keyboard: mainReplyKeyboard() };
+  }
+  if (state.kind === "models") {
+    const models = await deps.listModels().catch((): string[] => []);
+    if (t === "➡️ Lagi" || t === "⬅️ Sebelumnya") {
+      const maxPage = Math.max(0, Math.ceil(models.length / MODEL_PAGE_SIZE) - 1);
+      const page = Math.min(Math.max(0, state.page + (t === "➡️ Lagi" ? 1 : -1)), maxPage);
+      keyboardPanelState.set(chatId, { kind: "models", page });
+      return { text: modelPageText(models, deps.pinnedModel(), page), keyboard: modelReplyKeyboard(models, page) };
+    }
+    if (models.includes(t)) {
+      deps.setModel(t);
+      keyboardPanelState.set(chatId, { kind: "menu", page: 0 });
+      return { text: `Model gateway dikunci ke: ${t}\nJawaban agen berikutnya memakai model ini.`, keyboard: mainReplyKeyboard() };
+    }
+  }
+  if (t === "➕ Provider") return { text: await deps.providerText(), keyboard: mainReplyKeyboard() };
+  if (t === "📊 Status") return { text: await deps.doctorText(), keyboard: mainReplyKeyboard() };
+  if (t === "📋 Schedule") return { text: deps.scheduleText(), keyboard: mainReplyKeyboard() };
+  if (t === "🔔 Alerts") return { text: deps.alertText(), keyboard: mainReplyKeyboard() };
+  if (t === "❓ Help") {
+    return {
+      text: [
+        "Perintah PANSA:",
+        "/status — ringkasan doctor (node, config, daemon, scheduler, gateway)",
+        "/schedule — tugas terjadwal yang masih pending",
+        "/alerts — price alert yang masih aktif",
+        "/provider — provider & model dari daemon (tanpa kirim API key)",
+        "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
+      ].join("\n"),
+      keyboard: mainReplyKeyboard(),
+    };
+  }
+  if (t === "⚙️ Settings") {
+    return {
+      text: [
+        "⚙️ Settings gateway:",
+        `Model terkunci: ${deps.pinnedModel() ?? "(tidak ada — daemon memilih)"}`,
+        "Tanda tangan tidak pernah lewat bot; konfirmasi tetap di TUI/CLI.",
+      ].join("\n"),
+      keyboard: mainReplyKeyboard(),
+    };
+  }
+  return null;
 }
 
 export function mainMenuKeyboard(): InlineKeyboardMarkup {
@@ -243,7 +379,7 @@ function modelPageText(models: string[], pinned: string | undefined, page: numbe
 
 export type GatewayAction =
   | { kind: "ignore" }
-  | { kind: "reply"; chatId: number; text: string; keyboard?: InlineKeyboardMarkup }
+  | { kind: "reply"; chatId: number; text: string; keyboard?: ReplyMarkup }
   | { kind: "paired"; userId: number; chatId: number; text: string }
   | { kind: "agent"; userId: number; chatId: number; text: string }
   | { kind: "callback"; callbackId: string; userId: number; chatId: number; data: string };
@@ -333,7 +469,7 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]
     return { kind: "reply", chatId, text: "Konfirmasi hanya bisa dilakukan manusia di TUI/CLI, bukan lewat gateway." };
   }
   if (text === "/start") {
-    return { kind: "reply", chatId, text: connectTemplate(), keyboard: mainMenuKeyboard() };
+    return { kind: "reply", chatId, text: connectTemplate(), keyboard: mainReplyKeyboard() };
   }
   return { kind: "agent", userId, chatId, text };
 }
@@ -484,7 +620,7 @@ export async function runGatewayLoop(opts: {
   allowlist: () => string[];
   allowedUsers?: () => number[];
   onPaired: (userId: number, chatId: number) => Promise<void> | void;
-  onAgentText: (userId: number, chatId: number, text: string) => Promise<string>;
+  onAgentText: (userId: number, chatId: number, text: string) => Promise<{ text: string; keyboard?: ReplyMarkup }>;
   onCallback: (userId: number, chatId: number, data: string) => Promise<{ text: string; keyboard?: InlineKeyboardMarkup } | null>;
   signal: AbortSignal;
 }): Promise<void> {
@@ -532,14 +668,13 @@ export async function runGatewayLoop(opts: {
             // template once, then the actual answer.
             try {
               if (markUserSeen(action.userId)) {
-                await opts.bot.sendMessage(action.chatId, connectTemplate(), mainMenuKeyboard());
+                await opts.bot.sendMessage(action.chatId, connectTemplate(), mainReplyKeyboard());
               }
             } catch {
               // A template failure must not block the answer.
             }
             const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
-            const keyboard = action.text.trim() === "/help" || isGreeting(action.text) ? mainMenuKeyboard() : undefined;
-            await opts.bot.sendMessage(action.chatId, answer, keyboard);
+            await opts.bot.sendMessage(action.chatId, answer.text, answer.keyboard);
           } finally {
             clearInterval(typing);
           }

@@ -24,7 +24,7 @@ import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, connectTemplate, mainMenuKeyboard } from "./gateway/telegram.js";
+import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -385,7 +385,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     const bot = new TelegramBot(token);
     try {
       // Private chats with a bot use chat_id == user_id.
-      await bot.sendMessage(id, connectTemplate(), mainMenuKeyboard());
+      await bot.sendMessage(id, connectTemplate(), mainReplyKeyboard());
       process.stdout.write(`Notifikasi connect terkirim ke user ${id}.\n`);
       return 0;
     } catch (err) {
@@ -447,7 +447,45 @@ async function gatewayCmd(rest: string[]): Promise<number> {
         c.gateways = { ...(c.gateways ?? {}), telegram: g };
         saveConfig(c);
       },
-      onAgentText: async (_userId, _chatId, text) => {
+      onAgentText: async (_userId, chatId, text) => {
+        // Reply-keyboard taps arrive as plain text: route them before
+        // deterministic commands and the agent. Every reply re-attaches
+        // the main panel, so the grid keyboard stays the main menu.
+        const panel = await handleReplyKeyboardText(text, chatId, {
+          doctorText: async () => formatDoctor(await runDoctor()),
+          scheduleText: () => {
+            const pending = listScheduled("pending");
+            if (!pending.length) return "Tugas terjadwal: (kosong)";
+            return pending.map((t) => `${t.id} | ${t.run_at} | ${t.prompt.slice(0, 80)}`).join("\n");
+          },
+          alertText: () => {
+            const active = listAlerts("active");
+            if (!active.length) return "Price alert aktif: (kosong)";
+            return active.map((a) => `${a.id} | ${a.token} ${a.op} $${a.price_usd}${a.note ? ` | ${a.note}` : ""}`).join("\n");
+          },
+          providerText: async () => {
+            const models = await gatewayListModels();
+            const pinned = loadConfig().models?.[0];
+            const customs = listProviders().filter((p) => p.enabled);
+            return [
+              "➕ Provider & model:",
+              `Model yang bisa dipilih bot: ${models.length} (daemon + provider custom aktif)`,
+              `Provider custom aktif: ${customs.length}`,
+              `Model terkunci: ${pinned ?? "(tidak ada — daemon memilih)"}`,
+              "Kelola provider lewat dashboard PANSA (bukan lewat chat).",
+              "API key tidak boleh dikirim lewat Telegram — tambah provider lewat dashboard.",
+              "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
+            ].join("\n");
+          },
+          listModels: () => gatewayListModels(),
+          pinnedModel: () => loadConfig().models?.[0],
+          setModel: (id) => {
+            const c = loadConfig();
+            c.models = [id];
+            saveConfig(c);
+          },
+        }).catch(() => null);
+        if (panel !== null) return panel;
         // Deterministic commands answer without an LLM call (fast, no
         // model cost). Anything else goes to the agent.
         const direct = await handleGatewayCommand(text, {
@@ -477,11 +515,11 @@ async function gatewayCmd(rest: string[]): Promise<number> {
             ].join("\n");
           },
         }).catch(() => null);
-        if (direct !== null) return direct;
+        if (direct !== null) return { text: direct, keyboard: mainReplyKeyboard() };
         try {
-          return await agentAnswer(text, tools);
+          return { text: await agentAnswer(text, tools), keyboard: mainReplyKeyboard() };
         } catch (err) {
-          return `Error: ${err instanceof Error ? err.message : String(err)}`;
+          return { text: `Error: ${err instanceof Error ? err.message : String(err)}`, keyboard: mainReplyKeyboard() };
         }
       },
       onCallback: async (_userId, _chatId, data) => {
