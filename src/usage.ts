@@ -40,8 +40,9 @@ export interface UsageTotals {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
-  /** Sum of known costs only; unknown-cost calls contribute 0 here. */
-  costUsd: number;
+  /** Sum of known costs only; null when NONE of the calls has a known
+   *  price (unknown, never 0 — a $0.00 total would falsely read as free). */
+  costUsd: number | null;
   byModel: UsageByModel[];
   byProvider: UsageByProvider[];
 }
@@ -125,9 +126,9 @@ export function getUsageTotals(limitModels = 50): UsageTotals {
     if (!db) return empty;
     const total = db
       .prepare(
-        "SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens), 0) AS inputTokens, COALESCE(SUM(output_tokens), 0) AS outputTokens, COALESCE(SUM(cost_usd), 0) AS costUsd FROM llm_usage",
+        "SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens), 0) AS inputTokens, COALESCE(SUM(output_tokens), 0) AS outputTokens, COALESCE(SUM(cost_usd), 0) AS costUsd, COUNT(cost_usd) AS pricedCalls FROM llm_usage",
       )
-      .get() as { calls: number; inputTokens: number; outputTokens: number; costUsd: number };
+      .get() as { calls: number; inputTokens: number; outputTokens: number; costUsd: number; pricedCalls: number };
     const rows = db
       .prepare(
         `SELECT provider, model, COUNT(*) AS calls, SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens
@@ -166,7 +167,7 @@ export function getUsageTotals(limitModels = 50): UsageTotals {
       inputTokens: total.inputTokens,
       outputTokens: total.outputTokens,
       totalTokens: total.inputTokens + total.outputTokens,
-      costUsd: total.costUsd,
+      costUsd: total.pricedCalls === 0 ? null : total.costUsd,
       byModel,
       byProvider,
     };

@@ -636,11 +636,11 @@ function render(d){
   if(d.usage){
     const fmtN=n=>n.toLocaleString("id-ID");
     const fmtC=c=>c===null?"—":"$"+c.toFixed(4);
-    document.getElementById("usage-summary").textContent=d.usage.calls===0?"(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)":'Total: '+fmtN(d.usage.totalTokens)+' token · in '+fmtN(d.usage.inputTokens)+' · out '+fmtN(d.usage.outputTokens)+' · '+d.usage.calls+' panggilan · estimasi biaya $'+d.usage.costUsd.toFixed(4)+' — rincian per model dan per provider ada di halaman Penggunaan.';
+    document.getElementById("usage-summary").textContent=d.usage.calls===0?"(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)":'Total: '+fmtN(d.usage.totalTokens)+' token · in '+fmtN(d.usage.inputTokens)+' · out '+fmtN(d.usage.outputTokens)+' · '+d.usage.calls+' panggilan · estimasi biaya '+fmtC(d.usage.costUsd)+' — rincian per model dan per provider ada di halaman Penggunaan.';
     document.getElementById("usage-card-total").textContent=fmtN(d.usage.totalTokens);
     document.getElementById("usage-card-in").textContent=fmtN(d.usage.inputTokens);
     document.getElementById("usage-card-out").textContent=fmtN(d.usage.outputTokens);
-    document.getElementById("usage-card-cost").innerHTML="$"+d.usage.costUsd.toFixed(4)+' <span class="sub">hanya model yang harganya diketahui</span>';
+    document.getElementById("usage-card-cost").innerHTML=d.usage.costUsd===null?"—"+' <span class="sub">tidak ada model yang harganya diketahui</span>':"$"+d.usage.costUsd.toFixed(4)+' <span class="sub">hanya model yang harganya diketahui</span>';
     document.getElementById("usage-card-calls").textContent=String(d.usage.calls);
     document.getElementById("usage-card-avg").textContent=d.usage.calls?fmtN(Math.round(d.usage.totalTokens/d.usage.calls)):"—";
     const topM=d.usage.byModel[0], topP=d.usage.byProvider[0];
@@ -749,7 +749,7 @@ function usageCardsHtml(usage: UsageTotals | null | undefined): string {
     card("Total token", "usage-card-total", usage ? fmtNum(usage.totalTokens) : "—"),
     card("Token masuk (in)", "usage-card-in", usage ? fmtNum(usage.inputTokens) : "—"),
     card("Token keluar (out)", "usage-card-out", usage ? fmtNum(usage.outputTokens) : "—"),
-    card("Estimasi biaya", "usage-card-cost", usage ? `$${usage.costUsd.toFixed(4)}` : "—", usage ? "hanya model yang harganya diketahui" : undefined),
+    card("Estimasi biaya", "usage-card-cost", usage ? fmtCost(usage.costUsd) : "—", usage ? (usage.costUsd === null ? "tidak ada model yang harganya diketahui" : "hanya model yang harganya diketahui") : undefined),
     card("Panggilan", "usage-card-calls", usage ? String(usage.calls) : "—"),
     card("Rata-rata token / panggilan", "usage-card-avg", usage && usage.calls ? fmtNum(Math.round(usage.totalTokens / usage.calls)) : "—"),
     card("Model teratas", "usage-card-topmodel", topModel ? escapeHtml(topModel.model) : "—", topModel ? `${fmtNum(topModel.totalTokens)} token` : undefined),
@@ -759,7 +759,7 @@ function usageCardsHtml(usage: UsageTotals | null | undefined): string {
 
 function usageSummaryHtml(usage: UsageTotals): string {
   if (usage.calls === 0) return "(belum ada pemakaian tercatat — pemakaian dicatat setiap chat selesai)";
-  return `Total: ${fmtNum(usage.totalTokens)} token · in ${fmtNum(usage.inputTokens)} · out ${fmtNum(usage.outputTokens)} · ${usage.calls} panggilan · estimasi biaya $${usage.costUsd.toFixed(4)} — rincian per model dan per provider ada di halaman Penggunaan.`;
+  return `Total: ${fmtNum(usage.totalTokens)} token · in ${fmtNum(usage.inputTokens)} · out ${fmtNum(usage.outputTokens)} · ${usage.calls} panggilan · estimasi biaya ${fmtCost(usage.costUsd)} — rincian per model dan per provider ada di halaman Penggunaan.`;
 }
 
 function usageProviderRowsHtml(usage: UsageTotals): string {
