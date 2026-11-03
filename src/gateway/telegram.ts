@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DB_FILE } from "../config.js";
@@ -53,9 +53,13 @@ export function gatewayConfirmAllowed(isTestnet: boolean, confirmTestnetEnabled:
 // it, then gate on the owner-managed allowedUsers list. initData is a
 // URL query string; the check string is all fields except "hash" AND
 // "signature" (newer clients send signature for Ed25519 validation; it
-// is NOT part of the HMAC input — including it breaks the check),
-// sorted by key, joined with "\n" as key=value (decoded values); the
-// key is SHA256(botToken) bytes and the check is HMAC-SHA256 hex.
+// is NOT part of the HMAC input), sorted by key, joined with "\n" as
+// key=value (decoded values). The HMAC key is NOT SHA256(botToken):
+// per Telegram's docs it is HMAC-SHA256(key="WebAppData",
+// message=botToken), and the check is HMAC-SHA256 of the check string
+// with that key, in hex. (An earlier version used SHA256(botToken) and
+// every real login failed with bad_hash; the unit test missed it
+// because it computed the hash the same wrong way.)
 // Data older than 24h (or from the future beyond clock skew) is
 // rejected, so a captured initData cannot work forever. The reason code
 // is for server logs only — never log initData itself.
@@ -84,7 +88,7 @@ export function verifyTelegramInitData(
     if (key === "hash" || key === "signature") continue;
     pairs.push(`${key}=${params.get(key) ?? ""}`);
   }
-  const secret = createHash("sha256").update(botToken).digest();
+  const secret = createHmac("sha256", "WebAppData").update(botToken).digest();
   const check = createHmac("sha256", secret).update(pairs.join("\n")).digest("hex");
   const a = Buffer.from(check, "utf8");
   const b = Buffer.from(hash, "utf8");
