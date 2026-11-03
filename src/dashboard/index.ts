@@ -417,8 +417,8 @@ th{background:#000;color:#fff;font-size:.75rem;letter-spacing:.06em;text-transfo
 td.addr{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mono{font-family:ui-monospace,monospace;font-size:.85rem}
 .badge{display:inline-block;padding:1px 8px;border-radius:0;font-size:.8rem;font-weight:800;border:2px solid #000;box-shadow:2px 2px 0 #000}
 .badge.ok{color:var(--ok);background:#d4edda}.badge.warn{color:var(--warn);background:#FFF3CD}.badge.bad{color:var(--bad);background:#F8D7DA}.badge.muted{color:var(--muted);background:#eee}
-.mchip{display:inline-block;font-size:.78rem;line-height:1.35;padding:3px 8px;margin:2px;box-shadow:2px 2px 0 #000;overflow-wrap:anywhere;text-align:left;vertical-align:top}.mchip.off{opacity:.6;background:#eee}
-td.mcol{min-width:170px;max-width:320px}td.mono{overflow-wrap:anywhere}
+.mod{display:block;font-size:.85rem;line-height:1.6;overflow-wrap:break-word}.mod.off{opacity:.55}
+td.mcol{min-width:170px;max-width:320px}
 pre.log{background:#111;color:#e5e5e5;border:3px solid #000;border-radius:0;padding:14px 16px;font-size:.82rem;line-height:1.6;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word;box-shadow:4px 4px 0 #FFDC58}
 .note{color:var(--muted);font-size:.88rem}
 @media (max-width:640px){.wrap{padding:16px 12px 32px}.card{padding:14px}td.addr{max-width:140px}table{font-size:.82rem}th,td{padding:7px 8px}}
@@ -501,10 +501,10 @@ function toast(msg,kind){
 let customCache=[];
 let armedDel="";
 let lastTouchedId="";
-function modelChips(p){ const off=new Set(p.disabledModels||[]); if(!p.models.length) return "(tidak ada model)"; return p.models.map(m=>'<button type="button" data-act="model" data-id="'+esc(p.id)+'" data-model="'+esc(m)+'">'+(off.has(m)?'✗ ':'✓ ')+esc(m)+'</button>').join(" "); }
+function modelChips(p){ const off=new Set(p.disabledModels||[]); if(!p.models.length) return "(tidak ada model)"; return p.models.map(m=>'<span class="mod'+(off.has(m)?' off':'')+'">'+(off.has(m)?'✗ ':'✓ ')+esc(m)+'</span>').join(""); }
 function customRowsHtml(list){
   if(!list.length) return '<tr><td colspan="6">(belum ada provider custom — tambah lewat form di bawah)</td></tr>';
-  return list.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="mono">'+esc(p.baseUrl)+'</td><td>'+modelChips(p)+'</td><td>'+(p.enabled?'<span class="badge ok">aktif</span>':'<span class="badge muted">nonaktif</span>')+'</td><td>'+(p.hasKey?"ada":"tidak ada")+'</td><td><button type="button" data-act="test" data-id="'+esc(p.id)+'">Uji</button> <button type="button" data-act="edit" data-id="'+esc(p.id)+'">Edit</button> <button type="button" data-act="toggle" data-id="'+esc(p.id)+'">'+(p.enabled?"Nonaktifkan":"Aktifkan")+'</button> <button type="button" data-act="del" data-id="'+esc(p.id)+'">'+(armedDel===p.id?"Yakin hapus?":"Hapus")+'</button></td></tr>').join("");
+  return list.map(p=>'<tr><td>'+esc(p.name)+'</td><td class="mono">'+esc(p.baseUrl)+'</td><td class="mcol">'+modelChips(p)+'</td><td>'+(p.enabled?'<span class="badge ok">aktif</span>':'<span class="badge muted">nonaktif</span>')+'</td><td>'+(p.hasKey?"ada":"tidak ada")+'</td><td><button type="button" data-act="test" data-id="'+esc(p.id)+'">Uji</button> <button type="button" data-act="edit" data-id="'+esc(p.id)+'">Edit</button> <button type="button" data-act="toggle" data-id="'+esc(p.id)+'">'+(p.enabled?"Nonaktifkan":"Aktifkan")+'</button> <button type="button" data-act="del" data-id="'+esc(p.id)+'">'+(armedDel===p.id?"Yakin hapus?":"Hapus")+'</button></td></tr>').join("");
 }
 function renderCustom(list){
   customCache=list;
@@ -729,9 +729,9 @@ function modelChipsHtml(p: CustomProviderView): string {
   return p.models
     .map(
       (m) =>
-        `<button type="button" class="mchip${off.has(m) ? " off" : ""}" data-act="model" data-id="${escapeHtml(p.id)}" data-model="${escapeHtml(m)}">${off.has(m) ? "✗ " : "✓ "}${escapeHtml(m)}</button>`,
+        `<span class="mod${off.has(m) ? " off" : ""}">${off.has(m) ? "✗ " : "✓ "}${escapeHtml(m)}</span>`,
     )
-    .join(" ");
+    .join("");
 }
 
 function fmtNum(n: number): string {
