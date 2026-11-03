@@ -23,7 +23,7 @@ import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin } from "./gateway/telegram.js";
+import { TelegramBot, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -77,7 +77,8 @@ Usage:
   pansa --plain            Output teks polos (tanpa warna/markdown)
   pansa --no-color         Nonaktifkan warna ANSI
   pansa update             Cek pembaruan (hanya info, tidak auto-install)
-  pansa gateway [status|pair|start|allow|deny|allowlist|notify]
+  pansa gateway [status|start|allow|deny|notify]
+  pansa set gateway <token-bot>  Simpan token bot Telegram (terenkripsi) + aktifkan gateway
   pansa schedule [add|list|cancel|run-once|watch]
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
@@ -242,6 +243,8 @@ export async function main(argv: string[]): Promise<number> {
       return updateCmd();
     case "gateway":
       return gatewayCmd(rest);
+    case "set":
+      return setCmd(rest);
     case "schedule":
       return scheduleCmd(rest);
     case "alert":
@@ -329,17 +332,60 @@ async function updateCmd(): Promise<number> {
   return 0;
 }
 
-async function gatewayCmd(rest: string[]): Promise<number> {
-  const sub = rest[0];
+// Enable the Telegram gateway in config, preserving everything already
+// there (access list, confirm flag, features). Used by both `pansa set
+// gateway` and the legacy env-based `pansa setup gateway`.
+function enableGatewayConfig(): void {
+  const cfg = loadConfig();
+  const existing = cfg.gateways?.telegram;
+  cfg.gateways = {
+    ...(cfg.gateways ?? {}),
+    telegram: { ...(existing ?? {}), enabled: true, adapter: "telegram", allowlist: existing?.allowlist ?? [], features: existing?.features ?? [] },
+  };
+  saveConfig(cfg);
+}
+
+// One-line gateway setup (personal agent): `pansa set gateway <token>`.
+// Stores the bot token in the encrypted secrets store (never printed,
+// never in config) and enables the gateway. The passphrase comes from
+// PANSA_PASSPHRASE, same as the other secret commands.
+export async function setCmd(rest: string[]): Promise<number> {
+  if (rest[0] !== "gateway" || !rest[1]) {
+    process.stderr.write("Usage: pansa set gateway <token-bot>\n");
+    return 1;
+  }
+  const token = rest[1];
+  const pass = process.env.PANSA_PASSPHRASE;
+  if (!pass) {
+    process.stderr.write("PANSA_PASSPHRASE diperlukan untuk menyimpan token bot (export PANSA_PASSPHRASE=<passphrase>).\n");
+    return 1;
+  }
+  const store = secretsLoad(pass);
+  secretsSet(store, "telegram_bot_token", token);
+  if (!secretsGet(store, "telegram_callback_key")) {
+    secretsSet(store, "telegram_callback_key", randomBytes(32).toString("hex"));
+  }
+  secretsSave(store, pass);
+  enableGatewayConfig();
+  const users = loadConfig().gateways?.telegram?.allowedUsers ?? [];
+  process.stdout.write("Token bot Telegram disimpan (terenkripsi) dan gateway diaktifkan.\n");
+  if (!users.length) {
+    process.stdout.write("Belum ada user yang diizinkan — daftarkan ID Telegram kamu: pansa gateway allow <id>\n");
+  }
+  process.stdout.write("Lalu jalankan: pansa gateway start\n");
+  return 0;
+}
+
+async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0];
   const cfg = loadConfig();
   const gw = cfg.gateways?.telegram;
   if (sub === "status") {
     if (!gw) {
-      process.stdout.write("Gateway Telegram: belum dikonfigurasi. Jalankan: pansa setup gateway\n");
+      process.stdout.write("Gateway Telegram: belum dikonfigurasi. Jalankan: pansa set gateway <token-bot>\n");
       return 0;
     }
     process.stdout.write(
-      `Gateway Telegram: ${gw.enabled ? "aktif" : "nonaktif"}\nAllowlist: ${gw.allowlist.length} chat\nUser ID terdaftar (tanpa pairing): ${(gw.allowedUsers ?? []).length}\nKonfirmasi via gateway: mainnet selalu ditolak; testnet ${gw.confirmTestnet ? "diizinkan" : "tidak diizinkan"} (eksekusi tetap manusia di TUI/CLI).\n`,
+      `Gateway Telegram: ${gw.enabled ? "aktif" : "nonaktif"}\nUser ID terdaftar: ${(gw.allowedUsers ?? []).join(", ") || "(kosong)"}\nKonfirmasi via gateway: mainnet selalu ditolak; testnet ${gw.confirmTestnet ? "diizinkan" : "tidak diizinkan"} (eksekusi tetap manusia di TUI/CLI).\n`,
     );
     return 0;
   }
@@ -355,25 +401,14 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     if (sub === "allow") {
       users.add(id);
       g.allowedUsers = [...users];
-      process.stdout.write(`User ID ${id} didaftarkan: bisa memakai bot tanpa pairing.\n`);
+      process.stdout.write(`User ID ${id} didaftarkan: bisa memakai bot.\n`);
     } else {
       users.delete(id);
       g.allowedUsers = [...users];
-      // A deny must close the legacy path too: drop any paired
-      // userId:chatId entries for this user, or the deny leaks.
-      g.allowlist = g.allowlist.filter((e) => !e.startsWith(`${id}:`));
-      process.stdout.write(`User ID ${id} dihapus dari akses bot (termasuk pairing lama).\n`);
+      process.stdout.write(`User ID ${id} dihapus dari akses bot.\n`);
     }
     c.gateways = { ...(c.gateways ?? {}), telegram: g };
     saveConfig(c);
-    return 0;
-  }
-  if (sub === "allowlist") {
-    if (!gw) {
-      process.stdout.write("Gateway Telegram: belum dikonfigurasi.\n");
-      return 0;
-    }
-    process.stdout.write(`User ID terdaftar: ${(gw.allowedUsers ?? []).join(", ") || "(kosong)"}\nChat ter-pairing: ${gw.allowlist.join(", ") || "(kosong)"}\n`);
     return 0;
   }
   if (sub === "notify") {
@@ -389,7 +424,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     }
     const token = secretsGet(secretsLoad(pass), "telegram_bot_token");
     if (!token) {
-      process.stderr.write("Token bot belum disimpan. Jalankan: pansa setup gateway\n");
+      process.stderr.write("Token bot belum disimpan. Jalankan: pansa set gateway <token-bot>\n");
       return 1;
     }
     const bot = new TelegramBot(token);
@@ -403,11 +438,6 @@ async function gatewayCmd(rest: string[]): Promise<number> {
       return 1;
     }
   }
-  if (sub === "pair") {
-    const code = createPairing();
-    process.stdout.write(`Kode pairing (berlaku 5 menit, sekali pakai): ${code}\nKirim /pair ${code} ke bot dari chat pribadi.\n`);
-    return 0;
-  }
   if (sub === "start") {
     const pass = process.env.PANSA_PASSPHRASE;
     if (!pass) {
@@ -416,8 +446,14 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     }
     const token = secretsGet(secretsLoad(pass), "telegram_bot_token");
     if (!token) {
-      process.stderr.write("Token bot belum disimpan. Jalankan: pansa setup gateway\n");
+      process.stderr.write("Token bot belum disimpan. Jalankan: pansa set gateway <token-bot>\n");
       return 1;
+    }
+    // Personal agent: access is the owner-managed allowedUsers list
+    // only (no pairing). The loop re-reads it per update, so an allow
+    // issued after start takes effect without a restart.
+    if (!(loadConfig().gateways?.telegram?.allowedUsers ?? []).length) {
+      process.stdout.write("Perhatian: belum ada user yang diizinkan — bot tidak akan menjawab siapa pun. Daftarkan ID Telegram kamu: pansa gateway allow <id>\n");
     }
     // The gateway's signing proposals are the "testnet confirm path":
     // enabled only when explicitly configured. Otherwise the sign tool
@@ -441,16 +477,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     );
     await runGatewayLoop({
       bot,
-      allowlist: () => loadConfig().gateways?.telegram?.allowlist ?? [],
       allowedUsers: () => loadConfig().gateways?.telegram?.allowedUsers ?? [],
-      onPaired: async (userId, chatId) => {
-        const c = loadConfig();
-        const g = c.gateways?.telegram ?? { enabled: true, adapter: "telegram", allowlist: [], features: [] };
-        const entry = `${userId}:${chatId}`;
-        if (!g.allowlist.includes(entry)) g.allowlist.push(entry);
-        c.gateways = { ...(c.gateways ?? {}), telegram: g };
-        saveConfig(c);
-      },
       onAgentText: async (userId, chatId, text) => {
         // Reply-keyboard taps arrive as plain text: route them before
         // deterministic commands and the agent. Every reply re-attaches
@@ -563,7 +590,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     });
     return 0;
   }
-  process.stderr.write("Usage: pansa gateway [status|pair|start|allow <user-id>|deny <user-id>|allowlist|notify <user-id>]\n");
+  process.stderr.write("Usage: pansa gateway [status|start|allow <user-id>|deny <user-id>|notify <user-id>]\n");
   return 1;
 }
 
@@ -1367,14 +1394,8 @@ async function setupCmd(rest: string[]): Promise<number> {
     secretsSet(store, "telegram_bot_token", token);
     secretsSet(store, "telegram_callback_key", randomBytes(32).toString("hex"));
     secretsSave(store, pass);
-    const cfg = loadConfig();
-    const existing = cfg.gateways?.telegram;
-    cfg.gateways = {
-      ...(cfg.gateways ?? {}),
-      telegram: { enabled: true, adapter: "telegram", allowlist: existing?.allowlist ?? [], features: existing?.features ?? [] },
-    };
-    saveConfig(cfg);
-    process.stdout.write("Gateway Telegram dikonfigurasi. Jalankan `pansa gateway pair`, lalu kirim /pair <kode> ke bot dari chat pribadi.\n");
+    enableGatewayConfig();
+    process.stdout.write("Gateway Telegram dikonfigurasi. Daftarkan ID Telegram kamu (pansa gateway allow <id>), lalu pansa gateway start.\n");
     return 0;
   }
   mkdirSync(PANSA_DIR, { recursive: true, mode: 0o700 });

@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DB_FILE } from "../config.js";
@@ -23,45 +23,8 @@ export function gatewayDb(): InstanceType<typeof Database> {
   if (!db) {
     mkdirSync(dirname(DB_FILE), { recursive: true });
     db = new Database(DB_FILE);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS gateway_pairings (
-        code_hash TEXT PRIMARY KEY,
-        expires_at TEXT NOT NULL,
-        used INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-    `);
   }
   return db;
-}
-
-function sha256Hex(s: string): string {
-  return createHash("sha256").update(s).digest("hex");
-}
-
-// Pairing: `pansa gateway pair` prints a 6-digit code; the user sends
-// `/pair <code>` from a private chat. Codes are stored hashed, expire
-// after 5 minutes, and are single-use.
-export function createPairing(nowMs: number = Date.now()): string {
-  const code = String(100000 + Math.floor(Math.random() * 900000));
-  const expires = new Date(nowMs + 5 * 60 * 1000).toISOString();
-  gatewayDb().prepare(`INSERT INTO gateway_pairings (code_hash, expires_at, used) VALUES (?, ?, 0)`).run(sha256Hex(code), expires);
-  return code;
-}
-
-export function verifyPairing(code: string, nowMs: number = Date.now()): boolean {
-  const row = gatewayDb().prepare(`SELECT expires_at, used FROM gateway_pairings WHERE code_hash = ?`).get(sha256Hex(code)) as
-    | { expires_at: string; used: number }
-    | undefined;
-  if (!row || row.used) return false;
-  if (new Date(row.expires_at).getTime() <= nowMs) return false;
-  gatewayDb().prepare(`UPDATE gateway_pairings SET used = 1 WHERE code_hash = ?`).run(sha256Hex(code));
-  return true;
-}
-
-// Allowlist entries are "userId:chatId" strings (config gateways.telegram.allowlist).
-export function isAllowlisted(allowlist: string[], userId: number, chatId: number): boolean {
-  return allowlist.includes(`${userId}:${chatId}`);
 }
 
 // Callback data is HMAC-SHA256 signed with a key kept in the encrypted
@@ -162,7 +125,6 @@ export class TelegramBot {
         { command: "schedule", description: "Tugas terjadwal yang pending" },
         { command: "alerts", description: "Price alert yang aktif" },
         { command: "provider", description: "Provider & model dari daemon" },
-        { command: "pair", description: "Hubungkan chat ini (kode dari pansa gateway pair)" },
       ],
     });
   }
@@ -457,7 +419,6 @@ function modelPageText(models: string[], pinned: string | undefined, page: numbe
 export type GatewayAction =
   | { kind: "ignore" }
   | { kind: "reply"; chatId: number; text: string; keyboard?: ReplyMarkup }
-  | { kind: "paired"; userId: number; chatId: number; text: string }
   | { kind: "agent"; userId: number; chatId: number; text: string }
   | { kind: "callback"; callbackId: string; userId: number; chatId: number; data: string };
 
@@ -559,14 +520,15 @@ export function markUserSeen(userId: number): boolean {
   const info = gatewayDb().prepare(`INSERT OR IGNORE INTO gateway_seen_users (user_id) VALUES (?)`).run(String(userId)) as { changes: number };
   return info.changes > 0;
 }
-// (owner-issued codes); /confirm and /reject are always refused via
-// the gateway (human-only, TUI/CLI). Access rule, in order:
-//   1. a user ID in allowedUsers is served immediately — no pairing
-//      needed, any private chat from that user works;
-//   2. a userId:chatId pair in allowlist (from a past pairing) works;
-//   3. everyone else is ignored silently (no info leak — not even the
+// This is a personal agent: there is no pairing. Access rule, in order:
+//   1. a user ID in allowedUsers (owner-managed via CLI: `pansa
+//      gateway allow <id>`) is served, any private chat from that user
+//      works;
+//   2. everyone else is ignored silently (no info leak — not even the
 //      confirm refusal, which would confirm the bot is listening).
-export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[], allowedUsers: number[] = []): GatewayAction {
+// /confirm and /reject are always refused via the gateway (human-only,
+// TUI/CLI).
+export function handleTelegramUpdate(update: TelegramUpdate, allowedUsers: number[] = []): GatewayAction {
   // Button taps arrive as callback_query, not messages. Gate them with
   // the same rule as messages; the loop answers the callback (dismisses
   // the spinner) and routes the button data.
@@ -577,7 +539,7 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]
     const data = cb.data ?? "";
     if (userId === undefined || chatId === undefined || !data) return { kind: "ignore" };
     if (cb.message?.chat.type && cb.message.chat.type !== "private") return { kind: "ignore" };
-    if (!allowedUsers.includes(userId) && !isAllowlisted(allowlist, userId, chatId)) return { kind: "ignore" };
+    if (!allowedUsers.includes(userId)) return { kind: "ignore" };
     return { kind: "callback", callbackId: cb.id, userId, chatId, data };
   }
   const msg = update.message;
@@ -587,14 +549,7 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowlist: string[]
   if (userId === undefined || chatId === undefined) return { kind: "ignore" };
   if (msg.chat.type !== "private") return { kind: "ignore" };
   const text = msg.text.trim();
-  if (text.startsWith("/pair")) {
-    const code = text.split(/\s+/)[1] ?? "";
-    if (verifyPairing(code)) {
-      return { kind: "paired", userId, chatId, text: "Perangkat terhubung. Kirim perintah apa pun untuk menjalankan PANSA." };
-    }
-    return { kind: "reply", chatId, text: "Kode pairing tidak valid atau kedaluwarsa. Jalankan `pansa gateway pair` untuk kode baru." };
-  }
-  if (!allowedUsers.includes(userId) && !isAllowlisted(allowlist, userId, chatId)) return { kind: "ignore" };
+  if (!allowedUsers.includes(userId)) return { kind: "ignore" };
   if (text.startsWith("/confirm") || text.startsWith("/reject") || /^CONFIRM\s+\S+$/i.test(text) || /^REJECT\s+\S+$/i.test(text)) {
     return { kind: "reply", chatId, text: "Konfirmasi hanya bisa dilakukan manusia di TUI/CLI, bukan lewat gateway." };
   }
@@ -628,9 +583,9 @@ export function isGreeting(text: string): boolean {
 
 // Deterministic gateway commands: answered without an LLM call (fast,
 // no model cost). Anything else falls through to the agent (null).
-// /balance and /portfolio are intentionally NOT deterministic here: they
-// need a configured wallet backend, and the agent's baw tool answers
-// them honestly when one is configured.
+// /balance and /portfolio are intentionally NOT deterministic here: the
+// gateway agent has no wallet tool (baw never reaches the gateway), so
+// the agent answers honestly that it cannot read balances via the bot.
 export async function handleGatewayCommand(text: string, deps: GatewayCommandDeps): Promise<string | null> {
   if (isGreeting(text)) {
     return "Halo! Ada yang bisa PANSA bantu? Pakai tombol di bawah, atau kirim /status untuk ringkasan dan /help untuk daftar perintah.";
@@ -643,9 +598,11 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
       "/schedule — tugas terjadwal yang masih pending",
       "/alerts — price alert yang masih aktif",
       "/provider — provider & model dari daemon (tanpa kirim API key)",
-      "/pair <kode> — hubungkan chat ini (kode dari `pansa gateway pair`)",
       "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
     ].join("\n");
+  }
+  if (cmd === "/pair") {
+    return "Pairing sudah tidak dipakai. Bot ini hanya untuk pemilik — akses diatur lewat CLI (`pansa gateway allow <id>`).";
   }
   if (cmd === "/status") return deps.doctorText();
   if (cmd === "/schedule") return deps.scheduleText();
@@ -749,21 +706,19 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function runGatewayLoop(opts: {
   bot: TelegramBot;
-  allowlist: () => string[];
   allowedUsers?: () => number[];
-  onPaired: (userId: number, chatId: number) => Promise<void> | void;
   onAgentText: (userId: number, chatId: number, text: string) => Promise<{ text: string; keyboard?: ReplyMarkup }>;
   onCallback: (userId: number, chatId: number, data: string) => Promise<{ text: string; keyboard?: InlineKeyboardMarkup } | null>;
   signal: AbortSignal;
 }): Promise<void> {
-  // Multi-user concurrency: the poll loop must never block behind one
-  // user's slow agent run. Agent actions run concurrently, but with two
-  // guards: (1) per-chat chains, so one user's answers never arrive out
-  // of order; (2) a global cap, so a burst of users cannot pile up
-  // unbounded parallel LLM runs. Offset still advances in poll order at
-  // dispatch time, so concurrent handling can never replay an update.
-  // Non-agent actions (replies, pairing, callbacks) stay inline: they
-  // are fast, and their order is the poll order.
+  // Concurrency: the poll loop must never block behind one slow agent
+  // run (e.g. the owner messaging from two chats at once). Agent actions
+  // run concurrently, but with two guards: (1) per-chat chains, so one
+  // chat's answers never arrive out of order; (2) a global cap, so a
+  // burst cannot pile up unbounded parallel LLM runs. Offset still
+  // advances in poll order at dispatch time, so concurrent handling can
+  // never replay an update. Non-agent actions (replies, callbacks) stay
+  // inline: they are fast, and their order is the poll order.
   const MAX_CONCURRENT_AGENTS = 4;
   const chatChains = new Map<number, Promise<void>>();
   let activeAgents = 0;
@@ -785,9 +740,6 @@ export async function runGatewayLoop(opts: {
     try {
       if (action.kind === "reply") {
         await opts.bot.sendMessage(action.chatId, action.text, action.keyboard);
-      } else if (action.kind === "paired") {
-        await opts.onPaired(action.userId, action.chatId);
-        await opts.bot.sendMessage(action.chatId, action.text);
       } else if (action.kind === "callback") {
         // Dismiss the spinner first, then route the button.
         try {
@@ -841,7 +793,7 @@ export async function runGatewayLoop(opts: {
     }
     for (const u of updates) {
       offset = u.update_id + 1;
-      const action = handleTelegramUpdate(u, opts.allowlist(), opts.allowedUsers?.() ?? []);
+      const action = handleTelegramUpdate(u, opts.allowedUsers?.() ?? []);
       if (action.kind === "ignore") continue;
       if (action.kind === "agent") {
         const prev = chatChains.get(action.chatId) ?? Promise.resolve();
