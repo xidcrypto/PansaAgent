@@ -601,6 +601,17 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
               "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
             ].join("\n");
           },
+          walletList: async () => walletRegistryLoad(),
+          walletCreate: async (chain, name) => {
+            const mnemonic = generateMnemonic(128);
+            const res = await getSigner().request("keystore.create", {
+              name, family: chain, mnemonic, path: defaultPath(chain), passphrase: process.env.PANSA_PASSPHRASE ?? "",
+            });
+            if (!res.ok) throw new Error(res.error);
+            setDefaultWallet(chain, name);
+            const r = res.result as { name: string; family: string; address: string; path: string };
+            return { name: r.name, family: r.family, address: r.address };
+          },
         }).catch(() => null);
         if (direct !== null) return { text: direct, keyboard: mainReplyKeyboard() };
         try {

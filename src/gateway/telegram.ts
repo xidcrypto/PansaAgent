@@ -262,6 +262,7 @@ export class TelegramBot {
         { command: "schedule", description: "Tugas terjadwal yang pending" },
         { command: "alerts", description: "Price alert yang aktif" },
         { command: "provider", description: "Provider & model dari daemon" },
+        { command: "wallet", description: "Buat & daftar dompet" },
       ],
     });
   }
@@ -717,6 +718,12 @@ export interface GatewayCommandDeps {
   scheduleText: () => string;
   alertText: () => string;
   providerText: () => Promise<string>;
+  // Owner-only wallet commands (deterministic, no LLM): list reads the
+  // public registry (addresses are not secrets); create goes through
+  // the signer and returns name/family/address ONLY — the mnemonic
+  // never leaves the gateway process, let alone the chat.
+  walletList: () => Promise<Array<{ name: string; family: string; address: string }>>;
+  walletCreate: (chain: string, name: string) => Promise<{ name: string; family: string; address: string }>;
 }
 
 // Sapaan ringan dijawab deterministik (tanpa LLM) untuk kecepatan.
@@ -739,6 +746,10 @@ export function isGreeting(text: string): boolean {
 // /balance and /portfolio are intentionally NOT deterministic here: the
 // gateway agent has no wallet tool (baw never reaches the gateway), so
 // the agent answers honestly that it cannot read balances via the bot.
+// /wallet list/create ARE deterministic, but they are not agent tools:
+// list reads the public registry and create goes through the signer,
+// both owner-only via the allowedUsers gate, and neither ever returns
+// key material to the chat.
 export async function handleGatewayCommand(text: string, deps: GatewayCommandDeps): Promise<string | null> {
   if (isGreeting(text)) {
     return "Halo! Ada yang bisa PANSA bantu? Pakai tombol di bawah, atau kirim /status untuk ringkasan dan /help untuk daftar perintah.";
@@ -751,11 +762,44 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
       "/schedule — tugas terjadwal yang masih pending",
       "/alerts — price alert yang masih aktif",
       "/provider — provider & model dari daemon (tanpa kirim API key)",
+      "/wallet — daftar & buat dompet (hanya pemilik; kunci tidak pernah dikirim lewat chat)",
       "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
     ].join("\n");
   }
   if (cmd === "/pair") {
     return "Pairing sudah tidak dipakai. Bot ini hanya untuk pemilik — akses diatur lewat CLI (`pansa gateway allow <id>`).";
+  }
+  if (cmd === "/wallet") {
+    const usage = [
+      "Dompet — perintah:",
+      "/wallet list — daftar dompet",
+      "/wallet create <rantai> <nama> — buat dompet baru (evm, solana, sui, aptos)",
+      "Nama: huruf kecil, angka, - dan _, maks 32 karakter. Private key/mnemonic tidak pernah dikirim lewat chat.",
+    ].join("\n");
+    try {
+      const args = text.trim().split(/\s+/).slice(1);
+      if (args[0] === "list" && args.length === 1) {
+        const wallets = await deps.walletList();
+        if (!wallets.length) return "Dompet: (kosong)";
+        return ["Dompet:", ...wallets.map((w) => `${w.name} | ${w.family} | ${w.address}`)].join("\n");
+      }
+      if (args[0] === "create" && args.length === 3) {
+        const chain = args[1];
+        const name = args[2];
+        if (!["evm", "solana", "sui", "aptos"].includes(chain)) return usage;
+        const w = await deps.walletCreate(chain, name);
+        return [
+          "Dompet dibuat:",
+          `Nama: ${w.name}`,
+          `Rantai: ${w.family}`,
+          `Alamat: ${w.address}`,
+          "Private key/mnemonic tidak dikirim lewat chat — tersimpan terenkripsi di keystore.",
+        ].join("\n");
+      }
+      return usage;
+    } catch (err) {
+      return `Perintah wallet gagal: ${err instanceof Error ? err.message : String(err)}`;
+    }
   }
   if (cmd === "/status") return deps.doctorText();
   if (cmd === "/schedule") return deps.scheduleText();
