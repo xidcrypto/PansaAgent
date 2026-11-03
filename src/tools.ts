@@ -12,6 +12,21 @@ import { McpClient } from "./mcp/client.js";
 // Single wiring for the agent's tool set (B1/M3). The CLI and the TUI both
 // build their Agent from this registry; the SkillsManager registry is a
 // secondary programmatic API, not a second tool set.
+// Gateway tool filter (multi-user safety): the gateway agent must never
+// move money or enumerate the owner's wallets. The baw tool does both
+// (transfer/swap/claim, plus list_wallets/balance reads), so it never
+// reaches the gateway — not even for the owner. Wallet ops stay in
+// TUI/CLI, matching the connect template's promise that signing never
+// happens via the bot. Signing tools are removed too unless the testnet
+// confirm path is explicitly enabled (execution still stays human-only).
+export function stripGatewayUnsafeTools(tools: Map<string, Tool>, opts: { allowConfirm: boolean }): void {
+  tools.delete("baw");
+  if (!opts.allowConfirm) {
+    tools.delete("sign_transaction");
+    tools.delete("reject_transaction");
+  }
+}
+
 export function buildAgentTools(): Map<string, Tool> {
   const tools = new Map<string, Tool>();
   const list: Tool[] = [

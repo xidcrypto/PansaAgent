@@ -16,15 +16,14 @@ import { getPolicy, savePolicy } from "./signer/policy.js";
 import { secretsLoad, secretsSave, secretsGet, secretsSet } from "./secrets.js";
 import { runDoctor, formatDoctor } from "./doctor.js";
 import { resolveEvmRpc, getEvmBalance, getEvmChainId, formatEth, evmPublicClient } from "./evm-rpc.js";
-import { buildAgentToolsWithMcp } from "./tools.js";
-import { humanConfirm, humanReject } from "./human-confirm.js";
+import { buildAgentToolsWithMcp, stripGatewayUnsafeTools } from "./tools.js";import { humanConfirm, humanReject } from "./human-confirm.js";
 import { TUI } from "./ui/index.js";
 import { resolveRestore, startRunSession, finishRunSession } from "./session-flow.js";
 import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard } from "./gateway/telegram.js";
+import { TelegramBot, createPairing, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -424,17 +423,11 @@ async function gatewayCmd(rest: string[]): Promise<number> {
     // enabled only when explicitly configured. Otherwise the sign tool
     // is removed from the gateway agent entirely (mainnet can never be
     // enabled via the gateway). Execution of any pending confirmation
-    // always stays human-only (TUI/CLI CONFIRM).
+    // always stays human-only (TUI/CLI CONFIRM). The baw tool never
+    // reaches the gateway at all (see stripGatewayUnsafeTools).
     const confirmTestnet = loadConfig().gateways?.telegram?.confirmTestnet === true;
     const tools = await buildAgentToolsWithMcp();
-    // NOTE: the signing tools are named sign_transaction /
-    // reject_transaction — deleting a bare "sign" was a no-op that left
-    // the gateway agent able to propose signing. When the gateway
-    // confirm path is not allowed, both go.
-    if (!gatewayConfirmAllowed(true, confirmTestnet)) {
-      tools.delete("sign_transaction");
-      tools.delete("reject_transaction");
-    }
+    stripGatewayUnsafeTools(tools, { allowConfirm: gatewayConfirmAllowed(true, confirmTestnet) });
     const bot = new TelegramBot(token);
     const abort = new AbortController();
     process.on("SIGINT", () => abort.abort());
@@ -458,10 +451,13 @@ async function gatewayCmd(rest: string[]): Promise<number> {
         c.gateways = { ...(c.gateways ?? {}), telegram: g };
         saveConfig(c);
       },
-      onAgentText: async (_userId, chatId, text) => {
+      onAgentText: async (userId, chatId, text) => {
         // Reply-keyboard taps arrive as plain text: route them before
         // deterministic commands and the agent. Every reply re-attaches
         // the main panel, so the grid keyboard stays the main menu.
+        // Pins are per-user: one user's Model tap must not re-pin the
+        // model for everyone else (global config pin is the fallback).
+        const effectivePin = getUserModel(userId)?.model ?? loadConfig().models?.[0];
         const panel = await handleReplyKeyboardText(text, chatId, {
           doctorText: async () => formatDoctor(await runDoctor()),
           scheduleText: () => {
@@ -476,13 +472,12 @@ async function gatewayCmd(rest: string[]): Promise<number> {
           },
           providerText: async () => {
             const models = await gatewayListModels();
-            const pinned = loadConfig().models?.[0];
             const customs = listProviders().filter((p) => p.enabled);
             return [
               "➕ Provider & model:",
               `Model yang bisa dipilih bot: ${models.length} (daemon + provider custom aktif)`,
               `Provider custom aktif: ${customs.length}`,
-              `Model terkunci: ${pinned ?? "(tidak ada — daemon memilih)"}`,
+              `Model terkunci: ${effectivePin ?? "(tidak ada — daemon memilih)"}`,
               "Kelola provider lewat dashboard PANSA (bukan lewat chat).",
               "API key tidak boleh dikirim lewat Telegram — tambah provider lewat dashboard.",
               "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
@@ -490,13 +485,9 @@ async function gatewayCmd(rest: string[]): Promise<number> {
           },
           listDefaultModels: () => fetchLiveModels().catch((): string[] => []),
           listCustomModels: () => Promise.resolve(gatewayCustomModels()),
-          pinnedModel: () => loadConfig().models?.[0],
+          pinnedModel: () => effectivePin,
           setModel: (id, source) => {
-            const c = loadConfig();
-            c.models = [id];
-            if (source) c.pinnedSource = source;
-            else delete c.pinnedSource;
-            saveConfig(c);
+            setUserModel(userId, id, source);
           },
         }).catch(() => null);
         if (panel !== null) return panel;
@@ -516,13 +507,12 @@ async function gatewayCmd(rest: string[]): Promise<number> {
           },
           providerText: async () => {
             const models = await gatewayListModels();
-            const pinned = loadConfig().models?.[0];
             const customs = listProviders().filter((p) => p.enabled);
             return [
               "➕ Provider & model:",
               `Model yang bisa dipilih bot: ${models.length} (daemon + provider custom aktif)`,
               `Provider custom aktif: ${customs.length}`,
-              `Model terkunci: ${pinned ?? "(tidak ada — daemon memilih)"}`,
+              `Model terkunci: ${effectivePin ?? "(tidak ada — daemon memilih)"}`,
               "Kelola provider lewat dashboard PANSA (bukan lewat chat).",
               "API key tidak boleh dikirim lewat Telegram — tambah provider lewat dashboard.",
               "Untuk mengganti model yang dipakai bot, pakai tombol Model.",
@@ -533,17 +523,18 @@ async function gatewayCmd(rest: string[]): Promise<number> {
         try {
           // A gateway pin is a strict choice: exactly one configured
           // model means "use this one, or say it failed" — never answer
-          // silently from another model. The recorded source decides
-          // which endpoint serves it when both have the model.
+          // silently from another model. The pin is per-user first
+          // (their own Model tap), falling back to the global config
+          // pin; the recorded source decides which endpoint serves it
+          // when both have the model.
           const pinnedCfg = loadConfig();
-          const pinned = pinnedCfg.models;
-          const onlyModel = pinned?.length === 1 ? pinned[0] : undefined;
-          return { text: await agentAnswer(text, tools, { onlyModel, onlySource: pinnedCfg.pinnedSource, signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }), keyboard: mainReplyKeyboard() };
+          const pin = resolveGatewayPin(getUserModel(userId), pinnedCfg.models, pinnedCfg.pinnedSource);
+          return { text: await agentAnswer(text, tools, { onlyModel: pin.onlyModel, onlySource: pin.onlySource, signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }), keyboard: mainReplyKeyboard() };
         } catch (err) {
           return { text: `Error: ${err instanceof Error ? err.message : String(err)}`, keyboard: mainReplyKeyboard() };
         }
       },
-      onCallback: async (_userId, _chatId, data) => {
+      onCallback: async (userId, _chatId, data) => {
         return handleGatewayCallback(data, {
           doctorText: async () => formatDoctor(await runDoctor()),
           scheduleText: () => {
@@ -557,14 +548,12 @@ async function gatewayCmd(rest: string[]): Promise<number> {
             return active.map((a) => `${a.id} | ${a.token} ${a.op} $${a.price_usd}${a.note ? ` | ${a.note}` : ""}`).join("\n");
           },
           listModels: () => gatewayListModels(),
-          pinnedModel: () => loadConfig().models?.[0],
+          pinnedModel: () => getUserModel(userId)?.model ?? loadConfig().models?.[0],
           setModel: (id) => {
-            const c = loadConfig();
-            c.models = [id];
             // A pin from an old inline button carries no source: fall
             // back to the default routing (daemon-live stays on daemon).
-            delete c.pinnedSource;
-            saveConfig(c);
+            // Per-user only — never touch the global pin here.
+            setUserModel(userId, id);
           },
           confirmText: `mainnet selalu ditolak; testnet ${confirmTestnet ? "diizinkan" : "tidak diizinkan"}`,
           allowedCount: (loadConfig().gateways?.telegram?.allowedUsers ?? []).length,

@@ -107,18 +107,35 @@ export class TelegramBot {
   ) {}
 
   private async api<T>(method: string, body: Record<string, unknown>): Promise<T> {
-    const res = await this.fetchFn(`https://api.telegram.org/bot${this.token}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-      // A stalled socket must never wedge the polling loop forever:
-      // abort well past Telegram's own 5s long-poll window so the loop
-      // retries instead of sleeping on a dead connection.
-      signal: AbortSignal.timeout(30000),
-    });
-    const data = (await res.json()) as { ok?: boolean; result?: T; description?: string };
-    if (!data.ok) throw new Error(`Telegram ${method} gagal: ${data.description ?? res.status}`);
-    return data.result as T;
+    // Telegram flood control (429) is a normal multi-user condition, not
+    // a fatal error: retry once after the server's retry_after (capped
+    // at 60s) instead of dropping the user's reply.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await this.fetchFn(`https://api.telegram.org/bot${this.token}/${method}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        // A stalled socket must never wedge the polling loop forever:
+        // abort well past Telegram's own 5s long-poll window so the loop
+        // retries instead of sleeping on a dead connection.
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        result?: T;
+        description?: string;
+        error_code?: number;
+        parameters?: { retry_after?: number };
+      };
+      if (data.ok) return data.result as T;
+      if (data.error_code === 429 && attempt === 0) {
+        const waitMs = Math.min(Math.max(0, data.parameters?.retry_after ?? 0), 60) * 1000;
+        if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      throw new Error(`Telegram ${method} gagal: ${data.description ?? res.status}`);
+    }
+    throw new Error(`Telegram ${method} gagal: 429 berulang`);
   }
 
   async getUpdates(offset?: number, timeout = 5): Promise<TelegramUpdate[]> {
@@ -341,7 +358,7 @@ export async function handleReplyKeyboardText(
     if (models.includes(t)) {
       deps.setModel(t, state.source);
       keyboardPanelState.set(chatId, { kind: "menu", page: 0 });
-      return { text: `Model gateway dikunci ke: ${t}\nJawaban agen berikutnya memakai model ini.`, keyboard: mainReplyKeyboard() };
+      return { text: `Model untuk chat ini dikunci ke: ${t}\nJawaban agen berikutnya memakai model ini.`, keyboard: mainReplyKeyboard() };
     }
   }
   if (t === "➕ Provider") return { text: await deps.providerText(), keyboard: mainReplyKeyboard() };
@@ -475,6 +492,59 @@ export function connectTemplate(nowMs: number = Date.now()): string {
     "",
     `Terhubung: ${when} WIB`,
   ].join("\n");
+}
+
+// Per-user model pins (multi-user correctness): one user's Model tap
+// must not re-pin the model for everyone else. Pins live in the gateway
+// DB, keyed by Telegram user id; the global config pin stays as the
+// fallback for users who never picked one.
+export interface UserModelPin {
+  model: string;
+  source?: "default" | "custom";
+}
+
+function userModelTable(): void {
+  gatewayDb().exec(`
+    CREATE TABLE IF NOT EXISTS gateway_user_models (
+      user_id TEXT PRIMARY KEY,
+      model TEXT NOT NULL,
+      source TEXT
+    );
+  `);
+}
+
+export function getUserModel(userId: number): UserModelPin | undefined {
+  userModelTable();
+  const row = gatewayDb().prepare(`SELECT model, source FROM gateway_user_models WHERE user_id = ?`).get(String(userId)) as
+    | { model: string; source: string | null }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    model: row.model,
+    source: row.source === "custom" ? "custom" : row.source === "default" ? "default" : undefined,
+  };
+}
+
+export function setUserModel(userId: number, model: string, source?: "default" | "custom"): void {
+  userModelTable();
+  gatewayDb()
+    .prepare(
+      `INSERT INTO gateway_user_models (user_id, model, source) VALUES (?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET model = excluded.model, source = excluded.source`,
+    )
+    .run(String(userId), model, source ?? null);
+}
+
+// Effective pin for one user: their own pin wins, otherwise the global
+// config pin (exactly one configured model), otherwise no pin.
+export function resolveGatewayPin(
+  userPin: UserModelPin | undefined,
+  globalModels?: string[],
+  globalSource?: "default" | "custom",
+): { onlyModel?: string; onlySource?: "default" | "custom" } {
+  if (userPin) return { onlyModel: userPin.model, onlySource: userPin.source };
+  const onlyModel = globalModels?.length === 1 ? globalModels[0] : undefined;
+  return { onlyModel, onlySource: globalSource };
 }
 
 // First-seen tracking: the connect template is sent once, before the
@@ -686,6 +756,76 @@ export async function runGatewayLoop(opts: {
   onCallback: (userId: number, chatId: number, data: string) => Promise<{ text: string; keyboard?: InlineKeyboardMarkup } | null>;
   signal: AbortSignal;
 }): Promise<void> {
+  // Multi-user concurrency: the poll loop must never block behind one
+  // user's slow agent run. Agent actions run concurrently, but with two
+  // guards: (1) per-chat chains, so one user's answers never arrive out
+  // of order; (2) a global cap, so a burst of users cannot pile up
+  // unbounded parallel LLM runs. Offset still advances in poll order at
+  // dispatch time, so concurrent handling can never replay an update.
+  // Non-agent actions (replies, pairing, callbacks) stay inline: they
+  // are fast, and their order is the poll order.
+  const MAX_CONCURRENT_AGENTS = 4;
+  const chatChains = new Map<number, Promise<void>>();
+  let activeAgents = 0;
+  const agentWaiters: Array<() => void> = [];
+  async function acquireAgentSlot(): Promise<void> {
+    if (activeAgents < MAX_CONCURRENT_AGENTS) {
+      activeAgents++;
+      return;
+    }
+    await new Promise<void>((resolve) => agentWaiters.push(resolve));
+    activeAgents++;
+  }
+  function releaseAgentSlot(): void {
+    activeAgents--;
+    const next = agentWaiters.shift();
+    if (next) next();
+  }
+  async function handleAction(action: GatewayAction): Promise<void> {
+    try {
+      if (action.kind === "reply") {
+        await opts.bot.sendMessage(action.chatId, action.text, action.keyboard);
+      } else if (action.kind === "paired") {
+        await opts.onPaired(action.userId, action.chatId);
+        await opts.bot.sendMessage(action.chatId, action.text);
+      } else if (action.kind === "callback") {
+        // Dismiss the spinner first, then route the button.
+        try {
+          await opts.bot.answerCallbackQuery(action.callbackId);
+        } catch {
+          // A failed dismiss must not block the button's answer.
+        }
+        const res = await opts.onCallback(action.userId, action.chatId, action.data).catch(() => null);
+        if (res) await opts.bot.sendMessage(action.chatId, res.text, res.keyboard);
+      } else if (action.kind === "agent") {
+        // Typing indicator while the agent works: Telegram shows it
+        // ~5s, so refresh every 4s until the answer is sent.
+        const typing = setInterval(() => {
+          opts.bot.sendChatAction(action.chatId, "typing").catch(() => {});
+        }, 4000);
+        try {
+          await opts.bot.sendChatAction(action.chatId, "typing").catch(() => {});
+          // First served message from this user: send the connect
+          // template once, then the actual answer.
+          try {
+            if (markUserSeen(action.userId)) {
+              await opts.bot.sendMessage(action.chatId, connectTemplate(), mainReplyKeyboard());
+            }
+          } catch {
+            // A template failure must not block the answer.
+          }
+          const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
+          await opts.bot.sendMessage(action.chatId, answer.text, answer.keyboard);
+        } finally {
+          clearInterval(typing);
+        }
+      }
+    } catch (err) {
+      // A failed send must not kill the loop; the next poll continues.
+      // But it must be logged: silent send failures are invisible.
+      console.error(`Gateway kirim gagal: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   let offset: number | undefined;
   while (!opts.signal.aborted) {
     let updates: TelegramUpdate[];
@@ -703,49 +843,31 @@ export async function runGatewayLoop(opts: {
       offset = u.update_id + 1;
       const action = handleTelegramUpdate(u, opts.allowlist(), opts.allowedUsers?.() ?? []);
       if (action.kind === "ignore") continue;
-      try {
-        if (action.kind === "reply") {
-          await opts.bot.sendMessage(action.chatId, action.text, action.keyboard);
-        } else if (action.kind === "paired") {
-          await opts.onPaired(action.userId, action.chatId);
-          await opts.bot.sendMessage(action.chatId, action.text);
-        } else if (action.kind === "callback") {
-          // Dismiss the spinner first, then route the button.
+      if (action.kind === "agent") {
+        const prev = chatChains.get(action.chatId) ?? Promise.resolve();
+        const task = prev.then(async () => {
+          await acquireAgentSlot();
           try {
-            await opts.bot.answerCallbackQuery(action.callbackId);
-          } catch {
-            // A failed dismiss must not block the button's answer.
-          }
-          const res = await opts.onCallback(action.userId, action.chatId, action.data).catch(() => null);
-          if (res) await opts.bot.sendMessage(action.chatId, res.text, res.keyboard);
-        } else if (action.kind === "agent") {
-          // Typing indicator while the agent works: Telegram shows it
-          // ~5s, so refresh every 4s until the answer is sent.
-          const typing = setInterval(() => {
-            opts.bot.sendChatAction(action.chatId, "typing").catch(() => {});
-          }, 4000);
-          try {
-            await opts.bot.sendChatAction(action.chatId, "typing").catch(() => {});
-            // First served message from this user: send the connect
-            // template once, then the actual answer.
-            try {
-              if (markUserSeen(action.userId)) {
-                await opts.bot.sendMessage(action.chatId, connectTemplate(), mainReplyKeyboard());
-              }
-            } catch {
-              // A template failure must not block the answer.
-            }
-            const answer = await opts.onAgentText(action.userId, action.chatId, action.text);
-            await opts.bot.sendMessage(action.chatId, answer.text, answer.keyboard);
+            await handleAction(action);
           } finally {
-            clearInterval(typing);
+            releaseAgentSlot();
           }
-        }
-      } catch (err) {
-        // A failed send must not kill the loop; the next poll continues.
-        // But it must be logged: silent send failures are invisible.
-        console.error(`Gateway kirim gagal: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        // A chain must never break on a task failure: handleAction logs
+        // its own errors, and this catch guards the unexpected.
+        const guarded = task.catch((err) => {
+          console.error(`Gateway tugas agen gagal: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        chatChains.set(action.chatId, guarded);
+        void guarded.then(() => {
+          if (chatChains.get(action.chatId) === guarded) chatChains.delete(action.chatId);
+        });
+        continue;
       }
+      await handleAction(action);
     }
   }
+  // Graceful shutdown finishes answers already started instead of
+  // dropping them; no new tasks can arrive once polling stopped.
+  await Promise.allSettled([...chatChains.values()]);
 }
