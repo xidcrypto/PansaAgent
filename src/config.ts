@@ -75,7 +75,9 @@ export interface PansaConfig {
   // simulation and broadcast. Env PANSA_EVM_RPC overrides this.
   evmRpc?: string;
   // Solana JSON-RPC endpoint for the Solana analyst. Env PANSA_SOLANA_RPC
-  // overrides this; without either, a public mainnet endpoint is used.
+  // overrides this; without either, the public mainnet-beta endpoint is
+  // used (rate-limited under heavy use; publicnode is NOT a valid default
+  // — it blocks indexed token methods without a personal token).
   solanaRpc?: string;
   policy?: PolicyConfig;
   gateways?: Record<string, GatewayConfig>;

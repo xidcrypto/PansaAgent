@@ -127,11 +127,13 @@ export function createSolanaRpc(rpcUrl: string, fetchFn: typeof fetch = fetch): 
   };
 }
 
-// Solana has one mainnet, so a public default is pragmatic (rate-limited;
-// override with PANSA_SOLANA_RPC or config solanaRpc). Never fake data:
-// callers fail on RPC errors instead of returning a guessed verdict.
+// Solana has one mainnet, so a public default is pragmatic (rate-limited
+// under heavy use; override with PANSA_SOLANA_RPC or config solanaRpc).
+// Default is api.mainnet-beta.solana.com: publicnode blocks the indexed
+// token methods (getTokenSupply/getTokenLargestAccounts) without a
+// personal token, which would make every mint read UNVERIFIED.
 export function resolveSolanaRpc(explicit?: string): string {
-  return explicit ?? process.env.PANSA_SOLANA_RPC ?? loadConfig().solanaRpc ?? "https://solana-rpc.publicnode.com";
+  return explicit ?? process.env.PANSA_SOLANA_RPC ?? loadConfig().solanaRpc ?? "https://api.mainnet-beta.solana.com";
 }
 
 interface SolanaDexRow {
