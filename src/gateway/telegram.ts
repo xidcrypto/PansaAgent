@@ -49,6 +49,24 @@ export function gatewayConfirmAllowed(isTestnet: boolean, confirmTestnetEnabled:
   return isTestnet && confirmTestnetEnabled;
 }
 
+// Diagnostic summary of an initData string for server logs: field names
+// and value LENGTHS only — never values, never the hash, never the
+// token. Lets us see the shape of a real client initData (e.g. an
+// unexpected field) without touching anything sensitive.
+export function initDataDiag(initData: string, nowMs: number = Date.now()): string | null {
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(initData);
+  } catch {
+    return null;
+  }
+  const keys = [...new Set(params.keys())].sort();
+  const authDate = Number(params.get("auth_date"));
+  const authAge = Number.isFinite(authDate) ? Math.round(nowMs / 1000 - authDate) : null;
+  const lens = keys.map((k) => `${k}:${(params.get(k) ?? "").length}`).join(",");
+  return `keys=${keys.join(",")}|sig=${params.has("signature") ? 1 : 0}|authAge=${authAge}|lens=${lens}`;
+}
+
 // Telegram Web App auth: validate initData the way Telegram documents
 // it, then gate on the owner-managed allowedUsers list. initData is a
 // URL query string; the check string is all fields except "hash" AND

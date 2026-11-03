@@ -31,7 +31,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult, ProviderApi } from "../providers/index.js";
 import { getUsageTotals } from "../usage.js";
 import type { UsageTotals } from "../usage.js";
-import { verifyTelegramInitData } from "../gateway/telegram.js";
+import { verifyTelegramInitData, initDataDiag } from "../gateway/telegram.js";
 import { secretsLoad, secretsGet } from "../secrets.js";
 import { loadConfig } from "../config.js";
 
@@ -1072,8 +1072,9 @@ export async function startDashboard(opts: {
         const users = loadConfig().gateways?.telegram?.allowedUsers ?? [];
         const result = botToken ? verifyTelegramInitData(initData, botToken, users) : { ok: false as const, reason: "no_token" };
         if (!result.ok) {
-          // Log only the reason code, never initData itself.
-          console.error(`Web App auth gagal: ${result.reason ?? "unknown"}`);
+          // Log only the reason code + initData SHAPE (field names and
+          // value lengths), never initData itself.
+          console.error(`Web App auth gagal: ${result.reason ?? "unknown"} | ${initDataDiag(initData) ?? "no-diag"}`);
           res.writeHead(botToken ? 401 : 503, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: botToken ? "Web App auth gagal." : "Web App auth tidak tersedia." }));
         } else {
