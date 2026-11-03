@@ -44,7 +44,7 @@ function accountFor(family: ChainFamily, mnemonic: string, path: string): { addr
 export interface RpcRequest { id: unknown; method: string; params?: Record<string, unknown> }
 export interface RpcResponse { id: unknown; ok: boolean; result?: unknown; error?: string }
 
-function handle(req: RpcRequest): RpcResponse {
+export function handle(req: RpcRequest): RpcResponse {
   try {
     switch (req.method) {
       case "ping":
@@ -62,23 +62,51 @@ function handle(req: RpcRequest): RpcResponse {
       case "keystore.list": {
         return { id: req.id, ok: true, result: { names: keystoreList() } };
       }
-      // Export: builds an encrypted V3 keystore INSIDE the signer, so
-      // the plaintext private key never leaves this process. The caller
-      // (gateway) only ever handles the resulting JSON file. EVM only:
-      // V3 is an Ethereum format; other chains have no equivalent here.
+      // Export: two formats, one entry point.
+      // - "v3" (default): builds an encrypted V3 keystore INSIDE the
+      //   signer, so the plaintext private key never leaves this
+      //   process. EVM only: V3 is an Ethereum format.
+      // - "plain": returns the raw mnemonic + private key as JSON.
+      //   This is the owner's own credential recovery, delivered ONLY
+      //   through an auto-deleting bot message (the dashboard route
+      //   enforces that — there is no browser-download path for plain
+      //   credentials). The signer itself never logs params or results,
+      //   so plaintext never lands in a log file.
       case "wallet.export": {
-        const { name, passphrase, exportPassword } = (req.params ?? {}) as {
-          name: string; passphrase: string; exportPassword: string;
+        const { name, passphrase, exportPassword, format } = (req.params ?? {}) as {
+          name: string; passphrase: string; exportPassword?: string; format?: string;
         };
-        if (typeof exportPassword !== "string" || !exportPassword) {
+        const plain = format === "plain";
+        if (!plain && (typeof exportPassword !== "string" || !exportPassword)) {
           return { id: req.id, ok: false, error: "export password required" };
         }
         const payload = keystoreUnlock(name, passphrase);
+        const acc = accountFor(payload.family, payload.mnemonic, payload.path);
+        if (plain) {
+          const privateKey = typeof acc.privateKey === "string" ? acc.privateKey : Buffer.from(acc.privateKey).toString("hex");
+          const privateKeyEncoding = typeof acc.privateKey === "string" ? "0x-hex" : "hex";
+          return {
+            id: req.id,
+            ok: true,
+            result: {
+              name, family: payload.family, address: acc.address,
+              filename: `pansa-wallet-${name}-credentials.json`,
+              json: JSON.stringify({
+                name,
+                family: payload.family,
+                address: acc.address,
+                mnemonic: payload.mnemonic,
+                privateKey,
+                privateKeyEncoding,
+                warning: "File ini berisi kunci mentah — simpan di tempat aman dan hapus setelah diimpor. Pesan ini terhapus otomatis dari chat setelah 30 detik.",
+              }, null, 2),
+            },
+          };
+        }
         if (payload.family !== "evm") {
           return { id: req.id, ok: false, error: "export hanya tersedia untuk dompet EVM saat ini" };
         }
-        const acc = accountFor(payload.family, payload.mnemonic, payload.path);
-        const v3 = buildV3Keystore(acc.address, acc.privateKey, exportPassword);
+        const v3 = buildV3Keystore(acc.address, acc.privateKey, exportPassword as string);
         return {
           id: req.id,
           ok: true,

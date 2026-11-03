@@ -315,18 +315,15 @@ export class TelegramBot {
   }
 
   async deleteStatus(chatId: number, messageId: number): Promise<void> {
-    await this.api("deleteMessage", { chat_id: chatId, message_id: messageId });
+    await this.deleteMessage(chatId, messageId);
   }
 
   // Send a file (e.g. an encrypted keystore) as a document. Multipart,
   // unlike api() which is JSON-only; same 429 retry discipline.
-  // Send a file as a Telegram document. Used ONLY for the encrypted
-  // wallet keystore delivery from the dashboard export flow: the file
-  // is encrypted (useless without the wallet password, which is never
-  // typed into chat), and this is the delivery channel that actually
-  // arrives as a file on mobile — WebView blob downloads render as
-  // text instead on iOS Telegram.
-  async sendDocument(chatId: number, filename: string, content: Buffer, caption?: string): Promise<void> {
+  // Send a file as a Telegram document. Returns the sent message_id so
+  // the caller can delete it later (used for the auto-deleting
+  // credential delivery: the file must not linger in chat history).
+  async sendDocument(chatId: number, filename: string, content: Buffer, caption?: string): Promise<number> {
     for (let attempt = 0; attempt < 2; attempt++) {
       const form = new FormData();
       form.append("chat_id", String(chatId));
@@ -342,8 +339,12 @@ export class TelegramBot {
         description?: string;
         error_code?: number;
         parameters?: { retry_after?: number };
+        result?: { message_id?: number };
       };
-      if (data.ok) return;
+      if (data.ok) {
+        if (typeof data.result?.message_id !== "number") throw new Error("Telegram sendDocument gagal: tanpa message_id.");
+        return data.result.message_id;
+      }
       if (data.error_code === 429 && attempt === 0) {
         const waitMs = Math.min(Math.max(0, data.parameters?.retry_after ?? 0), 60) * 1000;
         if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
@@ -352,6 +353,10 @@ export class TelegramBot {
       throw new Error(`Telegram sendDocument gagal: ${data.description ?? res.status}`);
     }
     throw new Error("Telegram sendDocument gagal: 429 berulang");
+  }
+
+  async deleteMessage(chatId: number, messageId: number): Promise<void> {
+    await this.api("deleteMessage", { chat_id: chatId, message_id: messageId });
   }
 
   // Dismiss the button spinner. Must be called for every handled

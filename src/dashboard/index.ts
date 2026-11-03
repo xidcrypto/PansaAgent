@@ -22,13 +22,16 @@
 //   are served. Provider keys are never returned, never logged, and
 //   never appear in HTML or JSON. Never mnemonics, keys, passphrases,
 //   or secret values.
-// - ONE deliberate exception: POST /api/wallets/export serves an
-//   ENCRYPTED V3 keystore file for one wallet, and only after BOTH the
-//   dashboard session and the shared wallet password check out. The
-//   plaintext private key never leaves the signer process; the
-//   dashboard only forwards the encrypted JSON to the browser download.
-//   The wallet password itself is never stored, logged, or returned —
-//   only its scrypt hash lives in the gateway DB.
+// - ONE deliberate exception: POST /api/wallets/export returns the
+//   wallet's RAW credentials (mnemonic + private key) as a JSON file,
+//   and only after BOTH the dashboard session and the shared wallet
+//   password check out. The file is delivered ONLY as an auto-deleting
+//   Telegram document (30 seconds) to the owner — there is deliberately
+//   NO browser-download path for raw credentials, and the route never
+//   returns the credentials in its own response body. The plaintext
+//   key never leaves the signer except through that one IPC hop to
+//   this process and the HTTPS hop to Telegram; the signer and this
+//   route never log it.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { cpus, freemem, loadavg, totalmem, uptime, homedir } from "node:os";
@@ -374,7 +377,7 @@ function walletRows(wallets: DashboardWallet[]): string {
   return wallets
     .map(
       (w) =>
-        `<tr><td>${escapeHtml(w.name)}</td><td>${escapeHtml(w.family)}</td><td class="addr" title="${escapeHtml(w.address)}">${escapeHtml(w.address)}</td><td>${w.family === "evm" ? `<button type="button" data-wallet-export="${escapeHtml(w.name)}">Unduh keystore</button>` : "—"}</td></tr>`,
+        `<tr><td>${escapeHtml(w.name)}</td><td>${escapeHtml(w.family)}</td><td class="addr" title="${escapeHtml(w.address)}">${escapeHtml(w.address)}</td><td><button type="button" data-wallet-export="${escapeHtml(w.name)}">Kirim kredensial</button></td></tr>`,
     )
     .join("\n");
 }
@@ -645,7 +648,7 @@ function render(d){
   document.getElementById("m-ram").innerHTML=fmtP(d.system.memUsedPct)+' <span class="sub">'+fmtB(d.system.memTotal-d.system.memFree)+' / '+fmtB(d.system.memTotal)+'</span>';
   document.getElementById("m-disk").innerHTML=fmtP(d.system.diskUsedPct)+' <span class="sub">'+(d.system.diskTotal===null?"—":fmtB(d.system.diskTotal-d.system.diskFree)+' / '+fmtB(d.system.diskTotal))+'</span>';
   document.getElementById("m-up").innerHTML=fmtU(d.system.uptimeSec)+' <span class="sub">proses '+fmtU(d.system.processUptimeSec)+' · RSS <span style="white-space:nowrap">'+fmtB(d.system.processRss)+'</span></span>';
-  document.getElementById("wallets").innerHTML=d.wallets.length?d.wallets.map(w=>'<tr><td>'+esc(w.name)+'</td><td>'+esc(w.family)+'</td><td class="addr" title="'+esc(w.address)+'">'+esc(w.address)+'</td><td>'+(w.family===\"evm\"?'<button type=\"button\" data-wallet-export=\"'+esc(w.name)+'\">Unduh keystore</button>':\"—\")+'</td></tr>').join(\"\"):'<tr><td colspan=\"4\">(kosong — belum ada dompet di registry)</td></tr>';
+  document.getElementById("wallets").innerHTML=d.wallets.length?d.wallets.map(w=>'<tr><td>'+esc(w.name)+'</td><td>'+esc(w.family)+'</td><td class="addr" title="'+esc(w.address)+'">'+esc(w.address)+'</td><td><button type="button" data-wallet-export="'+esc(w.name)+'">Kirim kredensial</button></td></tr>').join(""):'<tr><td colspan="4">(kosong — belum ada dompet di registry)</td></tr>';
   document.getElementById("cfg").innerHTML='Model: '+esc(d.models.join(", ")||"(tidak ada)")+'<br>Gateway Telegram: '+(d.gatewayEnabled?"aktif":"nonaktif")+' · pengguna terdaftar: '+d.gatewayAllowedUsers+'<br>Testnet only: '+(d.testnetOnly===undefined?"tidak diketahui":d.testnetOnly?"ya":"tidak")+'<br>Tugas terjadwal pending: '+d.scheduledPending+' dari '+d.scheduledTotal+' · Price alert aktif: '+d.alertsActive+' dari '+d.alertsTotal;
   document.getElementById("tasks").innerHTML=d.tasks.length?d.tasks.map(t=>'<tr><td class="mono">'+esc(t.id.slice(0,8))+'</td><td title="'+esc(t.prompt)+'">'+esc(trunc(t.prompt,90))+'</td><td>'+esc(t.run_at)+'</td><td>'+badge(t.status)+'</td><td title="'+esc(t.last_result||"")+'">'+esc(trunc(t.last_result,60))+'</td></tr>').join(""):'<tr><td colspan="5">(belum ada tugas terjadwal)</td></tr>';
   document.getElementById("alerts").innerHTML=d.alerts.length?d.alerts.map(a=>'<tr><td class="mono">'+esc(a.token)+'</td><td>'+esc(a.op)+' $'+a.price_usd+'</td><td title="'+esc(a.note)+'">'+esc(trunc(a.note,60))+'</td><td>'+badge(a.status)+'</td><td>'+esc(a.created_at)+'</td></tr>').join(""):'<tr><td colspan="5">(belum ada price alert)</td></tr>';
@@ -734,16 +737,16 @@ function walletModalShow(mode,name){
     document.getElementById("wallet-modal-old").focus();
     return;
   }
-  title.textContent="Unduh keystore "+name;
-  submit.textContent="Unduh";
+  title.textContent="Kirim kredensial "+name;
+  submit.textContent="Kirim";
   bd.classList.add("open");
   api("api/wallets/password-status","GET").then(function(s){
     if(s.hasPassword){
-      note.textContent="Masukkan password dompet untuk mengunduh file keystore terenkripsi (V3).";
+      note.textContent="Masukkan password dompet — file JSON berisi mnemonic + private key akan dikirim ke chat bot dan terhapus otomatis setelah 30 detik. Unduh segera dan simpan di tempat aman.";
       document.getElementById("wallet-modal-enter").style.display="";
       document.getElementById("wallet-modal-password").focus();
     } else {
-      note.textContent="Belum ada password dompet. Buat dulu — password ini dipakai semua dompet dan wajib dimasukkan setiap unduhan.";
+      note.textContent="Belum ada password dompet. Buat dulu — password ini dipakai semua dompet dan wajib dimasukkan setiap pengiriman.";
       document.getElementById("wallet-modal-create").style.display="";
       document.getElementById("wallet-modal-new").focus();
     }
@@ -794,32 +797,16 @@ document.getElementById("wallet-modal-submit").addEventListener("click",async fu
     }
     var r=await fetch("api/wallets/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:walletModal.name,password:pw})});
     if(r.status===401){ location=dashPrefix+"/login"; return; }
+    var dj=await r.json().catch(function(){return {};});
     if(!r.ok){
-      var j=await r.json().catch(function(){return {};});
-      throw new Error(j.error||("HTTP "+r.status));
+      throw new Error(dj.error||("HTTP "+r.status));
     }
-    var cd=r.headers.get("Content-Disposition")||"";
-    if(!cd){
-      // Bot delivery: the file went to the owner's Telegram chat as a
-      // document (no browser download involved).
-      var dj=await r.json().catch(function(){return {};});
-      if(dj.delivered==="telegram"){
-        toast("Keystore "+walletModal.name+" terkirim ke Telegram — buka chat bot untuk mengunduh file-nya.","ok");
-        walletModalHide();
-        return;
-      }
-      throw new Error("Respons export tidak dikenali.");
+    if(dj.delivered==="telegram"){
+      toast("Kredensial "+walletModal.name+" terkirim ke Telegram — unduh dalam 30 detik, pesan akan terhapus otomatis.","ok");
+      walletModalHide();
+      return;
     }
-    var blob=await r.blob();
-    var m=/filename="([^"]+)"/.exec(cd);
-    var filename=m?m[1]:("pansa-wallet-"+walletModal.name+"-keystore.json");
-    var a=document.createElement("a");
-    a.href=URL.createObjectURL(blob);
-    a.download=filename;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function(){ URL.revokeObjectURL(a.href); },5000);
-    toast("Keystore "+walletModal.name+" terunduh.","ok");
-    walletModalHide();
+    throw new Error("Respons export tidak dikenali.");
   }catch(e){
     err.textContent="Error: "+e.message;
   } finally {
@@ -1040,7 +1027,7 @@ ${usage ? usageProviderRowsHtml(usage) : `<tr><td colspan="6">(tidak ada data)</
 <h2>Dompet</h2>
 <div class="tablewrap"><table><tr><th>Nama</th><th>Rantai</th><th>Alamat</th><th>Aksi</th></tr><tbody id="wallets">
 ${walletRows(data.wallets)}</tbody></table></div>
-<p class="note">File keystore terenkripsi (V3, bisa di-import MetaMask/Rabby) hanya untuk dompet EVM. Password dompet dipakai semua dompet dan wajib dimasukkan setiap unduhan — password tidak pernah disimpan dalam bentuk polos.</p>
+<p class="note">File JSON berisi mnemonic + private key dikirim ke chat bot dan terhapus otomatis setelah 30 detik — unduh segera dan simpan di tempat aman. Password dompet dipakai semua dompet dan wajib dimasukkan setiap pengiriman.</p>
 <div><button type="button" id="wallet-password-change">Ubah password dompet</button></div>
 </section>
 <section id="sec-tugas">
@@ -1059,7 +1046,7 @@ ${alertRows(data.alerts)}</tbody></table></div>
 </section>
 <p class="note">Untuk saldo, jalankan <code>pansa portfolio</code>. Log yang tampil sudah disaring dari nilai yang tampak seperti secret.</p>
 </div></main></div><div class="modal-backdrop" id="wallet-modal-backdrop"><div class="modal">
-<h3 id="wallet-modal-title">Unduh keystore</h3>
+<h3 id="wallet-modal-title">Kirim kredensial</h3>
 <p class="note" id="wallet-modal-note"></p>
 <div id="wallet-modal-enter">
 <div class="label" style="margin-bottom:6px">Password dompet</div>
@@ -1080,7 +1067,7 @@ ${alertRows(data.alerts)}</tbody></table></div>
 <input id="wallet-modal-confirm2" type="password" autocomplete="new-password">
 </div>
 <p class="err" id="wallet-modal-err"></p>
-<div class="row"><button type="button" id="wallet-modal-cancel">Batal</button><button type="button" id="wallet-modal-submit" style="background:#FFDC58">Unduh</button></div>
+<div class="row"><button type="button" id="wallet-modal-cancel">Batal</button><button type="button" id="wallet-modal-submit" style="background:#FFDC58">Kirim</button></div>
 </div></div><div id="toasts"></div><script>${JS}</script></body></html>`;
 }
 
@@ -1299,12 +1286,17 @@ export async function startDashboard(opts: {
         res.end(JSON.stringify({ ok: true }));
         return;
       }
-      // Wallet keystore export (session-gated + wallet-password-gated).
+      // Wallet credential export (session-gated + wallet-password-gated).
       // The wallet password is verified against its scrypt hash only;
       // the password value itself is never stored, logged, or returned.
-      // The plaintext private key never leaves the signer process: the
-      // signer builds the encrypted V3 keystore and this route only
-      // forwards that JSON as a browser download.
+      // The raw credentials (mnemonic + private key) are built inside
+      // the signer and delivered ONLY as an auto-deleting Telegram
+      // document to the owner: bot delivery is REQUIRED — if it is
+      // unavailable there is deliberately no browser-download fallback
+      // for raw credentials, and the route never returns the
+      // credentials in its own response body. The 30-second deletion
+      // is best-effort (a dashboard restart inside the window skips
+      // it); the message_id is logged, never the content.
       if (url.pathname === "/api/wallets/password-status" && req.method === "GET") {
         try {
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -1367,42 +1359,41 @@ export async function startDashboard(opts: {
             name,
             passphrase: process.env.PANSA_PASSPHRASE ?? "",
             exportPassword: password,
+            format: "plain",
           });
           if (!res2.ok) {
             fail(400, res2.error ?? "Export gagal.");
             return;
           }
           const r = res2.result as { name: string; family: string; address: string; filename: string; json: string };
-          // Delivery: the bot sends the file as a Telegram document to
-          // the owner — on mobile Telegram that reliably arrives as a
-          // file, while a WebView blob download renders as text (seen
-          // on iOS). Only the ENCRYPTED file travels through chat; the
-          // wallet password never does. If bot delivery is unavailable
-          // (no token, no allowed user, send error), fall back to the
-          // browser download so the user still gets the file.
+          // Delivery is bot-only and auto-deleting: the raw credentials
+          // must never sit in chat history or a browser download.
           const pass = process.env.PANSA_PASSPHRASE;
           const botToken = pass ? secretsGet(secretsLoad(pass), "telegram_bot_token") : undefined;
           const ownerId = loadConfig().gateways?.telegram?.allowedUsers?.[0];
-          if (botToken && typeof ownerId === "number") {
-            try {
-              await new TelegramBot(botToken).sendDocument(
-                ownerId,
-                r.filename,
-                Buffer.from(r.json, "utf8"),
-                `Keystore ${r.name} (${r.address}) — import ke MetaMask/Rabby dengan password dompet.`,
-              );
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ ok: true, delivered: "telegram", filename: r.filename }));
-              return;
-            } catch {
-              // Fall through to the browser download below.
-            }
+          if (!botToken || typeof ownerId !== "number") {
+            fail(503, "Bot Telegram tidak tersedia — file kredensial hanya dikirim lewat bot (auto-hapus).");
+            return;
           }
-          res.writeHead(200, {
-            "Content-Type": "application/json",
-            "Content-Disposition": `attachment; filename="${r.filename}"`,
-          });
-          res.end(r.json);
+          try {
+            const messageId = await new TelegramBot(botToken).sendDocument(
+              ownerId,
+              r.filename,
+              Buffer.from(r.json, "utf8"),
+              `Kredensial ${r.name} (${r.address}) — mnemonic + private key. UNDUH DALAM 30 DETIK, pesan ini terhapus otomatis. Simpan di tempat aman.`,
+            );
+            const bot = new TelegramBot(botToken);
+            setTimeout(() => {
+              bot.deleteMessage(ownerId, messageId).catch((err) => {
+                console.error(`Gagal hapus pesan kredensial ${messageId}: ${err instanceof Error ? err.message : String(err)}`);
+              });
+            }, 30000);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, delivered: "telegram", filename: r.filename, deleteAfterSec: 30 }));
+          } catch (err) {
+            fail(400, err instanceof Error ? err.message : String(err));
+          }
+          return;
         } catch (err) {
           fail(400, err instanceof Error ? err.message : String(err));
         }
