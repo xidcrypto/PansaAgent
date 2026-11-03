@@ -22,6 +22,13 @@
 //   are served. Provider keys are never returned, never logged, and
 //   never appear in HTML or JSON. Never mnemonics, keys, passphrases,
 //   or secret values.
+// - ONE deliberate exception: POST /api/wallets/export serves an
+//   ENCRYPTED V3 keystore file for one wallet, and only after BOTH the
+//   dashboard session and the shared wallet password check out. The
+//   plaintext private key never leaves the signer process; the
+//   dashboard only forwards the encrypted JSON to the browser download.
+//   The wallet password itself is never stored, logged, or returned —
+//   only its scrypt hash lives in the gateway DB.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { cpus, freemem, loadavg, totalmem, uptime, homedir } from "node:os";
@@ -31,7 +38,8 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult, ProviderApi } from "../providers/index.js";
 import { getUsageTotals } from "../usage.js";
 import type { UsageTotals } from "../usage.js";
-import { verifyTelegramInitData, initDataDiag } from "../gateway/telegram.js";
+import { verifyTelegramInitData, initDataDiag, hasWalletPassword, setWalletPassword, verifyWalletPassword } from "../gateway/telegram.js";
+import { getSignerClient } from "../signer/client.js";
 import { secretsLoad, secretsGet } from "../secrets.js";
 import { loadConfig } from "../config.js";
 
@@ -362,11 +370,11 @@ function badge(status: string): string {
 }
 
 function walletRows(wallets: DashboardWallet[]): string {
-  if (!wallets.length) return `<tr><td colspan="3">(kosong — belum ada dompet di registry)</td></tr>`;
+  if (!wallets.length) return `<tr><td colspan="4">(kosong — belum ada dompet di registry)</td></tr>`;
   return wallets
     .map(
       (w) =>
-        `<tr><td>${escapeHtml(w.name)}</td><td>${escapeHtml(w.family)}</td><td class="addr" title="${escapeHtml(w.address)}">${escapeHtml(w.address)}</td></tr>`,
+        `<tr><td>${escapeHtml(w.name)}</td><td>${escapeHtml(w.family)}</td><td class="addr" title="${escapeHtml(w.address)}">${escapeHtml(w.address)}</td><td>${w.family === "evm" ? `<button type="button" data-wallet-export="${escapeHtml(w.name)}">Unduh keystore</button>` : "—"}</td></tr>`,
     )
     .join("\n");
 }
@@ -446,7 +454,14 @@ main{flex:1;min-width:0}
 .sidebar{transition:transform .2s}
 .backdrop{display:none}
 @media (min-width:821px){.layout.sidebar-collapsed .sidebar{display:none}}
-@media (max-width:820px){.layout{flex-direction:column}.sidebar{position:fixed;top:0;left:0;height:100vh;z-index:10;transform:translateX(-105%);border-right:3px solid #000;box-shadow:8px 0 0 rgba(0,0,0,.2)}.layout.sidebar-open .sidebar{transform:none}.layout.sidebar-open .backdrop{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9}}`;
+@media (max-width:820px){.layout{flex-direction:column}.sidebar{position:fixed;top:0;left:0;height:100vh;z-index:10;transform:translateX(-105%);border-right:3px solid #000;box-shadow:8px 0 0 rgba(0,0,0,.2)}.layout.sidebar-open .sidebar{transform:none}.layout.sidebar-open .backdrop{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9}}
+.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;align-items:center;justify-content:center}
+.modal-backdrop.open{display:flex}
+.modal{background:#fff;border:3px solid #000;box-shadow:8px 8px 0 #000;padding:20px;max-width:420px;width:calc(100% - 32px)}
+.modal h3{margin-top:0}
+.modal input{width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px}
+.modal .row{display:flex;gap:10px;justify-content:flex-end;margin-top:6px}
+.modal .err{color:#cf222e;font-weight:700;min-height:1.2em}`;
 
 const JS = `(function(){var o=document.getElementById("page-loading");if(o){var done=false;function hide(){if(done){return;}done=true;o.className+=" done";setTimeout(function(){o.style.display="none";},500);}if(document.readyState==="complete"){hide();}else{window.addEventListener("load",hide);}setTimeout(hide,5000);}})();
 const esc=s=>String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
@@ -630,7 +645,7 @@ function render(d){
   document.getElementById("m-ram").innerHTML=fmtP(d.system.memUsedPct)+' <span class="sub">'+fmtB(d.system.memTotal-d.system.memFree)+' / '+fmtB(d.system.memTotal)+'</span>';
   document.getElementById("m-disk").innerHTML=fmtP(d.system.diskUsedPct)+' <span class="sub">'+(d.system.diskTotal===null?"—":fmtB(d.system.diskTotal-d.system.diskFree)+' / '+fmtB(d.system.diskTotal))+'</span>';
   document.getElementById("m-up").innerHTML=fmtU(d.system.uptimeSec)+' <span class="sub">proses '+fmtU(d.system.processUptimeSec)+' · RSS <span style="white-space:nowrap">'+fmtB(d.system.processRss)+'</span></span>';
-  document.getElementById("wallets").innerHTML=d.wallets.length?d.wallets.map(w=>'<tr><td>'+esc(w.name)+'</td><td>'+esc(w.family)+'</td><td class="addr" title="'+esc(w.address)+'">'+esc(w.address)+'</td></tr>').join(""):'<tr><td colspan="3">(kosong — belum ada dompet di registry)</td></tr>';
+  document.getElementById("wallets").innerHTML=d.wallets.length?d.wallets.map(w=>'<tr><td>'+esc(w.name)+'</td><td>'+esc(w.family)+'</td><td class="addr" title="'+esc(w.address)+'">'+esc(w.address)+'</td><td>'+(w.family===\"evm\"?'<button type=\"button\" data-wallet-export=\"'+esc(w.name)+'\">Unduh keystore</button>':\"—\")+'</td></tr>').join(\"\"):'<tr><td colspan=\"4\">(kosong — belum ada dompet di registry)</td></tr>';
   document.getElementById("cfg").innerHTML='Model: '+esc(d.models.join(", ")||"(tidak ada)")+'<br>Gateway Telegram: '+(d.gatewayEnabled?"aktif":"nonaktif")+' · pengguna terdaftar: '+d.gatewayAllowedUsers+'<br>Testnet only: '+(d.testnetOnly===undefined?"tidak diketahui":d.testnetOnly?"ya":"tidak")+'<br>Tugas terjadwal pending: '+d.scheduledPending+' dari '+d.scheduledTotal+' · Price alert aktif: '+d.alertsActive+' dari '+d.alertsTotal;
   document.getElementById("tasks").innerHTML=d.tasks.length?d.tasks.map(t=>'<tr><td class="mono">'+esc(t.id.slice(0,8))+'</td><td title="'+esc(t.prompt)+'">'+esc(trunc(t.prompt,90))+'</td><td>'+esc(t.run_at)+'</td><td>'+badge(t.status)+'</td><td title="'+esc(t.last_result||"")+'">'+esc(trunc(t.last_result,60))+'</td></tr>').join(""):'<tr><td colspan="5">(belum ada tugas terjadwal)</td></tr>';
   document.getElementById("alerts").innerHTML=d.alerts.length?d.alerts.map(a=>'<tr><td class="mono">'+esc(a.token)+'</td><td>'+esc(a.op)+' $'+a.price_usd+'</td><td title="'+esc(a.note)+'">'+esc(trunc(a.note,60))+'</td><td>'+badge(a.status)+'</td><td>'+esc(a.created_at)+'</td></tr>').join(""):'<tr><td colspan="5">(belum ada price alert)</td></tr>';
@@ -693,6 +708,112 @@ document.getElementById("password-form").addEventListener("submit",async e=>{
     toast(msg.textContent,"ok");
   }catch(err){ msg.textContent="Error: "+err.message; toast(msg.textContent,"bad"); }
   finally{ if(btn) btn.disabled=false; }
+});
+// Wallet keystore modal: export (enter/create) + change password.
+// Passwords live only in these inputs during the flow and are cleared
+// on close; they are never stored, logged, or sent anywhere except the
+// session-gated export/password endpoints over this same origin.
+var walletModal={mode:"export",name:""};
+function walletModalShow(mode,name){
+  walletModal.mode=mode; walletModal.name=name||"";
+  var bd=document.getElementById("wallet-modal-backdrop");
+  var title=document.getElementById("wallet-modal-title");
+  var note=document.getElementById("wallet-modal-note");
+  var submit=document.getElementById("wallet-modal-submit");
+  document.getElementById("wallet-modal-enter").style.display="none";
+  document.getElementById("wallet-modal-create").style.display="none";
+  document.getElementById("wallet-modal-change").style.display="none";
+  document.getElementById("wallet-modal-err").textContent="";
+  ["wallet-modal-password","wallet-modal-new","wallet-modal-confirm","wallet-modal-old","wallet-modal-new2","wallet-modal-confirm2"].forEach(function(id){var el=document.getElementById(id); if(el) el.value="";});
+  if(mode==="change"){
+    title.textContent="Ubah password dompet";
+    note.textContent="Password lama diverifikasi dulu — tanpa itu password tidak bisa diubah.";
+    document.getElementById("wallet-modal-change").style.display="";
+    submit.textContent="Simpan";
+    bd.classList.add("open");
+    document.getElementById("wallet-modal-old").focus();
+    return;
+  }
+  title.textContent="Unduh keystore "+name;
+  submit.textContent="Unduh";
+  bd.classList.add("open");
+  api("api/wallets/password-status","GET").then(function(s){
+    if(s.hasPassword){
+      note.textContent="Masukkan password dompet untuk mengunduh file keystore terenkripsi (V3).";
+      document.getElementById("wallet-modal-enter").style.display="";
+      document.getElementById("wallet-modal-password").focus();
+    } else {
+      note.textContent="Belum ada password dompet. Buat dulu — password ini dipakai semua dompet dan wajib dimasukkan setiap unduhan.";
+      document.getElementById("wallet-modal-create").style.display="";
+      document.getElementById("wallet-modal-new").focus();
+    }
+  }).catch(function(err){
+    document.getElementById("wallet-modal-err").textContent="Error: "+err.message;
+  });
+}
+function walletModalHide(){
+  document.getElementById("wallet-modal-backdrop").classList.remove("open");
+  ["wallet-modal-password","wallet-modal-new","wallet-modal-confirm","wallet-modal-old","wallet-modal-new2","wallet-modal-confirm2"].forEach(function(id){var el=document.getElementById(id); if(el) el.value="";});
+}
+document.getElementById("wallet-modal-cancel").addEventListener("click",walletModalHide);
+document.getElementById("wallet-modal-backdrop").addEventListener("click",function(e){ if(e.target===this) walletModalHide(); });
+document.getElementById("wallets").addEventListener("click",function(e){
+  var btn=e.target.closest?e.target.closest("[data-wallet-export]"):null;
+  if(btn) walletModalShow("export",btn.getAttribute("data-wallet-export"));
+});
+document.getElementById("wallet-password-change").addEventListener("click",function(){ walletModalShow("change",""); });
+document.getElementById("wallet-modal-submit").addEventListener("click",async function(){
+  var err=document.getElementById("wallet-modal-err");
+  var btn=document.getElementById("wallet-modal-submit");
+  if(btn.disabled) return;
+  err.textContent="";
+  try{
+    if(walletModal.mode==="change"){
+      var oldPw=document.getElementById("wallet-modal-old").value;
+      var nw=document.getElementById("wallet-modal-new2").value;
+      var cf=document.getElementById("wallet-modal-confirm2").value;
+      if(nw!==cf){ err.textContent="Password baru tidak sama dengan ulangannya."; return; }
+      btn.disabled=true;
+      await api("api/wallets/password","POST",{oldPassword:oldPw,newPassword:nw});
+      toast("Password dompet berhasil diubah.","ok");
+      walletModalHide();
+      return;
+    }
+    var pw="";
+    var st=await api("api/wallets/password-status","GET");
+    if(!st.hasPassword){
+      var n1=document.getElementById("wallet-modal-new").value;
+      var n2=document.getElementById("wallet-modal-confirm").value;
+      if(n1!==n2){ err.textContent="Password baru tidak sama dengan ulangannya."; return; }
+      btn.disabled=true;
+      await api("api/wallets/password","POST",{newPassword:n1});
+      pw=n1;
+    } else {
+      pw=document.getElementById("wallet-modal-password").value;
+      btn.disabled=true;
+    }
+    var r=await fetch("api/wallets/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:walletModal.name,password:pw})});
+    if(r.status===401){ location=dashPrefix+"/login"; return; }
+    if(!r.ok){
+      var j=await r.json().catch(function(){return {};});
+      throw new Error(j.error||("HTTP "+r.status));
+    }
+    var blob=await r.blob();
+    var cd=r.headers.get("Content-Disposition")||"";
+    var m=/filename="([^"]+)"/.exec(cd);
+    var filename=m?m[1]:("pansa-wallet-"+walletModal.name+"-keystore.json");
+    var a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); },5000);
+    toast("Keystore "+walletModal.name+" terunduh.","ok");
+    walletModalHide();
+  }catch(e){
+    err.textContent="Error: "+e.message;
+  } finally {
+    btn.disabled=false;
+  }
 });
 let es=null; let lastAuthCheck=0;
 function startEvents(){
@@ -906,8 +1027,10 @@ ${usage ? usageProviderRowsHtml(usage) : `<tr><td colspan="6">(tidak ada data)</
 </section>
 <section id="sec-dompet">
 <h2>Dompet</h2>
-<div class="tablewrap"><table><tr><th>Nama</th><th>Rantai</th><th>Alamat</th></tr><tbody id="wallets">
+<div class="tablewrap"><table><tr><th>Nama</th><th>Rantai</th><th>Alamat</th><th>Aksi</th></tr><tbody id="wallets">
 ${walletRows(data.wallets)}</tbody></table></div>
+<p class="note">File keystore terenkripsi (V3, bisa di-import MetaMask/Rabby) hanya untuk dompet EVM. Password dompet dipakai semua dompet dan wajib dimasukkan setiap unduhan — password tidak pernah disimpan dalam bentuk polos.</p>
+<div><button type="button" id="wallet-password-change">Ubah password dompet</button></div>
 </section>
 <section id="sec-tugas">
 <h2>Tugas Terjadwal</h2>
@@ -924,7 +1047,30 @@ ${alertRows(data.alerts)}</tbody></table></div>
 <pre class="log" id="logs">${data.logs.length ? escapeHtml(data.logs.join("\n")) : "(tidak ada log yang dikonfigurasi — set PANSA_DASHBOARD_LOG ke path file log.)"}</pre>
 </section>
 <p class="note">Untuk saldo, jalankan <code>pansa portfolio</code>. Log yang tampil sudah disaring dari nilai yang tampak seperti secret.</p>
-</div></main></div><div id="toasts"></div><script>${JS}</script></body></html>`;
+</div></main></div><div class="modal-backdrop" id="wallet-modal-backdrop"><div class="modal">
+<h3 id="wallet-modal-title">Unduh keystore</h3>
+<p class="note" id="wallet-modal-note"></p>
+<div id="wallet-modal-enter">
+<div class="label" style="margin-bottom:6px">Password dompet</div>
+<input id="wallet-modal-password" type="password" autocomplete="current-password">
+</div>
+<div id="wallet-modal-create" style="display:none">
+<div class="label" style="margin-bottom:6px">Password dompet baru (min 8 karakter, dipakai semua dompet)</div>
+<input id="wallet-modal-new" type="password" autocomplete="new-password">
+<div class="label" style="margin-bottom:6px">Ulangi password baru</div>
+<input id="wallet-modal-confirm" type="password" autocomplete="new-password">
+</div>
+<div id="wallet-modal-change" style="display:none">
+<div class="label" style="margin-bottom:6px">Password dompet lama</div>
+<input id="wallet-modal-old" type="password" autocomplete="current-password">
+<div class="label" style="margin-bottom:6px">Password dompet baru (min 8 karakter)</div>
+<input id="wallet-modal-new2" type="password" autocomplete="new-password">
+<div class="label" style="margin-bottom:6px">Ulangi password baru</div>
+<input id="wallet-modal-confirm2" type="password" autocomplete="new-password">
+</div>
+<p class="err" id="wallet-modal-err"></p>
+<div class="row"><button type="button" id="wallet-modal-cancel">Batal</button><button type="button" id="wallet-modal-submit" style="background:#FFDC58">Unduh</button></div>
+</div></div><div id="toasts"></div><script>${JS}</script></body></html>`;
 }
 
 export async function startDashboard(opts: {
@@ -1140,6 +1286,90 @@ export async function startDashboard(opts: {
         for (const token of [...sessions]) if (token !== mine) sessions.delete(token);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      // Wallet keystore export (session-gated + wallet-password-gated).
+      // The wallet password is verified against its scrypt hash only;
+      // the password value itself is never stored, logged, or returned.
+      // The plaintext private key never leaves the signer process: the
+      // signer builds the encrypted V3 keystore and this route only
+      // forwards that JSON as a browser download.
+      if (url.pathname === "/api/wallets/password-status" && req.method === "GET") {
+        try {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, hasPassword: hasWalletPassword() }));
+        } catch {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Tidak bisa memeriksa password dompet." }));
+        }
+        return;
+      }
+      if (url.pathname === "/api/wallets/password" && req.method === "POST") {
+        const body = (await readJsonBody(req)) as { oldPassword?: unknown; newPassword?: unknown };
+        const fail = (error: string) => {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error }));
+        };
+        try {
+          const next = typeof body.newPassword === "string" ? body.newPassword : "";
+          if (next.length < 8) {
+            fail("Password dompet minimal 8 karakter.");
+            return;
+          }
+          if (hasWalletPassword()) {
+            const old = typeof body.oldPassword === "string" ? body.oldPassword : "";
+            if (!verifyWalletPassword(old)) {
+              fail("Password dompet lama salah.");
+              return;
+            }
+          }
+          setWalletPassword(next);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } catch {
+          fail("Gagal menyimpan password dompet.");
+        }
+        return;
+      }
+      if (url.pathname === "/api/wallets/export" && req.method === "POST") {
+        const body = (await readJsonBody(req)) as { name?: unknown; password?: unknown };
+        const fail = (status: number, error: string) => {
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error }));
+        };
+        try {
+          const name = typeof body.name === "string" ? body.name : "";
+          const password = typeof body.password === "string" ? body.password : "";
+          if (!name) {
+            fail(400, "Nama dompet wajib diisi.");
+            return;
+          }
+          if (!hasWalletPassword()) {
+            fail(400, "Belum ada password dompet.");
+            return;
+          }
+          if (!verifyWalletPassword(password)) {
+            fail(401, "Password dompet salah.");
+            return;
+          }
+          const res2 = await getSignerClient().request("wallet.export", {
+            name,
+            passphrase: process.env.PANSA_PASSPHRASE ?? "",
+            exportPassword: password,
+          });
+          if (!res2.ok) {
+            fail(400, res2.error ?? "Export gagal.");
+            return;
+          }
+          const r = res2.result as { name: string; family: string; address: string; filename: string; json: string };
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Content-Disposition": `attachment; filename="${r.filename}"`,
+          });
+          res.end(r.json);
+        } catch (err) {
+          fail(400, err instanceof Error ? err.message : String(err));
+        }
         return;
       }
       // Provider CRUD (session-gated; keys never leave the server).

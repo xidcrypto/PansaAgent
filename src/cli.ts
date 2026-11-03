@@ -23,7 +23,7 @@ import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin, startAgentStatus, getChatHistory, appendChatHistory, getWalletPending, setWalletPending, clearWalletPending, setWalletPassword, verifyWalletPassword, isPasswordAttemptCandidate, WALLET_PENDING_TTL_MS, WALLET_PASSWORD_MIN_LEN, WALLET_EXPORT_MAX_ATTEMPTS } from "./gateway/telegram.js";
+import { TelegramBot, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin, startAgentStatus, getChatHistory, appendChatHistory } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -541,70 +541,6 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
       bot,
       allowedUsers: () => loadConfig().gateways?.telegram?.allowedUsers ?? [],
       onAgentText: async (userId, chatId, text) => {
-        // Pending password flows consume the message FIRST: a password
-        // must never reach the reply keyboard, a deterministic command,
-        // the agent, or chat history. Commands and keyboard buttons keep
-        // routing normally (and leave the pending state untouched).
-        // The password itself is used transiently here only — verify
-        // (hash) or build the encrypted keystore — and is never stored,
-        // logged, or appended to history.
-        const pending = (() => {
-          try {
-            return getWalletPending(chatId);
-          } catch {
-            return null;
-          }
-        })();
-        if (pending && isPasswordAttemptCandidate(text)) {
-          const reply = (t: string) => ({ text: t, keyboard: mainReplyKeyboard() });
-          try {
-            if (pending.kind === "set-password") {
-              if (pending.step === "old") {
-                if (!verifyWalletPassword(text)) {
-                  return reply("Password lama salah. Coba lagi, atau kirim /wallet set-password untuk mengulang.");
-                }
-                setWalletPending(chatId, { kind: "set-password", step: "new", attempts: 0, expiresAt: Date.now() + WALLET_PENDING_TTL_MS });
-                return reply("Password lama benar. Kirim password dompet baru (min 8 karakter).");
-              }
-              if (text.length < WALLET_PASSWORD_MIN_LEN) {
-                return reply(`Password terlalu pendek (min ${WALLET_PASSWORD_MIN_LEN} karakter). Kirim password lain.`);
-              }
-              setWalletPassword(text);
-              clearWalletPending(chatId);
-              return reply("Password dompet tersimpan. Password ini dipakai semua dompet dan wajib dimasukkan setiap export. Hapus pesan password di atas dari riwayat chat kamu (pesan itu tidak bisa dihapus bot).");
-            }
-            // Export: verify, then build the encrypted keystore inside
-            // the signer and send it as a document. The file alone is
-            // useless without the wallet password.
-            const attempts = pending.attempts + 1;
-            if (!verifyWalletPassword(text)) {
-              if (attempts >= WALLET_EXPORT_MAX_ATTEMPTS) {
-                clearWalletPending(chatId);
-                return reply("Password salah 3 kali — export dibatalkan. Ulangi dengan /wallet export <nama>.");
-              }
-              setWalletPending(chatId, { ...pending, attempts });
-              return reply(`Password salah (${attempts}/${WALLET_EXPORT_MAX_ATTEMPTS}). Coba lagi.`);
-            }
-            clearWalletPending(chatId);
-            const walletName = pending.walletName ?? "";
-            const res = await getSigner().request("wallet.export", {
-              name: walletName,
-              passphrase: process.env.PANSA_PASSPHRASE ?? "",
-              exportPassword: text,
-            });
-            if (!res.ok) throw new Error(res.error);
-            const r = res.result as { name: string; family: string; address: string; filename: string; json: string };
-            await bot.sendDocument(chatId, r.filename, Buffer.from(r.json, "utf8"), `Keystore ${r.name} (${r.address}) — import ke MetaMask/Rabby dengan password dompet.`);
-            return reply(`File keystore ${r.name} terkirim. Import dengan password dompet. Hapus pesan password di atas dari riwayat chat kamu (pesan itu tidak bisa dihapus bot).`);
-          } catch (err) {
-            try {
-              clearWalletPending(chatId);
-            } catch {
-              // Ignore: the error reply matters more.
-            }
-            return reply(`Gagal: ${err instanceof Error ? err.message : String(err)}`);
-          }
-        }
         // Reply-keyboard taps arrive as plain text: route them before
         // deterministic commands and the agent. Every reply re-attaches
         // the main panel, so the grid keyboard stays the main menu.
@@ -647,7 +583,6 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
         // Deterministic commands answer without an LLM call (fast, no
         // model cost). Anything else goes to the agent.
         const direct = await handleGatewayCommand(text, {
-          chatId,
           doctorText: async () => formatDoctor(await runDoctor()),
           scheduleText: () => {
             const pending = listScheduled("pending");

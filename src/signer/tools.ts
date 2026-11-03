@@ -226,11 +226,11 @@ export function createWalletCreateTool(deps?: WalletCreateDeps): Tool {
       }
       // First-creation rule, same as the deterministic path: no wallet
       // can be made before the shared wallet password exists. The model
-      // must direct the user to /wallet set-password, never ask for the
-      // password itself (it must never see one).
+      // must direct the user to the dashboard (Dompet menu), never ask
+      // for the password itself (it must never see one).
       try {
         if (!hasWalletPassword()) {
-          return { ok: false, data: null, error: "WALLET_PASSWORD_REQUIRED: belum ada password dompet. Minta user mengatur dulu lewat /wallet set-password, lalu ulangi pembuatan." };
+          return { ok: false, data: null, error: "WALLET_PASSWORD_REQUIRED: belum ada password dompet. Minta user mengatur dulu lewat dashboard (menu Dompet — tombol Unduh keystore akan meminta pembuatan password), lalu ulangi pembuatan." };
         }
       } catch {
         return { ok: false, data: null, error: "Tidak bisa memeriksa password dompet. Coba lagi." };

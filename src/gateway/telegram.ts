@@ -320,34 +320,6 @@ export class TelegramBot {
 
   // Send a file (e.g. an encrypted keystore) as a document. Multipart,
   // unlike api() which is JSON-only; same 429 retry discipline.
-  async sendDocument(chatId: number, filename: string, content: Buffer, caption?: string): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const form = new FormData();
-      form.append("chat_id", String(chatId));
-      form.append("document", new Blob([content], { type: "application/json" }), filename);
-      if (caption) form.append("caption", caption);
-      const res = await this.fetchFn(`https://api.telegram.org/bot${this.token}/sendDocument`, {
-        method: "POST",
-        body: form,
-        signal: AbortSignal.timeout(30000),
-      });
-      const data = (await res.json()) as {
-        ok?: boolean;
-        description?: string;
-        error_code?: number;
-        parameters?: { retry_after?: number };
-      };
-      if (data.ok) return;
-      if (data.error_code === 429 && attempt === 0) {
-        const waitMs = Math.min(Math.max(0, data.parameters?.retry_after ?? 0), 60) * 1000;
-        if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
-        continue;
-      }
-      throw new Error(`Telegram sendDocument gagal: ${data.description ?? res.status}`);
-    }
-    throw new Error("Telegram sendDocument gagal: 429 berulang");
-  }
-
   // Dismiss the button spinner. Must be called for every handled
   // callback, or the button looks stuck.
   async answerCallbackQuery(callbackId: string): Promise<void> {
@@ -795,79 +767,6 @@ export function verifyWalletPassword(password: string): boolean {
   }
 }
 
-// Pending password flows: a multi-step exchange the agent must never
-// see. /wallet set-password and /wallet export arm a pending state;
-// the next FREE-TEXT message from that chat is consumed as the password
-// (never forwarded to the agent, never recorded in history). Commands
-// and reply-keyboard buttons keep routing normally and leave the
-// pending state untouched, so tapping a button never burns an attempt.
-export const WALLET_PENDING_TTL_MS = 5 * 60 * 1000;
-export const WALLET_PASSWORD_MIN_LEN = 8;
-export const WALLET_EXPORT_MAX_ATTEMPTS = 3;
-
-export type WalletPendingKind = "set-password" | "export";
-
-export interface WalletPending {
-  kind: WalletPendingKind;
-  step: "old" | "new" | "password";
-  walletName?: string;
-  attempts: number;
-  expiresAt: number;
-}
-
-function walletPendingTable(): void {
-  gatewayDb().exec(`
-    CREATE TABLE IF NOT EXISTS wallet_pending (
-      chat_id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,
-      step TEXT NOT NULL,
-      wallet_name TEXT,
-      attempts INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL
-    );
-  `);
-}
-
-export function getWalletPending(chatId: number): WalletPending | null {
-  walletPendingTable();
-  const row = gatewayDb().prepare(`SELECT kind, step, wallet_name, attempts, expires_at FROM wallet_pending WHERE chat_id = ?`).get(String(chatId)) as
-    | { kind: string; step: string; wallet_name: string | null; attempts: number; expires_at: number }
-    | undefined;
-  if (!row) return null;
-  if (row.expires_at <= Date.now()) {
-    clearWalletPending(chatId);
-    return null;
-  }
-  return {
-    kind: row.kind as WalletPendingKind,
-    step: row.step as WalletPending["step"],
-    walletName: row.wallet_name ?? undefined,
-    attempts: row.attempts,
-    expiresAt: row.expires_at,
-  };
-}
-
-export function setWalletPending(chatId: number, pending: WalletPending): void {
-  walletPendingTable();
-  gatewayDb()
-    .prepare(`INSERT INTO wallet_pending (chat_id, kind, step, wallet_name, attempts, expires_at) VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(chat_id) DO UPDATE SET kind = excluded.kind, step = excluded.step, wallet_name = excluded.wallet_name, attempts = excluded.attempts, expires_at = excluded.expires_at`)
-    .run(String(chatId), pending.kind, pending.step, pending.walletName ?? null, pending.attempts, pending.expiresAt);
-}
-
-export function clearWalletPending(chatId: number): void {
-  walletPendingTable();
-  gatewayDb().prepare(`DELETE FROM wallet_pending WHERE chat_id = ?`).run(String(chatId));
-}
-
-export function isPasswordAttemptCandidate(text: string): boolean {
-  const t = text.trim();
-  if (!t || t.startsWith("/")) return false;
-  const buttons = mainReplyKeyboard().keyboard.flat().map((b) => b.text);
-  if (buttons.includes(t)) return false;
-  return true;
-}
-
 // Effective pin for one user: their own pin wins, otherwise the global
 // config pin (exactly one configured model), otherwise no pin.
 export function resolveGatewayPin(
@@ -932,7 +831,6 @@ export function handleTelegramUpdate(update: TelegramUpdate, allowedUsers: numbe
 }
 
 export interface GatewayCommandDeps {
-  chatId: number;
   doctorText: () => Promise<string>;
   scheduleText: () => string;
   alertText: () => string;
@@ -1050,8 +948,6 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
       "/alerts — price alert yang masih aktif",
       "/provider — provider & model dari daemon (tanpa kirim API key)",
       "/wallet — daftar & buat dompet (hanya pemilik; kunci tidak pernah dikirim lewat chat)",
-      "/wallet set-password — atur password dompet (dipakai semua dompet, wajib sebelum export)",
-      "/wallet export <nama> — kirim file keystore terenkripsi (perlu password dompet)",
       "Pesan lain diteruskan ke agen PANSA. Konfirmasi transaksi hanya di TUI/CLI.",
     ].join("\n");
   }
@@ -1063,8 +959,7 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
       "Dompet — perintah:",
       "/wallet list — daftar dompet",
       "/wallet create <rantai> <nama> — buat dompet baru (evm, solana, sui, aptos)",
-      "/wallet set-password — atur password dompet (dipakai semua dompet)",
-      "/wallet export <nama> — kirim file keystore terenkripsi (EVM; perlu password dompet)",
+      "Kredensial wallet (file keystore) hanya lewat dashboard: buka dashboard dari tombol menu bot, menu Dompet, tombol Unduh keystore.",
       "Nama: huruf kecil, angka, - dan _, maks 32 karakter. Private key/mnemonic tidak pernah dikirim lewat chat.",
     ].join("\n");
     try {
@@ -1074,48 +969,21 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
         if (!wallets.length) return "Dompet: (kosong)";
         return ["Dompet:", ...wallets.map((w) => `${w.name} | ${w.family} | ${w.address}`)].join("\n");
       }
-      if (args[0] === "set-password" && args.length === 1) {
-        // The password itself arrives as the NEXT free-text message and
-        // is consumed by onAgentText — never by the agent, never into
-        // history. If a password already exists, the old one is asked
-        // first (so a chat compromise alone cannot silently reset it).
-        const step = hasWalletPassword() ? "old" : "new";
-        setWalletPending(deps.chatId, {
-          kind: "set-password",
-          step,
-          attempts: 0,
-          expiresAt: Date.now() + WALLET_PENDING_TTL_MS,
-        });
-        return step === "old"
-          ? "Kirim password dompet LAMA dulu (5 menit). Pesan ini tidak diteruskan ke agent dan tidak disimpan di riwayat."
-          : "Kirim password dompet BARU (min 8 karakter, dipakai semua dompet). Pesan ini tidak diteruskan ke agent dan tidak disimpan di riwayat.";
-      }
-      if (args[0] === "export" && args.length === 2) {
-        const name = args[1];
-        if (!hasWalletPassword()) {
-          return "Belum ada password dompet. Atur dulu: /wallet set-password";
-        }
-        const wallets = await deps.walletList();
-        if (!wallets.some((w) => w.name === name)) {
-          return `Dompet tidak ditemukan: ${name}`;
-        }
-        setWalletPending(deps.chatId, {
-          kind: "export",
-          step: "password",
-          walletName: name,
-          attempts: 0,
-          expiresAt: Date.now() + WALLET_PENDING_TTL_MS,
-        });
-        return `Kirim password dompet untuk export ${name} (5 menit, maks 3 percobaan). Pesan ini tidak diteruskan ke agent dan tidak disimpan di riwayat.`;
+      if ((args[0] === "set-password" || args[0] === "export") && args.length >= 1) {
+        // Credential retrieval moved to the dashboard only: a keystore
+        // file must never travel through chat history, and a password
+        // must never be typed into chat.
+        return "Kredensial wallet hanya lewat dashboard: buka dashboard dari tombol menu bot, menu Dompet, tombol Unduh keystore — masukkan password dompet di modal yang muncul.";
       }
       if (args[0] === "create" && args.length === 3) {
         const chain = args[1];
         const name = args[2];
         if (!["evm", "solana", "sui", "aptos"].includes(chain)) return usage;
         // First-creation rule, enforced for both paths: no wallet can be
-        // made before the shared wallet password exists.
+        // made before the shared wallet password exists (set it in the
+        // dashboard, menu Dompet — it is also asked at first download).
         if (!hasWalletPassword()) {
-          return "Belum ada password dompet. Atur dulu: /wallet set-password — password ini dipakai semua dompet dan wajib dimasukkan setiap export.";
+          return "Belum ada password dompet. Atur dulu di dashboard (menu Dompet, tombol Unduh keystore akan meminta pembuatan password) — password ini dipakai semua dompet.";
         }
         const w = await deps.walletCreate(chain, name);
         return [
@@ -1124,7 +992,7 @@ export async function handleGatewayCommand(text: string, deps: GatewayCommandDep
           `Rantai: ${w.family}`,
           `Alamat: ${w.address}`,
           "Private key/mnemonic tidak dikirim lewat chat — tersimpan terenkripsi di keystore.",
-          "Untuk file keystore-nya: /wallet export " + w.name,
+          "Untuk file keystore-nya: dashboard (menu Dompet, tombol Unduh keystore).",
         ].join("\n");
       }
       return usage;
