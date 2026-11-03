@@ -23,7 +23,7 @@ import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin } from "./gateway/telegram.js";
+import { TelegramBot, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin, startAgentStatus } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -626,7 +626,24 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
           // when both have the model.
           const pinnedCfg = loadConfig();
           const pin = resolveGatewayPin(getUserModel(userId), pinnedCfg.models, pinnedCfg.pinnedSource);
-          return { text: await agentAnswer(text, tools, { onlyModel: pin.onlyModel, onlySource: pin.onlySource, signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }), keyboard: mainReplyKeyboard() };
+          // Live status message: the header typing indicator cannot show
+          // custom text, so the run's current phase is shown in-chat.
+          // Tools are wrapped per run (copies, never the shared map) so
+          // each tool start updates the status; the message is deleted
+          // in finally, whether the run succeeds or fails.
+          const status = await startAgentStatus(bot, chatId);
+          const liveTools = new Map([...tools].map(([name, tool]) => [name, {
+            ...tool,
+            execute: async (args: Record<string, unknown>) => {
+              await status.update(name);
+              return tool.execute(args);
+            },
+          }]));
+          try {
+            return { text: await agentAnswer(text, liveTools, { onlyModel: pin.onlyModel, onlySource: pin.onlySource, signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }), keyboard: mainReplyKeyboard() };
+          } finally {
+            await status.finish();
+          }
         } catch (err) {
           return { text: `Error: ${err instanceof Error ? err.message : String(err)}`, keyboard: mainReplyKeyboard() };
         }

@@ -298,6 +298,25 @@ export class TelegramBot {
     await this.api("sendChatAction", { chat_id: chatId, action });
   }
 
+  // Agent status message (a visible stand-in for the header typing
+  // indicator, whose text Telegram does NOT let a bot customize): one
+  // message sent at the start of an agent run, edited as the agent's
+  // current tool changes, deleted when the run finishes. These throw
+  // like the other methods; the tracker below swallows failures so a
+  // status problem can never break the answer itself.
+  async sendStatus(chatId: number, text: string): Promise<number> {
+    const res = await this.api<{ message_id: number }>("sendMessage", { chat_id: chatId, text });
+    return res.message_id;
+  }
+
+  async editStatus(chatId: number, messageId: number, text: string): Promise<void> {
+    await this.api("editMessageText", { chat_id: chatId, message_id: messageId, text });
+  }
+
+  async deleteStatus(chatId: number, messageId: number): Promise<void> {
+    await this.api("deleteMessage", { chat_id: chatId, message_id: messageId });
+  }
+
   // Dismiss the button spinner. Must be called for every handled
   // callback, or the button looks stuck.
   async answerCallbackQuery(callbackId: string): Promise<void> {
@@ -739,6 +758,74 @@ export function isGreeting(text: string): boolean {
     "selamat pagi", "selamat siang", "selamat sore", "selamat malam",
     "assalamualaikum", "assalamu'alaikum", "salam",
   ].includes(t);
+}
+
+// Human labels for the agent status message, keyed by tool name.
+// Unknown tools (e.g. MCP tools) fall back to their raw name so the
+// status never goes blank mid-run.
+export const AGENT_STATUS_LABELS: Record<string, string> = {
+  wallet_create: "👛 Membuat dompet…",
+  wallet_list: "👛 Memeriksa daftar dompet…",
+  analyst: "🔍 Menginvestigasi…",
+  scam_check: "🛡️ Memeriksa keamanan…",
+  tracker: "📊 Memeriksa portofolio…",
+  report: "📝 Menyusun laporan…",
+  sign_transaction: "✍️ Menyiapkan transaksi (perlu konfirmasi)…",
+  reject_transaction: "🚫 Menolak transaksi…",
+  list_confirmations: "📋 Memeriksa konfirmasi…",
+  skill_load: "📚 Memuat panduan…",
+  browser_open: "🌐 Membuka halaman…",
+};
+
+export function agentStatusLabel(toolName: string): string {
+  return AGENT_STATUS_LABELS[toolName] ?? `⚙️ Menjalankan ${toolName}…`;
+}
+
+export interface AgentStatusTracker {
+  update: (toolName: string) => Promise<void>;
+  finish: () => Promise<void>;
+}
+
+// Best-effort status lifecycle: send once, edit only when the label
+// actually changes (Telegram errors on identical edits, and rapid
+// re-edits risk flood control), delete on finish. If the initial send
+// fails the tracker silently no-ops; if delete fails it falls back to
+// editing the message to "Selesai" so no stale phase lingers.
+export async function startAgentStatus(bot: TelegramBot, chatId: number): Promise<AgentStatusTracker> {
+  let messageId: number | null = null;
+  let current = "";
+  try {
+    messageId = await bot.sendStatus(chatId, "⏳ Memproses…");
+    current = "⏳ Memproses…";
+  } catch {
+    messageId = null;
+  }
+  return {
+    update: async (toolName: string) => {
+      const label = agentStatusLabel(toolName);
+      if (messageId === null || label === current) return;
+      current = label;
+      try {
+        await bot.editStatus(chatId, messageId, label);
+      } catch {
+        // Status is cosmetic; never break the agent run for it.
+      }
+    },
+    finish: async () => {
+      if (messageId === null) return;
+      const id = messageId;
+      messageId = null;
+      try {
+        await bot.deleteStatus(chatId, id);
+      } catch {
+        try {
+          await bot.editStatus(chatId, id, "✅ Selesai.");
+        } catch {
+          // Nothing left to do; the final answer still goes out.
+        }
+      }
+    },
+  };
 }
 
 // Deterministic gateway commands: answered without an LLM call (fast,
