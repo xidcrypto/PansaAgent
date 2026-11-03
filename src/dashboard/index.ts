@@ -102,7 +102,12 @@ function loginPageHtml(error: boolean): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PANSA Dashboard — Masuk</title>
 <style>${CSS}</style>
-</head><body><div class="wrap" style="max-width:420px;margin-top:80px">
+<style>.tg-loading{display:none}.tg-autologin .tg-loading{display:block}.tg-autologin .wrap{display:none}</style>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+(function(){try{var w=window.Telegram&&window.Telegram.WebApp;if(w&&w.initData){document.documentElement.className+=" tg-autologin";}}catch(e){}})();
+</script>
+</head><body><div class="tg-loading" style="max-width:420px;margin:80px auto 0;text-align:center"><h1>PANSA Dashboard</h1><p style="font-weight:700">Membuka dashboard…</p></div><div class="wrap" style="max-width:420px;margin-top:80px">
 <h1>PANSA Dashboard</h1>
 <div class="card"><form id="login-form">
 <div class="label" style="margin-bottom:6px">Password dashboard</div>
@@ -112,9 +117,8 @@ ${error ? `<p class="note" style="color:#cf222e;font-weight:700">Password salah.
 <p class="note" id="login-msg" style="color:#cf222e;font-weight:700"></p>
 <p class="note">Password default: <code>password</code> — ganti lewat env PANSA_DASHBOARD_PASSWORD.</p>
 </form></div></div>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
-(function(){var w=window.Telegram&&window.Telegram.WebApp;if(!w||!w.initData){return;}try{w.ready();w.expand();}catch(e){}fetch("api/telegram-webapp-auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData:w.initData})}).then(function(r){if(r.ok){var p=location.pathname;location=p.endsWith("/login")?p.slice(0,-6)||"/":"/";}else{var m=document.getElementById("login-msg");if(m){m.textContent="Login otomatis Telegram gagal — silakan masuk dengan password.";}}}).catch(function(){});})();
+(function(){var w=window.Telegram&&window.Telegram.WebApp;if(!w||!w.initData){return;}try{w.ready();w.expand();}catch(e){}function showForm(msg){document.documentElement.className=document.documentElement.className.replace(" tg-autologin","");var m=document.getElementById("login-msg");if(m){m.textContent=msg;}}fetch("api/telegram-webapp-auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData:w.initData})}).then(function(r){if(r.ok){var p=location.pathname;location=p.endsWith("/login")?p.slice(0,-6)||"/":"/";}else{showForm("Login otomatis Telegram gagal — silakan masuk dengan password.");}}).catch(function(){showForm("Gagal menghubungi server — cek koneksi lalu coba lagi.");});})();
 </script>
 <script>
 document.getElementById("login-form").addEventListener("submit",async e=>{
@@ -1081,9 +1085,12 @@ export async function startDashboard(opts: {
           console.error(`Web App auth OK via variant ${result.variant ?? "unknown"}`);
           const session = randomBytes(32).toString("hex");
           sessions.add(session);
+          // Persistent for Web App opens: the owner reopens the mini app
+          // often, and a session cookie would die with the WebView,
+          // forcing a login-page round-trip every time. 30 days.
           res.writeHead(200, {
             "Content-Type": "application/json",
-            "Set-Cookie": `pansa_session=${session}; HttpOnly; Path=/; SameSite=Lax`,
+            "Set-Cookie": `pansa_session=${session}; HttpOnly; Path=/; SameSite=Lax; Max-Age=2592000`,
           });
           res.end(JSON.stringify({ ok: true }));
         }
