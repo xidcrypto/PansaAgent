@@ -193,7 +193,7 @@ export function formatConfirmationCard(req: ConfirmationRequest): string {
 │ To: ${truncate(req.tx.to).padEnd(46)}│
 │ Value: ${(req.tx.value ?? "0").padEnd(55)}│
 │ Gas Limit: ${(req.tx.gasLimit ?? "auto").padEnd(51)}│
-├─────────────────────────────────────────────────────────────────────────────┤
+${req.tx.note ? `│ Catatan: ${req.tx.note.slice(0, 55).padEnd(51)}│\n` : ""}├─────────────────────────────────────────────────────────────────────────────┤
 │ Simulation: ${req.simulation.ok ? "✓ Success" : "✗ Failed"} ${req.simulation.gasUsed ? `(gas: ${req.simulation.gasUsed})` : req.simulation.error ? `(${req.simulation.error})` : ""}
 │ Policy Check: ${req.policyCheck.ok ? "✓ Passed" : `✗ ${req.policyCheck.error}`}
 ├─────────────────────────────────────────────────────────────────────────────┤

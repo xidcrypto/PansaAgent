@@ -1,12 +1,14 @@
 import { loadViem } from "./viem-lazy.js";
-import { loadConfig } from "./config.js";
+import { resolveRpc } from "./rpc/index.js";
 
 // EVM RPC access shared by balance lookup, testnet detection, simulation
-// and broadcast. The endpoint is never hardcoded: explicit argument wins,
-// then PANSA_EVM_RPC, then evmRpc in ~/.pansa/config.json. No endpoint
-// means no EVM RPC feature (callers must fail closed, never fake data).
+// and broadcast. Resolution (see src/rpc/index.ts): explicit argument >
+// PANSA_EVM_RPC > dashboard default for BSC (56) > legacy evmRpc in
+// ~/.pansa/config.json. No endpoint means no EVM RPC feature (callers
+// must fail closed, never fake data). Callers that need a different EVM
+// chain resolve it via resolveRpc(chainId) directly.
 export function resolveEvmRpc(explicit?: string): string | undefined {
-  return explicit ?? process.env.PANSA_EVM_RPC ?? loadConfig().evmRpc;
+  return resolveRpc("56", explicit);
 }
 
 export async function evmPublicClient(rpcUrl: string) {

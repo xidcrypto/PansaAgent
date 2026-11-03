@@ -83,6 +83,15 @@ export interface PansaConfig {
   // used (rate-limited under heavy use; publicnode is NOT a valid default
   // — it blocks indexed token methods without a personal token).
   solanaRpc?: string;
+  // RPC registry (see src/rpc/index.ts): per-chain defaults chosen in the
+  // dashboard + user-added custom endpoints. A dashboard default beats
+  // the legacy evmRpc/solanaRpc fields above. Built-in public endpoints
+  // ship as selectable candidates; they are never an implicit default
+  // (no endpoint for a chain means no feature for that chain).
+  rpcs?: {
+    defaults?: Record<string, string>;
+    custom?: Array<{ id: string; chain: string; name: string; url: string }>;
+  };
   policy?: PolicyConfig;
   gateways?: Record<string, GatewayConfig>;
   mcpServers?: Record<string, string>;

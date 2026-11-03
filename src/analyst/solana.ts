@@ -8,7 +8,7 @@
 // unknown, never filled with a guess.
 
 import type { AnalystCheck, AnalystVerdict } from "./index.js";
-import { loadConfig } from "../config.js";
+import { resolveRpc } from "../rpc/index.js";
 
 const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -133,7 +133,7 @@ export function createSolanaRpc(rpcUrl: string, fetchFn: typeof fetch = fetch): 
 // token methods (getTokenSupply/getTokenLargestAccounts) without a
 // personal token, which would make every mint read UNVERIFIED.
 export function resolveSolanaRpc(explicit?: string): string {
-  return explicit ?? process.env.PANSA_SOLANA_RPC ?? loadConfig().solanaRpc ?? "https://api.mainnet-beta.solana.com";
+  return resolveRpc("solana", explicit) ?? "https://api.mainnet-beta.solana.com";
 }
 
 interface SolanaDexRow {

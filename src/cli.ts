@@ -29,6 +29,11 @@ import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
 import type { ScoutRpc } from "./scout/index.js";
 import { analyzeContract, formatAnalystReport } from "./analyst/index.js";
+import { getPrice, formatPriceResult } from "./market/price.js";
+import { getCexMarket, formatCexMarket, type CexAction } from "./market/cex.js";
+import { prepareEvmSwap, prepareSolanaSwap } from "./swap/index.js";
+import { listRpcs, addCustomRpc, removeCustomRpc, setDefaultRpc, normalizeChainKey, CHAIN_NAMES, effectiveDefault } from "./rpc/index.js";
+import { formatConfirmationCard, getConfirmation } from "./signer/policy.js";
 import { analyzeSolanaMint, createSolanaRpc, formatSolanaReport, isSolanaAddress, resolveSolanaRpc } from "./analyst/solana.js";
 import type { AnalystRpc } from "./analyst/index.js";
 import { getPortfolio, getWalletPortfolio, formatPortfolio, dexscreenerTokenPrice, dexscreenerNativePrice } from "./portfolio/index.js";
@@ -85,6 +90,13 @@ Usage:
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
   pansa analyst <kontrak-atau-url> [wallet]  Audit kontrak read-only EVM atau mint Solana (verdict CLEAR/CAUTION/TRAP/UNVERIFIED)
+  pansa price <alamat-token-atau-simbol>  Harga live (DEX via Dexscreener, simbol via Binance)
+  pansa cex <simbol> <price|ticker|depth|klines> [interval] [limit]  Data market Binance spot (tanpa API key)
+  pansa swap <dompet> <chain> <fromToken> <toToken> <jumlah> [slippageBps]  Siapkan swap (konfirmasi manusia, EVM via Paraswap; Solana quote saja)
+  pansa rpc list [rantai]  Daftar RPC (bawaan + custom) + default per rantai
+  pansa rpc add <rantai> <nama> <url>  Tambah RPC custom
+  pansa rpc default <id>  Jadikan RPC sebagai default rantainya
+  pansa rpc remove <id>  Hapus RPC custom
   pansa mcp [list|tools|call]
   pansa browse <url>       Baca halaman web (butuh browser: true + playwright)
   pansa setup              Buat direktori + config/policy default
@@ -255,6 +267,14 @@ export async function main(argv: string[]): Promise<number> {
       return scoutCmd(rest);
     case "analyst":
       return analystCmd(rest);
+    case "price":
+      return priceCmd(rest);
+    case "cex":
+      return cexCmd(rest);
+    case "swap":
+      return swapCmd(rest);
+    case "rpc":
+      return rpcCmd(rest);
     case "mcp":
       return mcpCmd(rest);
     case "browse":
@@ -900,6 +920,145 @@ async function analystCmd(rest: string[]): Promise<number> {
   const report = await analyzeContract(resolved.address, rpc, { wallet, chainId });
   process.stdout.write(`${formatAnalystReport(report)}\n`);
   return 0;
+}
+
+async function priceCmd(rest: string[]): Promise<number> {
+  const target = rest[0];
+  if (!target) {
+    process.stderr.write("Usage: pansa price <alamat-token-atau-simbol>\n");
+    return 1;
+  }
+  const res = await getPrice(target);
+  if (!res.ok || !res.data) {
+    process.stderr.write(`${res.error}\n`);
+    return 1;
+  }
+  process.stdout.write(`${formatPriceResult(res.data)}\n`);
+  return 0;
+}
+
+async function cexCmd(rest: string[]): Promise<number> {
+  const symbol = rest[0];
+  const action = rest[1] as CexAction;
+  if (!symbol || !action) {
+    process.stderr.write("Usage: pansa cex <simbol> <price|ticker|depth|klines> [interval] [limit]\n");
+    return 1;
+  }
+  const limit = rest[3] === undefined ? undefined : Number(rest[3]);
+  const res = await getCexMarket(symbol, action, { interval: rest[2], limit: Number.isFinite(limit) ? limit : undefined });
+  if (!res.ok || !res.data) {
+    process.stderr.write(`${res.error}\n`);
+    return 1;
+  }
+  process.stdout.write(`${formatCexMarket(res.data)}\n`);
+  return 0;
+}
+
+async function swapCmd(rest: string[]): Promise<number> {
+  const [wallet, chain, fromToken, toToken, amount, slippageRaw] = rest;
+  if (!wallet || !chain || !fromToken || !toToken || !amount) {
+    process.stderr.write("Usage: pansa swap <dompet> <chain> <fromToken> <toToken> <jumlah> [slippageBps]\n");
+    return 1;
+  }
+  const slippageBps = slippageRaw === undefined ? undefined : Number(slippageRaw);
+  if (chain === "solana") {
+    const inputDecimals = Number(rest[5]);
+    if (!Number.isFinite(inputDecimals)) {
+      process.stderr.write("Usage: pansa swap <dompet> solana <inputMint> <outputMint> <jumlah> <inputDecimals> [slippageBps]\n");
+      return 1;
+    }
+    const res = await prepareSolanaSwap({ inputMint: fromToken, outputMint: toToken, amount, inputDecimals, slippageBps });
+    if (!res.ok || !res.data) {
+      process.stderr.write(`${res.error}\n`);
+      return 1;
+    }
+    process.stdout.write(
+      `Jupiter quote: ${res.data.quote.inAmount} -> ${res.data.quote.outAmount} (min ${res.data.quote.otherAmountThreshold}, impact ${res.data.quote.priceImpactPct}%)\n${res.data.execution}\n`,
+    );
+    return 0;
+  }
+  if (!/^\d+$/.test(chain)) {
+    process.stderr.write(`Chain tidak dikenal: ${chain}. Pakai chainId EVM (56, 1, …).\n`);
+    return 1;
+  }
+  const res = await prepareEvmSwap({ wallet, chainId: chain, fromToken, toToken, amount, slippageBps });
+  if (!res.ok || !res.data) {
+    process.stderr.write(`${res.error}\n`);
+    return 1;
+  }
+  if (res.data.kind === "needsApproval") {
+    process.stdout.write(
+      `${res.data.note}\nApproval calldata: ${res.data.approveData}\nBuat konfirmasi approval via: pansa sign (atau tool sign_transaction) ke ${res.data.token} dengan data di atas, konfirmasi, lalu ulangi swap.\n`,
+    );
+    return 0;
+  }
+  const conf = getConfirmation(res.data.confirmationId);
+  process.stdout.write(
+    `${res.data.note}\nRouter: ${res.data.router} · Gas: ${res.data.gas} · RPC: ${res.data.rpcUrl}\n${conf ? formatConfirmationCard(conf) : `Confirmation: ${res.data.confirmationId}`}\nKonfirmasi manusia: pansa confirm ${res.data.confirmationId}\n`,
+  );
+  return 0;
+}
+
+async function rpcCmd(rest: string[]): Promise<number> {
+  const sub = rest[0];
+  if (sub === "list") {
+    const chains = rest[1] ? [normalizeChainKey(rest[1])] : Object.keys(CHAIN_NAMES);
+    for (const chain of chains) {
+      if (!chain) {
+        process.stderr.write(`Rantai tidak dikenal: ${rest[1]}\n`);
+        return 1;
+      }
+      process.stdout.write(`${CHAIN_NAMES[chain]} (${chain}) — default: ${effectiveDefault(chain) ?? "-"}\n`);
+      for (const e of listRpcs(chain)) {
+        process.stdout.write(`  ${e.isDefault ? "*" : " "} [${e.id}] ${e.name} ${e.url}${e.builtin ? " (bawaan)" : ""}\n`);
+      }
+    }
+    return 0;
+  }
+  if (sub === "add") {
+    const [, chain, name, url] = rest;
+    if (!chain || !name || !url) {
+      process.stderr.write("Usage: pansa rpc add <rantai> <nama> <url>\n");
+      return 1;
+    }
+    const res = addCustomRpc(chain, name, url);
+    if (!res.ok || !res.entry) {
+      process.stderr.write(`${res.error}\n`);
+      return 1;
+    }
+    process.stdout.write(`RPC ditambah: [${res.entry.id}] ${res.entry.name} ${res.entry.url}\n`);
+    return 0;
+  }
+  if (sub === "default") {
+    const id = rest[1];
+    if (!id) {
+      process.stderr.write("Usage: pansa rpc default <id>\n");
+      return 1;
+    }
+    const res = setDefaultRpc(id);
+    if (!res.ok || !res.entry) {
+      process.stderr.write(`${res.error}\n`);
+      return 1;
+    }
+    process.stdout.write(`Default ${CHAIN_NAMES[res.entry.chain]}: ${res.entry.name} ${res.entry.url}\n`);
+    return 0;
+  }
+  if (sub === "remove") {
+    const id = rest[1];
+    if (!id) {
+      process.stderr.write("Usage: pansa rpc remove <id>\n");
+      return 1;
+    }
+    const res = removeCustomRpc(id);
+    if (!res.ok) {
+      process.stderr.write(`${res.error}\n`);
+      return 1;
+    }
+    process.stdout.write(`RPC dihapus: ${id}\n`);
+    return 0;
+  }
+  process.stderr.write("Usage: pansa rpc <list|add|default|remove> …\n");
+  return 1;
 }
 
 async function mcpCmd(rest: string[]): Promise<number> {

@@ -24,6 +24,10 @@ export interface TxRequest {
   // sign flow from the RPC endpoint; never guessed.
   chainId?: number;
   rpcUrl?: string;
+  // Human-readable trade summary (e.g. a swap quote). Shown on the
+  // confirmation card so a human sees the real trade, not just the
+  // native value (which is 0 for ERC20 swaps).
+  note?: string;
 }
 
 export interface TxSimulation {

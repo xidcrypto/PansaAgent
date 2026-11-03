@@ -4,6 +4,8 @@ import { createTrackerTool, createReportTool } from "./tracker/tools.js";
 import { createBAWTool } from "./skills/baw.js";
 import { createScamCheckTool } from "./research/index.js";
 import { createSkillLoadTool } from "./skills/loader.js";
+import { createPriceTool, createCexTool } from "./market/tools.js";
+import { createSwapTool } from "./swap/tools.js";
 import { runAnalyst } from "./analyst/run.js";
 import { loadConfig } from "./config.js";
 import { openPage } from "./browser/index.js";
@@ -27,6 +29,7 @@ import { McpClient } from "./mcp/client.js";
 // that order and stays out.
 export function stripGatewayUnsafeTools(tools: Map<string, Tool>, opts: { allowConfirm: boolean }): void {
   tools.delete("baw");
+  tools.delete("swap");
   if (!opts.allowConfirm) {
     tools.delete("sign_transaction");
     tools.delete("reject_transaction");
@@ -46,6 +49,9 @@ export function buildAgentTools(): Map<string, Tool> {
     createBAWTool(),
     createScamCheckTool(),
     createAnalystTool(),
+    createPriceTool(),
+    createCexTool(),
+    createSwapTool(),
     createSkillLoadTool(),
     createBrowserTool(),
   ];

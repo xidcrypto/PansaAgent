@@ -43,6 +43,7 @@ import { getUsageTotals } from "../usage.js";
 import type { UsageTotals } from "../usage.js";
 import { verifyTelegramInitData, initDataDiag, hasWalletPassword, setWalletPassword, verifyWalletPassword, TelegramBot } from "../gateway/telegram.js";
 import { getSignerClient } from "../signer/client.js";
+import { listRpcs, addCustomRpc, removeCustomRpc, setDefaultRpc, CHAIN_NAMES } from "../rpc/index.js";
 import { secretsLoad, secretsGet } from "../secrets.js";
 import { loadConfig } from "../config.js";
 
@@ -473,7 +474,7 @@ const fmtP=n=>n===null||n===undefined?"—":n.toFixed(1)+"%";
 const fmtU=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+"h "+h+"j":h>0?h+"j "+m+"m":m+"m";};
 const trunc=(s,n)=>!s?"—":s.length>n?s.slice(0,n)+"…":s;
 const badge=st=>{const m={pending:["warn","pending"],active:["ok","aktif"],done:["ok","selesai"],triggered:["warn","terpicu"],failed:["bad","gagal"],cancelled:["muted","batal"]};const [c,l]=m[st]||["muted",st];return '<span class="badge '+c+'">'+esc(l)+'</span>';};
-const SECTIONS=["status","provider","model","usage","dompet","tugas","alert","log"];
+const SECTIONS=["status","provider","rpc","model","usage","dompet","tugas","alert","log"];
 const dashPrefix=location.pathname.endsWith("/") ? location.pathname.slice(0, -1) : location.pathname;
 function showSection(id){
   if(!SECTIONS.includes(id)) id="status";
@@ -485,6 +486,47 @@ document.querySelectorAll("nav a[data-sec]").forEach(a=>{
 });
 window.addEventListener("hashchange",()=>showSection(location.hash.replace("#","")));
 showSection(location.hash.replace("#","")||"status");
+function rpcRowsHtml(chains){
+  let html="";
+  for(const c of chains){
+    for(const e of c.entries){
+      html+='<tr><td>'+esc(c.name)+'</td><td>'+esc(e.name)+(e.builtin?' (bawaan)':'')+'</td><td class="mono">'+esc(e.url)+'</td><td>'+(e.isDefault?'★ default':'')+'</td><td>'+(e.isDefault?'':('<button type="button" data-act="default" data-id="'+esc(e.id)+'">Jadikan default</button> '))+(e.builtin?'':('<button type="button" data-act="del" data-id="'+esc(e.id)+'">Hapus</button>'))+'</td></tr>';
+    }
+  }
+  return html||'<tr><td colspan="5">(tidak ada RPC)</td></tr>';
+}
+async function refreshRpcs(){
+  try{
+    const j=await api("api/rpcs","GET");
+    document.getElementById("rpc-rows").innerHTML=rpcRowsHtml(j.chains||[]);
+  }catch(e){ document.getElementById("rpc-rows").innerHTML='<tr><td colspan="5">Gagal memuat RPC: '+esc(e.message||String(e))+'</td></tr>'; }
+}
+document.getElementById("rpc-rows").addEventListener("click",async e=>{
+  const btn=e.target.closest("button[data-act]"); if(!btn||btn.disabled) return;
+  const id=btn.getAttribute("data-id"); const act=btn.getAttribute("data-act");
+  const msg=document.getElementById("rpc-msg");
+  btn.disabled=true;
+  try{
+    if(act==="default"){ await api("api/rpcs/"+encodeURIComponent(id)+"/default","POST"); toast("Default RPC diubah."); }
+    else if(act==="del"){ await api("api/rpcs/"+encodeURIComponent(id),"DELETE"); toast("RPC dihapus."); }
+    await refreshRpcs();
+  }catch(err){ msg.textContent=err.message||String(err); }
+  btn.disabled=false;
+});
+document.getElementById("rpc-form").addEventListener("submit",async e=>{
+  e.preventDefault();
+  const msg=document.getElementById("rpc-msg");
+  const chain=document.getElementById("rpc-chain").value;
+  const name=document.getElementById("rpc-name").value;
+  const url=document.getElementById("rpc-url").value;
+  try{
+    const r=await api("api/rpcs","POST",{chain,name,url});
+    msg.textContent="RPC ditambah: "+(r.entry?r.entry.name:"");
+    document.getElementById("rpc-name").value=""; document.getElementById("rpc-url").value="";
+    await refreshRpcs();
+  }catch(err){ msg.textContent=err.message||String(err); }
+});
+refreshRpcs();
 function providerStatusHtml(p){
   const total=p.sources.reduce((n,s)=>n+s.count,0);
   if(!p.reachable) return 'Daemon LLM: <b>tidak terjangkau</b> ('+esc(p.base)+') — daftar provider/model kosong sampai daemon jalan.';
@@ -943,6 +985,7 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 <aside class="sidebar"><div class="brand">PANSA<small>Dashboard</small></div><nav>
 <a href="#status" data-sec="status" class="active">Status</a>
 <a href="#provider" data-sec="provider">Provider <span class="dot-nav${providers.reachable ? "" : " off"}" id="dot-provider"></span></a>
+<a href="#rpc" data-sec="rpc">RPC</a>
 <a href="#model" data-sec="model">Model</a>
 <a href="#usage" data-sec="usage">Penggunaan</a>
 <a href="#dompet" data-sec="dompet">Dompet</a>
@@ -952,7 +995,7 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 </nav></aside>
 <main><div class="wrap">
 <header><button id="sidebar-toggle" type="button" aria-label="Buka/tutup sidebar">☰</button><h1>PANSA Dashboard</h1><div class="live"><span id="dot" class="dot"></span><span id="updated">live · refresh tiap 3 detik</span><button id="refresh" type="button">Perbarui sekarang</button><button id="logout" type="button">Keluar</button></div></header>
-<p class="note">Halaman ini tidak bisa memindahkan dana, sign, atau approve apa pun — yang bisa diubah hanya registry provider custom.</p>
+<p class="note">Halaman ini tidak bisa memindahkan dana, sign, atau approve apa pun — yang bisa diubah hanya registry provider custom dan daftar RPC.</p>
 <section id="sec-status">
 <h2>Status</h2>
 <div class="grid">
@@ -1004,6 +1047,35 @@ ${customRows(customProviders)}</tbody></table></div>
 <label style="font-weight:700"><input id="pf-enabled" type="checkbox" checked> Aktif</label>
 <div style="margin-top:14px"><button type="submit">Simpan provider</button> <button type="button" id="provider-cancel">Batal</button></div>
 <p class="note" id="provider-msg"></p>
+</form></div>
+</section>
+<section id="sec-rpc">
+<h2>RPC</h2>
+<p class="note">Endpoint publik bawaan per rantai + RPC custom. Tanda ★ = default yang dipakai. Default bisa diganti kapan saja; RPC bawaan tidak bisa dihapus.</p>
+<div class="tablewrap"><table><tr><th>Rantai</th><th>Nama</th><th>URL</th><th>Default</th><th>Aksi</th></tr><tbody id="rpc-rows">
+<tr><td colspan="5">Memuat…</td></tr>
+</tbody></table></div>
+<h2>Tambah RPC custom</h2>
+<div class="card"><form id="rpc-form">
+<div class="label" style="margin-bottom:6px">Rantai</div>
+<select id="rpc-chain" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px">
+<option value="56">BNB Smart Chain (56)</option>
+<option value="1">Ethereum (1)</option>
+<option value="137">Polygon (137)</option>
+<option value="42161">Arbitrum One (42161)</option>
+<option value="10">Optimism (10)</option>
+<option value="8453">Base (8453)</option>
+<option value="43114">Avalanche C-Chain (43114)</option>
+<option value="solana">Solana</option>
+<option value="sui">Sui</option>
+<option value="aptos">Aptos</option>
+</select>
+<div class="label" style="margin-bottom:6px">Nama</div>
+<input id="rpc-name" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="mis. RPC pribadi">
+<div class="label" style="margin-bottom:6px">URL</div>
+<input id="rpc-url" style="width:100%;border:3px solid #000;padding:10px 12px;font:inherit;box-sizing:border-box;margin-bottom:10px" placeholder="https://…">
+<div style="margin-top:6px"><button type="submit">Tambah RPC</button></div>
+<p class="note" id="rpc-msg"></p>
 </form></div>
 </section>
 <section id="sec-model">
@@ -1394,6 +1466,58 @@ export async function startDashboard(opts: {
             fail(400, err instanceof Error ? err.message : String(err));
           }
           return;
+        } catch (err) {
+          fail(400, err instanceof Error ? err.message : String(err));
+        }
+        return;
+      }
+      // RPC registry (session-gated).
+      if (url.pathname === "/api/rpcs" || url.pathname.startsWith("/api/rpcs/")) {
+        const rest = url.pathname.slice("/api/rpcs".length);
+        const ok = (obj: unknown) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(obj));
+        };
+        const fail = (code: number, error: string) => {
+          res.writeHead(code, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error }));
+        };
+        try {
+          if (rest === "" && req.method === "GET") {
+            const chains = Object.keys(CHAIN_NAMES).map((chain) => ({ chain, name: CHAIN_NAMES[chain], entries: listRpcs(chain) }));
+            ok({ ok: true, chains });
+            return;
+          }
+          if (rest === "" && req.method === "POST") {
+            const body = (await readJsonBody(req)) as { chain?: unknown; name?: unknown; url?: unknown };
+            const r = addCustomRpc(String(body.chain ?? ""), String(body.name ?? ""), String(body.url ?? ""));
+            if (!r.ok || !r.entry) {
+              fail(400, r.error ?? "Gagal menambah RPC.");
+              return;
+            }
+            ok({ ok: true, entry: r.entry });
+            return;
+          }
+          const idMatch = /^\/([^/]+)(\/default)?$/.exec(rest);
+          if (idMatch && req.method === "DELETE" && !idMatch[2]) {
+            const r = removeCustomRpc(decodeURIComponent(idMatch[1]));
+            if (!r.ok) {
+              fail(400, r.error ?? "Gagal menghapus RPC.");
+              return;
+            }
+            ok({ ok: true });
+            return;
+          }
+          if (idMatch && req.method === "POST" && idMatch[2]) {
+            const r = setDefaultRpc(decodeURIComponent(idMatch[1]));
+            if (!r.ok || !r.entry) {
+              fail(400, r.error ?? "Gagal mengatur default.");
+              return;
+            }
+            ok({ ok: true, entry: r.entry });
+            return;
+          }
+          fail(404, "Route RPC tidak dikenal.");
         } catch (err) {
           fail(400, err instanceof Error ? err.message : String(err));
         }
