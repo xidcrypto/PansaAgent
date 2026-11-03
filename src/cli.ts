@@ -79,6 +79,7 @@ Usage:
   pansa update             Cek pembaruan (hanya info, tidak auto-install)
   pansa gateway [status|start|allow|deny|notify]
   pansa set gateway <token-bot>  Simpan token bot Telegram (terenkripsi) + aktifkan gateway
+  pansa set usertg <id-telegram>  Daftarkan ID Telegram pemilik ke bot
   pansa schedule [add|list|cancel|run-once|watch]
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
@@ -345,13 +346,37 @@ function enableGatewayConfig(): void {
   saveConfig(cfg);
 }
 
+// Owner access list for the personal agent's Telegram bot. Shared by
+// `pansa gateway allow` and `pansa set usertg` so the two spellings
+// cannot drift apart.
+function allowTelegramUser(id: number): void {
+  const c = loadConfig();
+  const g = c.gateways?.telegram ?? { enabled: true, adapter: "telegram", allowlist: [], features: [] };
+  const users = new Set(g.allowedUsers ?? []);
+  users.add(id);
+  g.allowedUsers = [...users];
+  c.gateways = { ...(c.gateways ?? {}), telegram: g };
+  saveConfig(c);
+}
+
 // One-line gateway setup (personal agent): `pansa set gateway <token>`.
 // Stores the bot token in the encrypted secrets store (never printed,
 // never in config) and enables the gateway. The passphrase comes from
 // PANSA_PASSPHRASE, same as the other secret commands.
 export async function setCmd(rest: string[]): Promise<number> {
+  if (rest[0] === "usertg") {
+    const id = Number(rest[1]);
+    if (!Number.isInteger(id) || id <= 0) {
+      process.stderr.write("Usage: pansa set usertg <telegram-user-id-numerik>\n");
+      return 1;
+    }
+    allowTelegramUser(id);
+    process.stdout.write(`User ID ${id} didaftarkan: bisa memakai bot.\n`);
+    process.stdout.write("Lalu jalankan: pansa gateway start\n");
+    return 0;
+  }
   if (rest[0] !== "gateway" || !rest[1]) {
-    process.stderr.write("Usage: pansa set gateway <token-bot>\n");
+    process.stderr.write("Usage: pansa set gateway <token-bot> | pansa set usertg <telegram-user-id-numerik>\n");
     return 1;
   }
   const token = rest[1];
@@ -395,18 +420,17 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
       process.stderr.write(`Usage: pansa gateway ${sub} <telegram-user-id-numerik>\n`);
       return 1;
     }
+    if (sub === "allow") {
+      allowTelegramUser(id);
+      process.stdout.write(`User ID ${id} didaftarkan: bisa memakai bot.\n`);
+      return 0;
+    }
     const c = loadConfig();
     const g = c.gateways?.telegram ?? { enabled: true, adapter: "telegram", allowlist: [], features: [] };
     const users = new Set(g.allowedUsers ?? []);
-    if (sub === "allow") {
-      users.add(id);
-      g.allowedUsers = [...users];
-      process.stdout.write(`User ID ${id} didaftarkan: bisa memakai bot.\n`);
-    } else {
-      users.delete(id);
-      g.allowedUsers = [...users];
-      process.stdout.write(`User ID ${id} dihapus dari akses bot.\n`);
-    }
+    users.delete(id);
+    g.allowedUsers = [...users];
+    process.stdout.write(`User ID ${id} dihapus dari akses bot.\n`);
     c.gateways = { ...(c.gateways ?? {}), telegram: g };
     saveConfig(c);
     return 0;
