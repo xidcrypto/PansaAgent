@@ -2,11 +2,7 @@ import { SkillsManager, Skill } from "./manager.js";
 import { scamCheck } from "../research/index.js";
 import { createTrackerTool, createReportTool } from "../tracker/tools.js";
 import { createSignTool } from "../signer/tools.js";
-import { analyzeContract } from "../analyst/index.js";
-import { createSolanaRpc, resolveSolanaRpc, analyzeSolanaMint, isSolanaAddress } from "../analyst/solana.js";
-import type { AnalystRpc } from "../analyst/index.js";
-import { resolveScoutTarget } from "../scout/index.js";
-import { resolveEvmRpc, evmPublicClient } from "../evm-rpc.js";
+import { runAnalyst } from "../analyst/run.js";
 
 // Scout Skill - NOT IMPLEMENTED. There is no on-chain scanning in this
 // codebase, so scout honestly reports that instead of returning a stub
@@ -156,30 +152,10 @@ class AnalystSkill implements Skill {
 
 	async execute(args: Record<string, unknown>) {
 		const target = String(args.address ?? args.target ?? "");
-		if (!target) return { ok: false, data: null, error: "Butuh address kontrak (atau URL proyek)." };
-		if (isSolanaAddress(target)) {
-			const rpc = createSolanaRpc(resolveSolanaRpc());
-			const report = await analyzeSolanaMint(target, rpc);
-			return { ok: true, data: report };
-		}
-		const resolved = await resolveScoutTarget(target).catch(() => null);
-		if (!resolved) return { ok: false, data: null, error: "Target tidak dapat diurai: butuh alamat kontrak 0x…, mint Solana (base58), atau URL proyek." };
-		const rpcUrl = resolveEvmRpc();
-		if (!rpcUrl) return { ok: false, data: null, error: "RPC EVM tidak terkonfigurasi (set PANSA_EVM_RPC atau config)." };
-		const client = await evmPublicClient(rpcUrl);
-		const rpc: AnalystRpc = {
-			getCode: (address: string) => client.getCode({ address: address as `0x${string}` }),
-			call: async (to: string, data: string) => {
-				const res = await client.call({ to: to as `0x${string}`, data: data as `0x${string}` });
-				return res.data ?? "0x";
-			},
-			getStorageAt: async (address: string, slot: string) =>
-				(await client.getStorageAt({ address: address as `0x${string}`, slot: slot as `0x${string}` })) ?? "0x",
-		};
-		const chainId = await client.getChainId().catch(() => undefined);
 		const wallet = typeof args.wallet === "string" && args.wallet ? args.wallet : undefined;
-		const report = await analyzeContract(resolved.address, rpc, { wallet, chainId });
-		return { ok: true, data: report };
+		const res = await runAnalyst(target, { wallet });
+		if (!res.ok) return { ok: false, data: null, error: res.error };
+		return { ok: true, data: res.data };
 	}
 }
 

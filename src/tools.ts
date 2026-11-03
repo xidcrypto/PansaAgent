@@ -4,6 +4,7 @@ import { createTrackerTool, createReportTool } from "./tracker/tools.js";
 import { createBAWTool } from "./skills/baw.js";
 import { createScamCheckTool } from "./research/index.js";
 import { createSkillLoadTool } from "./skills/loader.js";
+import { runAnalyst } from "./analyst/run.js";
 import { loadConfig } from "./config.js";
 import { openPage } from "./browser/index.js";
 import { McpClient } from "./mcp/client.js";
@@ -21,11 +22,34 @@ export function buildAgentTools(): Map<string, Tool> {
     createReportTool(),
     createBAWTool(),
     createScamCheckTool(),
+    createAnalystTool(),
     createSkillLoadTool(),
     createBrowserTool(),
   ];
   for (const t of list) tools.set(t.name, t);
   return tools;
+}
+
+// Direct analyst tool for the agent. Without it the agent could only read
+// skill docs via skill_load (which has no analyst doc) and could never
+// actually audit a contract — it looped calling docs until the step cap.
+export function createAnalystTool(): Tool {
+  return {
+    name: "analyst",
+    description:
+      "Audit a token/mint from on-chain evidence and return a CLEAR, CAUTION, TRAP, or UNVERIFIED verdict with checks. Use this tool (not skill_load) for any contract audit request. EVM contract address (0x…) or Solana mint (base58). Read-only, never signs.",
+    parameters: {
+      type: "object",
+      properties: { address: { type: "string" } },
+      required: ["address"],
+    },
+    signs: false,
+    execute: async (args: Record<string, unknown>) => {
+      const res = await runAnalyst(String(args.address ?? ""));
+      if (!res.ok) return { ok: false, data: null, error: res.error };
+      return { ok: true, data: res.data };
+    },
+  };
 }
 
 // Optional browser tool. It exists in every agent's tool set but refuses
