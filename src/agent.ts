@@ -65,6 +65,24 @@ export class Agent {
     this.chatFn = opts.chatFn ?? chat;
   }
 
+  // Distinguish a user cancel (Ctrl+C) from a watchdog timeout: a cancel
+  // ends the run gracefully, a timeout is an error the caller must see
+  // (gateway error reply, scheduler failed status) instead of silence.
+  private abortKind(signal?: AbortSignal): "cancel" | "timeout" | null {
+    if (!signal?.aborted) return null;
+    const name = (signal.reason as { name?: unknown } | undefined)?.name;
+    return name === "TimeoutError" ? "timeout" : "cancel";
+  }
+
+  private throwIfTimeout(signal?: AbortSignal): void {
+    if (this.abortKind(signal) === "timeout") {
+      throw new LlmError("Agent kehabisan waktu. Coba lagi dengan prompt yang lebih spesifik.", {
+        code: "timeout",
+        retryable: true,
+      });
+    }
+  }
+
   // Pin the agent to one model (used by the TUI /model command). Takes
   // effect on the next run, since chat() re-reads cfg per call.
   setModel(model: string): void {
@@ -79,7 +97,9 @@ export class Agent {
     while (steps < 14) {
       // Ctrl+C abort (U3): checked between steps and before tool work.
       // An in-flight LLM request is aborted via the signal passed to
-      // chat(); the loop exits before acting on its result.
+      // chat(); the loop exits before acting on its result. A watchdog
+      // timeout is an error, not a graceful cancel (see throwIfTimeout).
+      this.throwIfTimeout(opts.signal);
       if (opts.signal?.aborted) return "Generasi dibatalkan.";
       steps++;
       const toolsDefs: ToolDef[] = [...this.tools.values()].map((t) => ({
@@ -101,6 +121,7 @@ export class Agent {
           this.cfg,
         );
       } catch (err) {
+        this.throwIfTimeout(opts.signal);
         if (opts.signal?.aborted) return "Generasi dibatalkan.";
         if (err instanceof LlmError && err.code === "no_model") {
           return "Model tidak tersedia. Jalankan `pansa setup` atau pastikan bansos-router berjalan.";
@@ -118,6 +139,7 @@ export class Agent {
       if (signing.length > 0) {
         // serialize signing, one at a time
         for (const tc of signing) {
+          this.throwIfTimeout(opts.signal);
           if (opts.signal?.aborted) return "Generasi dibatalkan.";
           const res = await this.executeOne(tc);
           this.context.addToolResult(tc.function.name, res.data, res.ok, res.error, tc.id);

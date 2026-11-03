@@ -287,7 +287,7 @@ async function gatewayListModels(): Promise<string[]> {
 // `schedule watch` must not spawn a fresh MCP server per task.
 let cachedMcpTools: Promise<Map<string, import("./agent.js").Tool>> | null = null;
 
-async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>, opts?: { onlyModel?: string; onlySource?: "default" | "custom" }): Promise<string> {
+async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>, opts?: { onlyModel?: string; onlySource?: "default" | "custom"; signal?: AbortSignal }): Promise<string> {
   const cfg = loadConfig();
   await ensureDaemon();
   const live = await fetchLiveModels().catch((): string[] => []);
@@ -303,8 +303,14 @@ async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.j
     liveModels: live,
     cfg: { preferReasoning: cfg.preferReasoning, preferCheap: cfg.preferCheap, models: cfg.models, providers: cfg.providers, onlyModel: opts?.onlyModel, onlySource: opts?.onlySource },
   });
-  return agent.run(prompt);
+  return agent.run(prompt, { signal: opts?.signal });
 }
+
+// Watchdog for unattended agent runs (gateway chat, scheduled tasks): a
+// stalled upstream stream must not hang the answer — or the whole watch
+// loop — forever. 15 minutes is generous for a 14-step agent run; on
+// timeout the agent throws (gateway replies Error, scheduler marks failed).
+const AGENT_TIMEOUT_MS = 15 * 60 * 1000;
 
 async function updateCmd(): Promise<number> {
   const info = await checkUpdate();
@@ -532,7 +538,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {
           const pinnedCfg = loadConfig();
           const pinned = pinnedCfg.models;
           const onlyModel = pinned?.length === 1 ? pinned[0] : undefined;
-          return { text: await agentAnswer(text, tools, { onlyModel, onlySource: pinnedCfg.pinnedSource }), keyboard: mainReplyKeyboard() };
+          return { text: await agentAnswer(text, tools, { onlyModel, onlySource: pinnedCfg.pinnedSource, signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }), keyboard: mainReplyKeyboard() };
         } catch (err) {
           return { text: `Error: ${err instanceof Error ? err.message : String(err)}`, keyboard: mainReplyKeyboard() };
         }
@@ -606,7 +612,7 @@ async function scheduleCmd(rest: string[]): Promise<number> {
     return ok ? 0 : 1;
   }
   if (sub === "run-once") {
-    const due = await runDue((prompt) => agentAnswer(prompt));
+    const due = await runDue((prompt) => agentAnswer(prompt, undefined, { signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }));
     if (!due.length) {
       process.stdout.write("Tidak ada tugas jatuh tempo.\n");
       return 0;
@@ -633,7 +639,7 @@ async function scheduleCmd(rest: string[]): Promise<number> {
         }, { once: true });
       });
     while (!abort.signal.aborted) {
-      const due = await runDue((prompt) => agentAnswer(prompt));
+      const due = await runDue((prompt) => agentAnswer(prompt, undefined, { signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }));
       for (const t of due) {
         process.stdout.write(`${t.id}: dijalankan @ ${new Date().toISOString()}.\n`);
       }
