@@ -38,7 +38,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult, ProviderApi } from "../providers/index.js";
 import { getUsageTotals } from "../usage.js";
 import type { UsageTotals } from "../usage.js";
-import { verifyTelegramInitData, initDataDiag, hasWalletPassword, setWalletPassword, verifyWalletPassword } from "../gateway/telegram.js";
+import { verifyTelegramInitData, initDataDiag, hasWalletPassword, setWalletPassword, verifyWalletPassword, TelegramBot } from "../gateway/telegram.js";
 import { getSignerClient } from "../signer/client.js";
 import { secretsLoad, secretsGet } from "../secrets.js";
 import { loadConfig } from "../config.js";
@@ -798,8 +798,19 @@ document.getElementById("wallet-modal-submit").addEventListener("click",async fu
       var j=await r.json().catch(function(){return {};});
       throw new Error(j.error||("HTTP "+r.status));
     }
-    var blob=await r.blob();
     var cd=r.headers.get("Content-Disposition")||"";
+    if(!cd){
+      // Bot delivery: the file went to the owner's Telegram chat as a
+      // document (no browser download involved).
+      var dj=await r.json().catch(function(){return {};});
+      if(dj.delivered==="telegram"){
+        toast("Keystore "+walletModal.name+" terkirim ke Telegram — buka chat bot untuk mengunduh file-nya.","ok");
+        walletModalHide();
+        return;
+      }
+      throw new Error("Respons export tidak dikenali.");
+    }
+    var blob=await r.blob();
     var m=/filename="([^"]+)"/.exec(cd);
     var filename=m?m[1]:("pansa-wallet-"+walletModal.name+"-keystore.json");
     var a=document.createElement("a");
@@ -1349,7 +1360,7 @@ export async function startDashboard(opts: {
             return;
           }
           if (!verifyWalletPassword(password)) {
-            fail(401, "Password dompet salah.");
+            fail(403, "Password dompet salah.");
             return;
           }
           const res2 = await getSignerClient().request("wallet.export", {
@@ -1362,6 +1373,31 @@ export async function startDashboard(opts: {
             return;
           }
           const r = res2.result as { name: string; family: string; address: string; filename: string; json: string };
+          // Delivery: the bot sends the file as a Telegram document to
+          // the owner — on mobile Telegram that reliably arrives as a
+          // file, while a WebView blob download renders as text (seen
+          // on iOS). Only the ENCRYPTED file travels through chat; the
+          // wallet password never does. If bot delivery is unavailable
+          // (no token, no allowed user, send error), fall back to the
+          // browser download so the user still gets the file.
+          const pass = process.env.PANSA_PASSPHRASE;
+          const botToken = pass ? secretsGet(secretsLoad(pass), "telegram_bot_token") : undefined;
+          const ownerId = loadConfig().gateways?.telegram?.allowedUsers?.[0];
+          if (botToken && typeof ownerId === "number") {
+            try {
+              await new TelegramBot(botToken).sendDocument(
+                ownerId,
+                r.filename,
+                Buffer.from(r.json, "utf8"),
+                `Keystore ${r.name} (${r.address}) — import ke MetaMask/Rabby dengan password dompet.`,
+              );
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true, delivered: "telegram", filename: r.filename }));
+              return;
+            } catch {
+              // Fall through to the browser download below.
+            }
+          }
           res.writeHead(200, {
             "Content-Type": "application/json",
             "Content-Disposition": `attachment; filename="${r.filename}"`,

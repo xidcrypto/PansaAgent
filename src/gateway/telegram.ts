@@ -320,6 +320,40 @@ export class TelegramBot {
 
   // Send a file (e.g. an encrypted keystore) as a document. Multipart,
   // unlike api() which is JSON-only; same 429 retry discipline.
+  // Send a file as a Telegram document. Used ONLY for the encrypted
+  // wallet keystore delivery from the dashboard export flow: the file
+  // is encrypted (useless without the wallet password, which is never
+  // typed into chat), and this is the delivery channel that actually
+  // arrives as a file on mobile — WebView blob downloads render as
+  // text instead on iOS Telegram.
+  async sendDocument(chatId: number, filename: string, content: Buffer, caption?: string): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const form = new FormData();
+      form.append("chat_id", String(chatId));
+      form.append("document", new Blob([content], { type: "application/json" }), filename);
+      if (caption) form.append("caption", caption);
+      const res = await this.fetchFn(`https://api.telegram.org/bot${this.token}/sendDocument`, {
+        method: "POST",
+        body: form,
+        signal: AbortSignal.timeout(30000),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        description?: string;
+        error_code?: number;
+        parameters?: { retry_after?: number };
+      };
+      if (data.ok) return;
+      if (data.error_code === 429 && attempt === 0) {
+        const waitMs = Math.min(Math.max(0, data.parameters?.retry_after ?? 0), 60) * 1000;
+        if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      throw new Error(`Telegram sendDocument gagal: ${data.description ?? res.status}`);
+    }
+    throw new Error("Telegram sendDocument gagal: 429 berulang");
+  }
+
   // Dismiss the button spinner. Must be called for every handled
   // callback, or the button looks stuck.
   async answerCallbackQuery(callbackId: string): Promise<void> {
