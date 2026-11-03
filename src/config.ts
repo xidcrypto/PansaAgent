@@ -74,6 +74,9 @@ export interface PansaConfig {
   // EVM JSON-RPC endpoint for balance lookup, testnet detection,
   // simulation and broadcast. Env PANSA_EVM_RPC overrides this.
   evmRpc?: string;
+  // Solana JSON-RPC endpoint for the Solana analyst. Env PANSA_SOLANA_RPC
+  // overrides this; without either, a public mainnet endpoint is used.
+  solanaRpc?: string;
   policy?: PolicyConfig;
   gateways?: Record<string, GatewayConfig>;
   mcpServers?: Record<string, string>;

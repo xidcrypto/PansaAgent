@@ -3,6 +3,7 @@ import { scamCheck } from "../research/index.js";
 import { createTrackerTool, createReportTool } from "../tracker/tools.js";
 import { createSignTool } from "../signer/tools.js";
 import { analyzeContract } from "../analyst/index.js";
+import { createSolanaRpc, resolveSolanaRpc, analyzeSolanaMint, isSolanaAddress } from "../analyst/solana.js";
 import type { AnalystRpc } from "../analyst/index.js";
 import { resolveScoutTarget } from "../scout/index.js";
 import { resolveEvmRpc, evmPublicClient } from "../evm-rpc.js";
@@ -142,11 +143,12 @@ class MintSkill implements Skill {
 }
 
 // Analyst Skill - delegates to the real on-chain analyst module. Read-only:
-// it never signs or moves funds. It needs a configured EVM RPC and fails
-// closed without one, instead of returning a guessed verdict.
+// it never signs or moves funds. EVM targets need a configured EVM RPC and
+// fail closed without one; Solana mints use resolveSolanaRpc (public
+// default, overridable). Routes by address format, never by guess.
 class AnalystSkill implements Skill {
 	name = "analyst";
-	description = "Audit a token or contract from on-chain evidence (proxy, owner, blacklist, pause, verification, liquidity) and return a CLEAR, CAUTION, TRAP, or UNVERIFIED verdict";
+	description = "Audit a token or contract from on-chain evidence and return a CLEAR, CAUTION, TRAP, or UNVERIFIED verdict. EVM: proxy, owner, blacklist, pause, verification, liquidity. Solana: mint/freeze authority, holder concentration, liquidity";
 	parameters = {
 		address: { type: "string" },
 		wallet: { type: "string" },
@@ -155,8 +157,13 @@ class AnalystSkill implements Skill {
 	async execute(args: Record<string, unknown>) {
 		const target = String(args.address ?? args.target ?? "");
 		if (!target) return { ok: false, data: null, error: "Butuh address kontrak (atau URL proyek)." };
+		if (isSolanaAddress(target)) {
+			const rpc = createSolanaRpc(resolveSolanaRpc());
+			const report = await analyzeSolanaMint(target, rpc);
+			return { ok: true, data: report };
+		}
 		const resolved = await resolveScoutTarget(target).catch(() => null);
-		if (!resolved) return { ok: false, data: null, error: "Target tidak dapat diurai: butuh alamat kontrak 0x… atau URL proyek." };
+		if (!resolved) return { ok: false, data: null, error: "Target tidak dapat diurai: butuh alamat kontrak 0x…, mint Solana (base58), atau URL proyek." };
 		const rpcUrl = resolveEvmRpc();
 		if (!rpcUrl) return { ok: false, data: null, error: "RPC EVM tidak terkonfigurasi (set PANSA_EVM_RPC atau config)." };
 		const client = await evmPublicClient(rpcUrl);

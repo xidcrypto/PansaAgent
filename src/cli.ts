@@ -30,6 +30,7 @@ import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
 import type { ScoutRpc } from "./scout/index.js";
 import { analyzeContract, formatAnalystReport } from "./analyst/index.js";
+import { analyzeSolanaMint, createSolanaRpc, formatSolanaReport, isSolanaAddress, resolveSolanaRpc } from "./analyst/solana.js";
 import type { AnalystRpc } from "./analyst/index.js";
 import { getPortfolio, getWalletPortfolio, formatPortfolio, dexscreenerTokenPrice, dexscreenerNativePrice } from "./portfolio/index.js";
 import type { PortfolioDeps } from "./portfolio/index.js";
@@ -81,7 +82,7 @@ Usage:
   pansa schedule [add|list|cancel|run-once|watch]
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
-  pansa analyst <kontrak-atau-url> [wallet]  Audit kontrak read-only (verdict CLEAR/CAUTION/TRAP/UNVERIFIED)
+  pansa analyst <kontrak-atau-url> [wallet]  Audit kontrak read-only EVM atau mint Solana (verdict CLEAR/CAUTION/TRAP/UNVERIFIED)
   pansa mcp [list|tools|call]
   pansa browse <url>       Baca halaman web (butuh browser: true + playwright)
   pansa setup              Buat direktori + config/policy default
@@ -733,9 +734,15 @@ async function analystCmd(rest: string[]): Promise<number> {
     process.stderr.write("Usage: pansa analyst <contract-address-atau-url> [wallet]\n");
     return 1;
   }
+  if (isSolanaAddress(target)) {
+    const rpc = createSolanaRpc(resolveSolanaRpc());
+    const report = await analyzeSolanaMint(target, rpc);
+    process.stdout.write(`${formatSolanaReport(report)}\n`);
+    return 0;
+  }
   const resolved = await resolveScoutTarget(target).catch(() => null);
   if (!resolved) {
-    process.stderr.write("Target tidak dapat diurai: butuh alamat kontrak 0x… atau URL proyek yang memuat alamat kontrak.\n");
+    process.stderr.write("Target tidak dapat diurai: butuh alamat kontrak 0x… atau mint Solana (base58) atau URL proyek yang memuat alamat kontrak.\n");
     return 1;
   }
   const rpcUrl = resolveEvmRpc();
