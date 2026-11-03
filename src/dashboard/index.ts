@@ -1078,6 +1078,7 @@ export async function startDashboard(opts: {
           res.writeHead(botToken ? 401 : 503, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: botToken ? "Web App auth gagal." : "Web App auth tidak tersedia." }));
         } else {
+          console.error(`Web App auth OK via variant ${result.variant ?? "unknown"}`);
           const session = randomBytes(32).toString("hex");
           sessions.add(session);
           res.writeHead(200, {

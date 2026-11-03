@@ -64,29 +64,85 @@ export function initDataDiag(initData: string, nowMs: number = Date.now()): stri
   const authDate = Number(params.get("auth_date"));
   const authAge = Number.isFinite(authDate) ? Math.round(nowMs / 1000 - authDate) : null;
   const lens = keys.map((k) => `${k}:${(params.get(k) ?? "").length}`).join(",");
-  return `keys=${keys.join(",")}|sig=${params.has("signature") ? 1 : 0}|authAge=${authAge}|lens=${lens}`;
+  let userKeys = "";
+  try {
+    const user = JSON.parse(params.get("user") ?? "") as Record<string, unknown>;
+    userKeys = `|userKeys=${Object.keys(user).sort().join(",")}`;
+  } catch {
+    userKeys = "|userKeys=unparsable";
+  }
+  return `keys=${keys.join(",")}|sig=${params.has("signature") ? 1 : 0}|authAge=${authAge}|lens=${lens}${userKeys}`;
 }
 
-// Telegram Web App auth: validate initData the way Telegram documents
-// it, then gate on the owner-managed allowedUsers list. initData is a
-// URL query string; the check string is all fields except "hash" AND
-// "signature" (newer clients send signature for Ed25519 validation; it
-// is NOT part of the HMAC input), sorted by key, joined with "\n" as
-// key=value (decoded values). The HMAC key is NOT SHA256(botToken):
-// per Telegram's docs it is HMAC-SHA256(key="WebAppData",
+// Telegram Web App auth: validate initData, then gate on the
+// owner-managed allowedUsers list. initData is a URL query string. The
+// documented check string is all fields except "hash" AND "signature"
+// (newer clients send signature for Ed25519 validation; it is NOT part
+// of the HMAC input), sorted by key, joined with "\n" as key=value
+// (decoded values). The HMAC key is HMAC-SHA256(key="WebAppData",
 // message=botToken), and the check is HMAC-SHA256 of the check string
 // with that key, in hex. (An earlier version used SHA256(botToken) and
 // every real login failed with bad_hash; the unit test missed it
 // because it computed the hash the same wrong way.)
-// Data older than 24h (or from the future beyond clock skew) is
-// rejected, so a captured initData cannot work forever. The reason code
-// is for server logs only — never log initData itself.
+//
+// Live reality (2026-11-03): a real iOS client initData still failed
+// bad_hash with the documented construction, even though its field set
+// was exactly auth_date/hash/query_id/signature/user and the data was
+// 4 seconds old. The documented construction therefore cannot be the
+// only one in the wild — different clients encode values differently
+// (notably: URLSearchParams turns a literal "+" into a space, and some
+// clients may hash the still-encoded values). So verification tries
+// several constructions and accepts the one that matches. This is
+// sound: every variant still requires the HMAC with the bot token,
+// which only Telegram holds, so a match proves that construction is
+// what Telegram used for this initData. The matched variant is
+// returned for server logs. Data older than 24h (or from the future
+// beyond clock skew) is rejected, so a captured initData cannot work
+// forever. The reason code is for server logs only — never log initData
+// itself.
+type InitDataEntries = Array<[string, string]>;
+
+function parseInitDataEntries(initData: string, mode: "decoded" | "raw" | "plus"): InitDataEntries | null {
+  try {
+    if (mode === "decoded") {
+      const params = new URLSearchParams(initData);
+      return [...params.entries()];
+    }
+    const out: InitDataEntries = [];
+    for (const part of initData.split("&")) {
+      if (!part) continue;
+      const eq = part.indexOf("=");
+      const rawKey = eq === -1 ? part : part.slice(0, eq);
+      const rawVal = eq === -1 ? "" : part.slice(eq + 1);
+      // "plus" decodes %XX but keeps a literal "+" as "+" (URLSearchParams
+      // would turn it into a space); "raw" keeps values still-encoded.
+      out.push([decodeURIComponent(rawKey), mode === "plus" ? decodeURIComponent(rawVal) : rawVal]);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function hashMatches(entries: InitDataEntries, excludeSignature: boolean, secret: Buffer, hash: string): boolean {
+  const keys = [...new Set(entries.map(([k]) => k))].sort();
+  const first = new Map<string, string>();
+  for (const [k, v] of entries) if (!first.has(k)) first.set(k, v);
+  const pairs = keys
+    .filter((k) => k !== "hash" && (!excludeSignature || k !== "signature"))
+    .map((k) => `${k}=${first.get(k) ?? ""}`);
+  const check = createHmac("sha256", secret).update(pairs.join("\n")).digest("hex");
+  const a = Buffer.from(check, "utf8");
+  const b = Buffer.from(hash, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function verifyTelegramInitData(
   initData: string,
   botToken: string,
   allowedUsers: number[],
   nowMs: number = Date.now(),
-): { ok: boolean; userId?: number; reason?: string } {
+): { ok: boolean; userId?: number; reason?: string; variant?: string } {
   const fail = (reason: string) => ({ ok: false as const, reason });
   if (!initData || !botToken) return fail("bad_request");
   let params: URLSearchParams;
@@ -101,16 +157,24 @@ export function verifyTelegramInitData(
   if (!Number.isFinite(authDate) || authDate <= 0) return fail("stale");
   const nowSec = nowMs / 1000;
   if (authDate > nowSec + 300 || nowSec - authDate > 24 * 60 * 60) return fail("stale");
-  const pairs: string[] = [];
-  for (const key of [...params.keys()].sort()) {
-    if (key === "hash" || key === "signature") continue;
-    pairs.push(`${key}=${params.get(key) ?? ""}`);
-  }
   const secret = createHmac("sha256", "WebAppData").update(botToken).digest();
-  const check = createHmac("sha256", secret).update(pairs.join("\n")).digest("hex");
-  const a = Buffer.from(check, "utf8");
-  const b = Buffer.from(hash, "utf8");
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return fail("bad_hash");
+  const variants: Array<{ name: string; mode: "decoded" | "raw" | "plus"; excludeSignature: boolean }> = [
+    { name: "decoded", mode: "decoded", excludeSignature: true },
+    { name: "decoded+sig", mode: "decoded", excludeSignature: false },
+    { name: "plus", mode: "plus", excludeSignature: true },
+    { name: "plus+sig", mode: "plus", excludeSignature: false },
+    { name: "raw", mode: "raw", excludeSignature: true },
+    { name: "raw+sig", mode: "raw", excludeSignature: false },
+  ];
+  let matched: string | null = null;
+  for (const v of variants) {
+    const entries = parseInitDataEntries(initData, v.mode);
+    if (entries && hashMatches(entries, v.excludeSignature, secret, hash)) {
+      matched = v.name;
+      break;
+    }
+  }
+  if (!matched) return fail("bad_hash");
   let userId: number | undefined;
   try {
     const user = JSON.parse(params.get("user") ?? "") as { id?: unknown };
@@ -120,7 +184,7 @@ export function verifyTelegramInitData(
   }
   if (userId === undefined) return fail("bad_request");
   if (!allowedUsers.includes(userId)) return fail("user_not_allowed");
-  return { ok: true, userId };
+  return { ok: true, userId, variant: matched };
 }
 
 export function splitMessage(text: string, limit = 4096): string[] {
