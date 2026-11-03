@@ -94,7 +94,7 @@ export class Agent {
       let result;
       try {
         result = await this.chatFn(
-          { messages, tools: toolsDefs, toolChoice: this.tools.size > 0 ? "required" : "auto", kind: "reasoning", onChunk: this.onChunk, signal: opts.signal },
+          { messages, tools: toolsDefs, toolChoice: "auto", kind: "reasoning", onChunk: this.onChunk, signal: opts.signal },
           this.liveModels,
           this.cfg,
         );

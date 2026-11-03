@@ -541,10 +541,12 @@ export interface GatewayCommandDeps {
   providerText: () => Promise<string>;
 }
 
-// Sapaan ringan dijawab deterministik (tanpa LLM): agen dengan
-// toolChoice "required" tidak bisa menjawab sapaan dalam teks biasa
-// — ia dipaksa memanggil tool sampai batas langkah. Hanya sapaan
-// persis (bukan "halo, tolong ...") yang masuk sini.
+// Sapaan ringan dijawab deterministik (tanpa LLM) untuk kecepatan.
+// Dulu agen memakai toolChoice "required" sehingga tidak bisa menjawab
+// sapaan dalam teks biasa (dipaksa memanggil tool sampai batas langkah);
+// sejak perbaikan toolChoice "auto", agen juga bisa menjawab teks biasa,
+// tapi sapaan persis tetap deterministik. Hanya sapaan persis (bukan
+// "halo, tolong ...") yang masuk sini.
 export function isGreeting(text: string): boolean {
   const t = text.trim().toLowerCase().replace(/[!?.]+$/, "");
   return [
