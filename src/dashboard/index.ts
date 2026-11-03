@@ -102,12 +102,12 @@ function loginPageHtml(error: boolean): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PANSA Dashboard — Masuk</title>
 <style>${CSS}</style>
-<style>.tg-loading{display:none}.tg-autologin .tg-loading{display:block}.tg-autologin .wrap{display:none}</style>
+<style>.tg-loading{display:none}.tg-autologin .tg-loading{display:flex;position:fixed;inset:0;z-index:9999;background:#fff;flex-direction:column;align-items:center;justify-content:center;gap:16px}.tg-autologin .wrap{display:none}.tg-loading .pl-spin{width:48px;height:48px;border:4px solid #000;border-top-color:#FFDC58;border-radius:50%;animation:pansa-spin 1s linear infinite}@keyframes pansa-spin{to{transform:rotate(360deg)}}.tg-loading p{font-weight:700}</style>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
 (function(){try{var w=window.Telegram&&window.Telegram.WebApp;if(w&&w.initData){document.documentElement.className+=" tg-autologin";}}catch(e){}})();
 </script>
-</head><body><div class="tg-loading" style="max-width:420px;margin:80px auto 0;text-align:center"><h1>PANSA Dashboard</h1><p style="font-weight:700">Membuka dashboard…</p></div><div class="wrap" style="max-width:420px;margin-top:80px">
+</head><body><div class="tg-loading"><div class="pl-spin"></div><p>Membuka dashboard…</p></div><div class="wrap" style="max-width:420px;margin-top:80px">
 <h1>PANSA Dashboard</h1>
 <div class="card"><form id="login-form">
 <div class="label" style="margin-bottom:6px">Password dashboard</div>
@@ -448,7 +448,8 @@ main{flex:1;min-width:0}
 @media (min-width:821px){.layout.sidebar-collapsed .sidebar{display:none}}
 @media (max-width:820px){.layout{flex-direction:column}.sidebar{position:fixed;top:0;left:0;height:100vh;z-index:10;transform:translateX(-105%);border-right:3px solid #000;box-shadow:8px 0 0 rgba(0,0,0,.2)}.layout.sidebar-open .sidebar{transform:none}.layout.sidebar-open .backdrop{display:block;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:9}}`;
 
-const JS = `const esc=s=>String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+const JS = `(function(){var o=document.getElementById("page-loading");if(o){var done=false;function hide(){if(done){return;}done=true;o.className+=" done";setTimeout(function(){o.style.display="none";},500);}if(document.readyState==="complete"){hide();}else{window.addEventListener("load",hide);}setTimeout(hide,5000);}})();
+const esc=s=>String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const fmtB=n=>n>=(1<<30)?(n/(1<<30)).toFixed(1)+" GB":n>=(1<<20)?(n/(1<<20)).toFixed(0)+" MB":(n/1024).toFixed(0)+" KB";
 const fmtP=n=>n===null||n===undefined?"—":n.toFixed(1)+"%";
 const fmtU=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+"h "+h+"j":h>0?h+"j "+m+"m":m+"m";};
@@ -817,7 +818,8 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 <script>
 (function(){var w=window.Telegram&&window.Telegram.WebApp;if(!w){return;}try{w.ready();w.expand();}catch(e){}})();
 </script>
-</head><body><div class="layout">
+<style>#page-loading{position:fixed;inset:0;z-index:9999;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;transition:opacity .4s}#page-loading.done{opacity:0;pointer-events:none}#page-loading .pl-spin{width:48px;height:48px;border:4px solid #000;border-top-color:#FFDC58;border-radius:50%;animation:pansa-spin 1s linear infinite}@keyframes pansa-spin{to{transform:rotate(360deg)}}#page-loading p{font-weight:700}</style>
+</head><body><div id="page-loading"><div class="pl-spin"></div><p>Memuat dashboard…</p></div><noscript><style>#page-loading{display:none}</style></noscript><div class="layout">
 <div class="backdrop" id="backdrop"></div>
 <aside class="sidebar"><div class="brand">PANSA<small>Dashboard</small></div><nav>
 <a href="#status" data-sec="status" class="active">Status</a>
