@@ -669,6 +669,55 @@ export function setUserModel(userId: number, model: string, source?: "default" |
     .run(String(userId), model, source ?? null);
 }
 
+// Per-chat conversation memory. Without it the gateway agent is
+// stateless per message: a follow-up answer ("Jhody" after "what name?")
+// arrives context-free, and the crypto-only scope instruction refuses
+// it as unrelated. History fixes that class of bug — the last few
+// exchanges ride along with each new agent run. Bounded (last 20 rows
+// kept, 16 sent, 1000 chars each) so tokens stay predictable; stored
+// in the gateway DB next to the pins, owner-only via the allowedUsers
+// gate. History is best-effort: callers swallow DB failures.
+export interface ChatHistoryEntry {
+  role: "user" | "assistant";
+  text: string;
+}
+
+const CHAT_HISTORY_KEEP = 20;
+const CHAT_HISTORY_TEXT_MAX = 1000;
+
+function chatHistoryTable(): void {
+  gatewayDb().exec(`
+    CREATE TABLE IF NOT EXISTS gateway_chat_history (
+      chat_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      text TEXT NOT NULL
+    );
+  `);
+}
+
+export function appendChatHistory(chatId: number, role: "user" | "assistant", text: string): void {
+  chatHistoryTable();
+  const db = gatewayDb();
+  db.prepare(`INSERT INTO gateway_chat_history (chat_id, role, text) VALUES (?, ?, ?)`).run(
+    String(chatId),
+    role,
+    text.slice(0, CHAT_HISTORY_TEXT_MAX),
+  );
+  db.prepare(
+    `DELETE FROM gateway_chat_history WHERE chat_id = ? AND rowid NOT IN (
+      SELECT rowid FROM gateway_chat_history WHERE chat_id = ? ORDER BY rowid DESC LIMIT ?
+    )`,
+  ).run(String(chatId), String(chatId), CHAT_HISTORY_KEEP);
+}
+
+export function getChatHistory(chatId: number, limit = 16): ChatHistoryEntry[] {
+  chatHistoryTable();
+  const rows = gatewayDb()
+    .prepare(`SELECT role, text FROM gateway_chat_history WHERE chat_id = ? ORDER BY rowid DESC LIMIT ?`)
+    .all(String(chatId), limit) as Array<{ role: string; text: string }>;
+  return rows.reverse().map((r) => ({ role: r.role === "assistant" ? "assistant" : "user", text: r.text }));
+}
+
 // Effective pin for one user: their own pin wins, otherwise the global
 // config pin (exactly one configured model), otherwise no pin.
 export function resolveGatewayPin(

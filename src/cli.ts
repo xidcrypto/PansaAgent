@@ -23,7 +23,7 @@ import type { RestoreRequest, RunSession } from "./session-flow.js";
 import { checkUpdate } from "./update.js";
 import { scheduleTask, listScheduled, cancelScheduled, runDue } from "./scheduler/index.js";
 import { addAlert, listAlerts, cancelAlert, checkAlerts } from "./alerts/index.js";
-import { TelegramBot, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin, startAgentStatus } from "./gateway/telegram.js";
+import { TelegramBot, runGatewayLoop, gatewayConfirmAllowed, handleGatewayCommand, handleGatewayCallback, handleReplyKeyboardText, connectTemplate, mainReplyKeyboard, getUserModel, setUserModel, resolveGatewayPin, startAgentStatus, getChatHistory, appendChatHistory } from "./gateway/telegram.js";
 import { McpClient } from "./mcp/client.js";
 import { openPage } from "./browser/index.js";
 import { resolveScoutTarget, inspectContract, dexscreenerPrice, formatScoutReport } from "./scout/index.js";
@@ -286,17 +286,23 @@ async function gatewayListModels(): Promise<string[]> {
 }
 
 // Headless agent run returning the final answer (scheduler, gateway).
-// No streaming, no session persistence: the caller owns reporting.
+// No streaming: the caller owns reporting.
 // The MCP-augmented tool set is built once per process: a long-running
 // `schedule watch` must not spawn a fresh MCP server per task.
+// Gateway runs may carry short per-chat history (opts.history); the
+// scheduler passes none (one-shot prompts, no chat to continue).
 let cachedMcpTools: Promise<Map<string, import("./agent.js").Tool>> | null = null;
 
-async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>, opts?: { onlyModel?: string; onlySource?: "default" | "custom"; signal?: AbortSignal }): Promise<string> {
+async function agentAnswer(prompt: string, tools?: Map<string, import("./agent.js").Tool>, opts?: { onlyModel?: string; onlySource?: "default" | "custom"; signal?: AbortSignal; history?: Array<{ role: "user" | "assistant"; text: string }> }): Promise<string> {
   const cfg = loadConfig();
   await ensureDaemon();
   const live = await fetchLiveModels().catch((): string[] => []);
   const ctx = new ContextManager();
   for (const f of loadContextFiles()) ctx.appendFileContext(f);
+  for (const h of opts?.history ?? []) {
+    if (h.role === "assistant") ctx.addAssistant(h.text);
+    else ctx.addUser(h.text);
+  }
   if (!tools) {
     if (!cachedMcpTools) cachedMcpTools = buildAgentToolsWithMcp();
     tools = await cachedMcpTools;
@@ -631,6 +637,16 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
           // Tools are wrapped per run (copies, never the shared map) so
           // each tool start updates the status; the message is deleted
           // in finally, whether the run succeeds or fails.
+          // Per-chat history: without it a follow-up answer ("Jhody"
+          // after "what name?") arrives context-free and the crypto-only
+          // scope refuses it as unrelated. History is best-effort.
+          const history = (() => {
+            try {
+              return getChatHistory(chatId);
+            } catch {
+              return [];
+            }
+          })();
           const status = await startAgentStatus(bot, chatId);
           const liveTools = new Map([...tools].map(([name, tool]) => [name, {
             ...tool,
@@ -639,11 +655,21 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
               return tool.execute(args);
             },
           }]));
+          let answer: string;
           try {
-            return { text: await agentAnswer(text, liveTools, { onlyModel: pin.onlyModel, onlySource: pin.onlySource, signal: AbortSignal.timeout(AGENT_TIMEOUT_MS) }), keyboard: mainReplyKeyboard() };
+            answer = await agentAnswer(text, liveTools, { onlyModel: pin.onlyModel, onlySource: pin.onlySource, signal: AbortSignal.timeout(AGENT_TIMEOUT_MS), history });
+          } catch (err) {
+            answer = `Error: ${err instanceof Error ? err.message : String(err)}`;
           } finally {
             await status.finish();
           }
+          try {
+            appendChatHistory(chatId, "user", text);
+            appendChatHistory(chatId, "assistant", answer);
+          } catch {
+            // History must never break the reply.
+          }
+          return { text: answer, keyboard: mainReplyKeyboard() };
         } catch (err) {
           return { text: `Error: ${err instanceof Error ? err.message : String(err)}`, keyboard: mainReplyKeyboard() };
         }
