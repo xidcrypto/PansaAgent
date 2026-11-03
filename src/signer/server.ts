@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline";
 import { keystoreCreate, keystoreList, keystoreUnlock, walletRegistryAdd, walletRegistryLoad, WalletRecord, ChainFamily } from "./keystore.js";
+import { buildV3Keystore } from "./keystore-export.js";
 import { evmAccountFromMnemonic } from "./evm.js";
 import { solanaAccountFromMnemonic } from "./solana.js";
 import { suiAccountFromMnemonic } from "./sui.js";
@@ -60,6 +61,33 @@ function handle(req: RpcRequest): RpcResponse {
       }
       case "keystore.list": {
         return { id: req.id, ok: true, result: { names: keystoreList() } };
+      }
+      // Export: builds an encrypted V3 keystore INSIDE the signer, so
+      // the plaintext private key never leaves this process. The caller
+      // (gateway) only ever handles the resulting JSON file. EVM only:
+      // V3 is an Ethereum format; other chains have no equivalent here.
+      case "wallet.export": {
+        const { name, passphrase, exportPassword } = (req.params ?? {}) as {
+          name: string; passphrase: string; exportPassword: string;
+        };
+        if (typeof exportPassword !== "string" || !exportPassword) {
+          return { id: req.id, ok: false, error: "export password required" };
+        }
+        const payload = keystoreUnlock(name, passphrase);
+        if (payload.family !== "evm") {
+          return { id: req.id, ok: false, error: "export hanya tersedia untuk dompet EVM saat ini" };
+        }
+        const acc = accountFor(payload.family, payload.mnemonic, payload.path);
+        const v3 = buildV3Keystore(acc.address, acc.privateKey, exportPassword);
+        return {
+          id: req.id,
+          ok: true,
+          result: {
+            name, family: payload.family, address: acc.address,
+            filename: `pansa-wallet-${name}-keystore.json`,
+            json: JSON.stringify(v3, null, 2),
+          },
+        };
       }
       case "wallet.unlock": {
         const { name, passphrase } = (req.params ?? {}) as { name: string; passphrase: string };

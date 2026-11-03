@@ -9,6 +9,7 @@ import { walletRegistryLoad, defaultPath, validateName } from "./keystore.js";
 import { getSignerClient } from "./client.js";
 import { generateMnemonic } from "../mnemonic.js";
 import { loadConfig, saveConfig } from "../config.js";
+import { hasWalletPassword } from "../gateway/telegram.js";
 
 export function createSignTool(): Tool {
   return {
@@ -222,6 +223,17 @@ export function createWalletCreateTool(deps?: WalletCreateDeps): Tool {
       }
       if (typeof name !== "string" || !name) {
         return { ok: false, data: null, error: "Missing wallet name" };
+      }
+      // First-creation rule, same as the deterministic path: no wallet
+      // can be made before the shared wallet password exists. The model
+      // must direct the user to /wallet set-password, never ask for the
+      // password itself (it must never see one).
+      try {
+        if (!hasWalletPassword()) {
+          return { ok: false, data: null, error: "WALLET_PASSWORD_REQUIRED: belum ada password dompet. Minta user mengatur dulu lewat /wallet set-password, lalu ulangi pembuatan." };
+        }
+      } catch {
+        return { ok: false, data: null, error: "Tidak bisa memeriksa password dompet. Coba lagi." };
       }
       try {
         validateName(name);
