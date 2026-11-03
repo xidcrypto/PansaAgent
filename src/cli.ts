@@ -80,6 +80,7 @@ Usage:
   pansa gateway [status|start|allow|deny|notify]
   pansa set gateway <token-bot>  Simpan token bot Telegram (terenkripsi) + aktifkan gateway
   pansa set usertg <id-telegram>  Daftarkan ID Telegram pemilik ke bot
+  pansa set webapp <url-https>  URL dashboard untuk tombol menu Web App bot
   pansa schedule [add|list|cancel|run-once|watch]
   pansa alert [add|list|cancel|check]  Price alert (DexScreener, sekali tembak)
   pansa scout <kontrak-atau-url>  Verifikasi proyek read-only (kandidat free mint?)
@@ -375,8 +376,29 @@ export async function setCmd(rest: string[]): Promise<number> {
     process.stdout.write("Lalu jalankan: pansa gateway start\n");
     return 0;
   }
+  if (rest[0] === "webapp") {
+    const raw = rest[1];
+    let parsed: URL | null = null;
+    try {
+      parsed = raw ? new URL(raw) : null;
+    } catch {
+      parsed = null;
+    }
+    if (!parsed || parsed.protocol !== "https:") {
+      process.stderr.write("URL Web App harus https yang valid (Telegram menolak http). Contoh: pansa set webapp https://host/pansa/\n");
+      return 1;
+    }
+    const c = loadConfig();
+    const g = c.gateways?.telegram ?? { enabled: true, adapter: "telegram", allowlist: [], features: [] };
+    g.webAppUrl = raw;
+    c.gateways = { ...(c.gateways ?? {}), telegram: g };
+    saveConfig(c);
+    process.stdout.write(`URL Web App dashboard disimpan: ${raw}\n`);
+    process.stdout.write("Restart gateway agar tombol menu diperbarui (pansa gateway start).\n");
+    return 0;
+  }
   if (rest[0] !== "gateway" || !rest[1]) {
-    process.stderr.write("Usage: pansa set gateway <token-bot> | pansa set usertg <telegram-user-id-numerik>\n");
+    process.stderr.write("Usage: pansa set gateway <token-bot> | pansa set usertg <telegram-user-id-numerik> | pansa set webapp <url-https>\n");
     return 1;
   }
   const token = rest[1];
@@ -410,7 +432,7 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
       return 0;
     }
     process.stdout.write(
-      `Gateway Telegram: ${gw.enabled ? "aktif" : "nonaktif"}\nUser ID terdaftar: ${(gw.allowedUsers ?? []).join(", ") || "(kosong)"}\nKonfirmasi via gateway: mainnet selalu ditolak; testnet ${gw.confirmTestnet ? "diizinkan" : "tidak diizinkan"} (eksekusi tetap manusia di TUI/CLI).\n`,
+      `Gateway Telegram: ${gw.enabled ? "aktif" : "nonaktif"}\nUser ID terdaftar: ${(gw.allowedUsers ?? []).join(", ") || "(kosong)"}\nWeb App: ${gw.webAppUrl ?? "(belum diatur — tombol menu tetap daftar perintah)"}\nKonfirmasi via gateway: mainnet selalu ditolak; testnet ${gw.confirmTestnet ? "diizinkan" : "tidak diizinkan"} (eksekusi tetap manusia di TUI/CLI).\n`,
     );
     return 0;
   }
@@ -499,6 +521,16 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
       () => process.stdout.write("Menu button Telegram diperbarui (daftar perintah).\n"),
       (err) => process.stderr.write(`Menu button Telegram gagal diperbarui: ${err instanceof Error ? err.message : String(err)}\n`),
     );
+    // Tombol menu Web App (bila URL diatur via `pansa set webapp`):
+    // mengganti tombol Menu menjadi tombol aplikasi PANSA yang membuka
+    // dashboard di dalam Telegram. Juga best-effort.
+    const webAppUrl = loadConfig().gateways?.telegram?.webAppUrl;
+    if (webAppUrl) {
+      await bot.setChatMenuButton(webAppUrl).then(
+        () => process.stdout.write("Tombol menu Telegram diperbarui (Web App PANSA).\n"),
+        (err) => process.stderr.write(`Tombol menu Web App gagal diperbarui: ${err instanceof Error ? err.message : String(err)}\n`),
+      );
+    }
     await runGatewayLoop({
       bot,
       allowedUsers: () => loadConfig().gateways?.telegram?.allowedUsers ?? [],

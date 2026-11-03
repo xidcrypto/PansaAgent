@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DB_FILE } from "../config.js";
@@ -47,6 +47,54 @@ export function verifyCallback(data: string, sig: string, key: string): boolean 
 // (TUI/CLI CONFIRM), which is the codebase's core invariant.
 export function gatewayConfirmAllowed(isTestnet: boolean, confirmTestnetEnabled: boolean): boolean {
   return isTestnet && confirmTestnetEnabled;
+}
+
+// Telegram Web App auth: validate initData the way Telegram documents
+// it, then gate on the owner-managed allowedUsers list. initData is a
+// URL query string; the check string is all fields except "hash",
+// sorted by key, joined with "\n" as key=value (decoded values); the
+// key is SHA256(botToken) bytes and the check is HMAC-SHA256 hex.
+// Data older than 24h (or from the future beyond clock skew) is
+// rejected, so a captured initData cannot work forever.
+export function verifyTelegramInitData(
+  initData: string,
+  botToken: string,
+  allowedUsers: number[],
+  nowMs: number = Date.now(),
+): { ok: boolean; userId?: number } {
+  const fail = { ok: false as const };
+  if (!initData || !botToken) return fail;
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(initData);
+  } catch {
+    return fail;
+  }
+  const hash = params.get("hash");
+  if (!hash || hash.length !== 64) return fail;
+  const authDate = Number(params.get("auth_date"));
+  if (!Number.isFinite(authDate) || authDate <= 0) return fail;
+  const nowSec = nowMs / 1000;
+  if (authDate > nowSec + 300 || nowSec - authDate > 24 * 60 * 60) return fail;
+  const pairs: string[] = [];
+  for (const key of [...params.keys()].sort()) {
+    if (key === "hash") continue;
+    pairs.push(`${key}=${params.get(key) ?? ""}`);
+  }
+  const secret = createHash("sha256").update(botToken).digest();
+  const check = createHmac("sha256", secret).update(pairs.join("\n")).digest("hex");
+  const a = Buffer.from(check, "utf8");
+  const b = Buffer.from(hash, "utf8");
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return fail;
+  let userId: number | undefined;
+  try {
+    const user = JSON.parse(params.get("user") ?? "") as { id?: unknown };
+    if (typeof user.id === "number") userId = user.id;
+  } catch {
+    return fail;
+  }
+  if (userId === undefined || !allowedUsers.includes(userId)) return fail;
+  return { ok: true, userId };
 }
 
 export function splitMessage(text: string, limit = 4096): string[] {
@@ -116,8 +164,7 @@ export class TelegramBot {
   // Menu button bot (tombol Menu di aplikasi Telegram, BUKAN tombol
   // inline di dalam chat): mengisi daftar perintah yang muncul saat
   // pengguna mengetuk Menu. Tanpa ini tombol Menu kosong.
-  async setBotCommands(): Promise<void> {
-    await this.api("setMyCommands", {
+  async setBotCommands(): Promise<void> {    await this.api("setMyCommands", {
       commands: [
         { command: "start", description: "Mulai dan info koneksi" },
         { command: "help", description: "Daftar perintah PANSA" },
@@ -127,6 +174,22 @@ export class TelegramBot {
         { command: "provider", description: "Provider & model dari daemon" },
       ],
     });
+  }
+
+  // Menu button Web App (tombol aplikasi di kiri bawah kolom chat, yang
+  // dilingkari di screenshot: ikon + teks, mis. "PANSA"). Mengetuknya
+  // membuka URL sebagai Web App di dalam Telegram — bukan daftar
+  // perintah. Scope default (tanpa chat_id) sehingga berlaku untuk
+  // semua chat dengan bot. Daftar perintah dari setBotCommands tetap
+  // tersedia lewat autocomplete "/" meski tombol ini aktif.
+  async setChatMenuButton(webAppUrl: string, text = "PANSA"): Promise<void> {
+    await this.api("setChatMenuButton", {
+      menu_button: { type: "web_app", text, web_app: { url: webAppUrl } },
+    });
+  }
+
+  async getChatMenuButton(): Promise<unknown> {
+    return this.api("getChatMenuButton", {});
   }
 
   async sendMessage(chatId: number, text: string, replyMarkup?: InlineKeyboardMarkup | ReplyKeyboardMarkup): Promise<void> {

@@ -31,6 +31,9 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { CustomProviderView, ProviderInput, ProviderTestResult, FetchModelsResult, ProviderApi } from "../providers/index.js";
 import { getUsageTotals } from "../usage.js";
 import type { UsageTotals } from "../usage.js";
+import { verifyTelegramInitData } from "../gateway/telegram.js";
+import { secretsLoad, secretsGet } from "../secrets.js";
+import { loadConfig } from "../config.js";
 
 export interface ProviderStore {
   list(): CustomProviderView[];
@@ -109,6 +112,10 @@ ${error ? `<p class="note" style="color:#cf222e;font-weight:700">Password salah.
 <p class="note" id="login-msg" style="color:#cf222e;font-weight:700"></p>
 <p class="note">Password default: <code>password</code> — ganti lewat env PANSA_DASHBOARD_PASSWORD.</p>
 </form></div></div>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+(function(){var w=window.Telegram&&window.Telegram.WebApp;if(!w||!w.initData){return;}try{w.ready();w.expand();}catch(e){}fetch("api/telegram-webapp-auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData:w.initData})}).then(function(r){if(r.ok){var p=location.pathname;location=p.endsWith("/login")?p.slice(0,-6)||"/":"/";}}).catch(function(){});})();
+</script>
 <script>
 document.getElementById("login-form").addEventListener("submit",async e=>{
   e.preventDefault();
@@ -802,6 +809,10 @@ export function renderDashboardHtml(data: DashboardData, system: SystemMetrics, 
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PANSA Dashboard</title>
 <style>${CSS}</style>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+(function(){var w=window.Telegram&&window.Telegram.WebApp;if(!w){return;}try{w.ready();w.expand();}catch(e){}})();
+</script>
 </head><body><div class="layout">
 <div class="backdrop" id="backdrop"></div>
 <aside class="sidebar"><div class="brand">PANSA<small>Dashboard</small></div><nav>
@@ -1045,6 +1056,33 @@ export async function startDashboard(opts: {
           "Set-Cookie": "pansa_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
         });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      // Telegram Web App auth (public, like /api/login): the dashboard
+      // page opened from the bot's menu button posts Telegram's
+      // initData; when the HMAC checks out AND the initData user is in
+      // allowedUsers, the same session cookie is issued — no password
+      // typing inside Telegram. Fail-closed: without a stored bot token
+      // the endpoint is unavailable (503), and a bad initData is 401.
+      if (url.pathname === "/api/telegram-webapp-auth" && req.method === "POST") {
+        const body = (await readJsonBody(req)) as { initData?: unknown };
+        const initData = typeof body.initData === "string" ? body.initData : "";
+        const pass = process.env.PANSA_PASSPHRASE;
+        const botToken = pass ? secretsGet(secretsLoad(pass), "telegram_bot_token") : undefined;
+        const users = loadConfig().gateways?.telegram?.allowedUsers ?? [];
+        const result = botToken ? verifyTelegramInitData(initData, botToken, users) : { ok: false as const };
+        if (!result.ok) {
+          res.writeHead(botToken ? 401 : 503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: botToken ? "Web App auth gagal." : "Web App auth tidak tersedia." }));
+        } else {
+          const session = randomBytes(32).toString("hex");
+          sessions.add(session);
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Set-Cookie": `pansa_session=${session}; HttpOnly; Path=/; SameSite=Lax`,
+          });
+          res.end(JSON.stringify({ ok: true }));
+        }
         return;
       }
       // Everything else requires a session.
