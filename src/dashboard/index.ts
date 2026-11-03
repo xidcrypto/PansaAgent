@@ -114,7 +114,7 @@ ${error ? `<p class="note" style="color:#cf222e;font-weight:700">Password salah.
 </form></div></div>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script>
-(function(){var w=window.Telegram&&window.Telegram.WebApp;if(!w||!w.initData){return;}try{w.ready();w.expand();}catch(e){}fetch("api/telegram-webapp-auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData:w.initData})}).then(function(r){if(r.ok){var p=location.pathname;location=p.endsWith("/login")?p.slice(0,-6)||"/":"/";}}).catch(function(){});})();
+(function(){var w=window.Telegram&&window.Telegram.WebApp;if(!w||!w.initData){return;}try{w.ready();w.expand();}catch(e){}fetch("api/telegram-webapp-auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData:w.initData})}).then(function(r){if(r.ok){var p=location.pathname;location=p.endsWith("/login")?p.slice(0,-6)||"/":"/";}else{var m=document.getElementById("login-msg");if(m){m.textContent="Login otomatis Telegram gagal — silakan masuk dengan password.";}}}).catch(function(){});})();
 </script>
 <script>
 document.getElementById("login-form").addEventListener("submit",async e=>{
@@ -1070,8 +1070,10 @@ export async function startDashboard(opts: {
         const pass = process.env.PANSA_PASSPHRASE;
         const botToken = pass ? secretsGet(secretsLoad(pass), "telegram_bot_token") : undefined;
         const users = loadConfig().gateways?.telegram?.allowedUsers ?? [];
-        const result = botToken ? verifyTelegramInitData(initData, botToken, users) : { ok: false as const };
+        const result = botToken ? verifyTelegramInitData(initData, botToken, users) : { ok: false as const, reason: "no_token" };
         if (!result.ok) {
+          // Log only the reason code, never initData itself.
+          console.error(`Web App auth gagal: ${result.reason ?? "unknown"}`);
           res.writeHead(botToken ? 401 : 503, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: false, error: botToken ? "Web App auth gagal." : "Web App auth tidak tersedia." }));
         } else {

@@ -51,49 +51,53 @@ export function gatewayConfirmAllowed(isTestnet: boolean, confirmTestnetEnabled:
 
 // Telegram Web App auth: validate initData the way Telegram documents
 // it, then gate on the owner-managed allowedUsers list. initData is a
-// URL query string; the check string is all fields except "hash",
+// URL query string; the check string is all fields except "hash" AND
+// "signature" (newer clients send signature for Ed25519 validation; it
+// is NOT part of the HMAC input — including it breaks the check),
 // sorted by key, joined with "\n" as key=value (decoded values); the
 // key is SHA256(botToken) bytes and the check is HMAC-SHA256 hex.
 // Data older than 24h (or from the future beyond clock skew) is
-// rejected, so a captured initData cannot work forever.
+// rejected, so a captured initData cannot work forever. The reason code
+// is for server logs only — never log initData itself.
 export function verifyTelegramInitData(
   initData: string,
   botToken: string,
   allowedUsers: number[],
   nowMs: number = Date.now(),
-): { ok: boolean; userId?: number } {
-  const fail = { ok: false as const };
-  if (!initData || !botToken) return fail;
+): { ok: boolean; userId?: number; reason?: string } {
+  const fail = (reason: string) => ({ ok: false as const, reason });
+  if (!initData || !botToken) return fail("bad_request");
   let params: URLSearchParams;
   try {
     params = new URLSearchParams(initData);
   } catch {
-    return fail;
+    return fail("bad_request");
   }
   const hash = params.get("hash");
-  if (!hash || hash.length !== 64) return fail;
+  if (!hash || hash.length !== 64) return fail("bad_hash");
   const authDate = Number(params.get("auth_date"));
-  if (!Number.isFinite(authDate) || authDate <= 0) return fail;
+  if (!Number.isFinite(authDate) || authDate <= 0) return fail("stale");
   const nowSec = nowMs / 1000;
-  if (authDate > nowSec + 300 || nowSec - authDate > 24 * 60 * 60) return fail;
+  if (authDate > nowSec + 300 || nowSec - authDate > 24 * 60 * 60) return fail("stale");
   const pairs: string[] = [];
   for (const key of [...params.keys()].sort()) {
-    if (key === "hash") continue;
+    if (key === "hash" || key === "signature") continue;
     pairs.push(`${key}=${params.get(key) ?? ""}`);
   }
   const secret = createHash("sha256").update(botToken).digest();
   const check = createHmac("sha256", secret).update(pairs.join("\n")).digest("hex");
   const a = Buffer.from(check, "utf8");
   const b = Buffer.from(hash, "utf8");
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return fail;
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return fail("bad_hash");
   let userId: number | undefined;
   try {
     const user = JSON.parse(params.get("user") ?? "") as { id?: unknown };
     if (typeof user.id === "number") userId = user.id;
   } catch {
-    return fail;
+    return fail("bad_request");
   }
-  if (userId === undefined || !allowedUsers.includes(userId)) return fail;
+  if (userId === undefined) return fail("bad_request");
+  if (!allowedUsers.includes(userId)) return fail("user_not_allowed");
   return { ok: true, userId };
 }
 
