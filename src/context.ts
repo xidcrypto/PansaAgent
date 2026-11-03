@@ -2,6 +2,7 @@ import { redact, redactObj } from "./redact.js";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PANSA_DIR } from "./config.js";
+import type { ToolCall } from "./llm.js";
 
 const SYSTEM_PREFIX = `
 PANSA is a crypto-only airdrop agent. Refuse unrelated requests in one sentence.
@@ -51,7 +52,7 @@ export function loadContextFiles(cwd: string = process.cwd()): ContextFile[] {
 }
 
 export class ContextManager {
-  private messages: Array<{ role: string; content: string }> = [];
+  private messages: Array<{ role: string; content: string; tool_calls?: ToolCall[]; tool_call_id?: string }> = [];
   private readonly budgetChars: number;
   private readonly maxTurns: number;
   private systemPrompt: string;
@@ -76,7 +77,7 @@ export class ContextManager {
     this.trim();
   }
 
-  addToolResult(name: string, result: unknown, ok: boolean, error?: string): void {
+  addToolResult(name: string, result: unknown, ok: boolean, error?: string, toolCallId?: string): void {
     let data = result;
     let truncated = false;
     const str = JSON.stringify(redactObj(data));
@@ -87,6 +88,7 @@ export class ContextManager {
     this.messages.push({
       role: "tool",
       content: JSON.stringify({ name, ok, data, error: ok ? undefined : (error ?? String(result)), truncated }),
+      ...(toolCallId ? { tool_call_id: toolCallId } : {}),
     });
     this.trim();
   }
@@ -102,8 +104,12 @@ export class ContextManager {
     this.trim();
   }
 
-  addAssistant(content: string): void {
-    this.messages.push({ role: "assistant", content: redact(content) });
+  addAssistant(content: string, toolCalls?: ToolCall[]): void {
+    this.messages.push({
+      role: "assistant",
+      content: redact(content),
+      ...(toolCalls && toolCalls.length ? { tool_calls: toolCalls } : {}),
+    });
     this.trim();
   }
 
@@ -120,7 +126,7 @@ export class ContextManager {
     this.trim();
   }
 
-  messagesForLlm(): Array<{ role: string; content: string }> {
+  messagesForLlm(): Array<{ role: string; content: string; tool_calls?: ToolCall[]; tool_call_id?: string }> {
     return [
       { role: "system", content: this.systemPrompt },
       ...this.messages,

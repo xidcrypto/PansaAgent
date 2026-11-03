@@ -90,6 +90,8 @@ export class Agent {
       const messages: ChatMessage[] = this.context.messagesForLlm().map((m) => ({
         role: m.role as ChatMessage["role"],
         content: m.content,
+        ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+        ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       }));
       let result;
       try {
@@ -106,7 +108,7 @@ export class Agent {
         throw err;
       }
       const msg = result.message;
-      this.context.addAssistant(msg.content ?? "");
+      this.context.addAssistant(msg.content ?? "", msg.tool_calls);
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
         return msg.content ?? "Selesai.";
       }
@@ -118,7 +120,7 @@ export class Agent {
         for (const tc of signing) {
           if (opts.signal?.aborted) return "Generasi dibatalkan.";
           const res = await this.executeOne(tc);
-          this.context.addToolResult(tc.function.name, res.data, res.ok, res.error);
+          this.context.addToolResult(tc.function.name, res.data, res.ok, res.error, tc.id);
           if (!res.ok) {
             // corrective feedback, max repair handled by next loop
             this.context.addUser(`Tool ${tc.function.name} gagal: ${res.error}. Perbaiki argumen atau batalkan.`);
@@ -129,7 +131,7 @@ export class Agent {
       // parallelize independent read-only
       const results = await Promise.all(readonly.map((tc) => this.executeOne(tc)));
       for (let i = 0; i < readonly.length; i++) {
-        this.context.addToolResult(readonly[i].function.name, results[i].data, results[i].ok, results[i].error);
+        this.context.addToolResult(readonly[i].function.name, results[i].data, results[i].ok, results[i].error, readonly[i].id);
         if (!results[i].ok) {
           this.context.addUser(`Tool ${readonly[i].function.name} gagal: ${results[i].error}.`);
         }
