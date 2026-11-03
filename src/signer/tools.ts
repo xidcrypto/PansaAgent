@@ -5,6 +5,10 @@ import { getPolicy } from "./policy.js";
 import { getSpentToday } from "./ledger.js";
 import { resolveEvmRpc, getEvmChainId, isTestnetChainId } from "../evm-rpc.js";
 import { ChainFamily } from "./keystore.js";
+import { walletRegistryLoad, defaultPath, validateName } from "./keystore.js";
+import { getSignerClient } from "./client.js";
+import { generateMnemonic } from "../mnemonic.js";
+import { loadConfig, saveConfig } from "../config.js";
 
 export function createSignTool(): Tool {
   return {
@@ -152,6 +156,99 @@ export function createListConfirmationsTool(): Tool {
         },
         signs: false,
       };
+    },
+  };
+}
+
+// Wallet tools (natural-language path for the gateway's owner-only bot).
+// Security properties, enforced here rather than in prompts:
+// - Neither tool moves funds or signs anything (signs unset/false).
+// - wallet_create returns ONLY name/family/address. The mnemonic is
+//   generated, handed to the signer for encrypted storage, and never
+//   placed in the result — so it can never reach the model's context,
+//   a reply, or a log through this tool.
+// - Arguments are validated server-side (chain allowlist, keystore name
+//   rule); the model's words are never trusted.
+// - The description tells the model to create ONLY on an explicit user
+//   request with both chain and name, and to ask when either is
+//   missing — so a vague prompt (or injected page text) cannot trigger
+//   a creation on its own.
+export function createWalletListTool(
+  list?: () => Array<{ name: string; family: string; address: string }>,
+): Tool {
+  return {
+    name: "wallet_list",
+    description: "List wallets in the local keystore (names, chains, addresses). Addresses are public identifiers; this never returns mnemonics, private keys, or balances.",
+    parameters: {},
+    signs: false,
+    async execute(): Promise<{ ok: boolean; data: unknown; error?: string; signs?: boolean }> {
+      const wallets = (list ?? walletRegistryLoad)();
+      return { ok: true, data: { wallets }, signs: false };
+    },
+  };
+}
+
+export interface WalletCreateDeps {
+  request?: (method: string, params: Record<string, unknown>) => Promise<{ ok: boolean; result?: unknown; error?: string }>;
+  setDefault?: (chain: string, name: string) => void;
+}
+
+export function createWalletCreateTool(deps?: WalletCreateDeps): Tool {
+  const request =
+    deps?.request ??
+    ((method: string, params: Record<string, unknown>) => getSignerClient().request(method, params));
+  const setDefault =
+    deps?.setDefault ??
+    ((chain: string, name: string) => {
+      const cfg = loadConfig();
+      const defs = (cfg as any).defaultWallets ?? {};
+      defs[chain] = name;
+      (cfg as any).defaultWallets = defs;
+      saveConfig(cfg);
+    });
+  return {
+    name: "wallet_create",
+    description:
+      "Create a wallet in the local keystore. ONLY call this when the user explicitly asked to create a wallet AND gave both a chain and a name — if either is missing, ask the user instead of guessing. Returns only name, chain and address. It never returns, prints, or repeats the mnemonic or private key; those stay encrypted in the keystore. Creating a wallet never moves funds and never signs anything.",
+    parameters: {
+      chain: { type: "string", description: "Chain family: evm, solana, sui, or aptos" },
+      name: { type: "string", description: "Wallet name: lowercase letters, digits, - and _, max 32 characters" },
+    },
+    signs: false,
+    async execute(args: Record<string, unknown>): Promise<{ ok: boolean; data: unknown; error?: string; signs?: boolean }> {
+      const { chain, name } = args as { chain?: unknown; name?: unknown };
+      if (typeof chain !== "string" || !["evm", "solana", "sui", "aptos"].includes(chain)) {
+        return { ok: false, data: null, error: `Unsupported chain: ${String(chain)} (use evm, solana, sui, or aptos)` };
+      }
+      if (typeof name !== "string" || !name) {
+        return { ok: false, data: null, error: "Missing wallet name" };
+      }
+      try {
+        validateName(name);
+      } catch (err) {
+        return { ok: false, data: null, error: err instanceof Error ? err.message : String(err) };
+      }
+      const mnemonic = generateMnemonic(128);
+      let res: { ok: boolean; result?: unknown; error?: string };
+      try {
+        res = await request("keystore.create", {
+          name, family: chain, mnemonic, path: defaultPath(chain), passphrase: process.env.PANSA_PASSPHRASE ?? "",
+        });
+      } catch (err) {
+        return { ok: false, data: null, error: err instanceof Error ? err.message : String(err) };
+      }
+      if (!res.ok) {
+        return { ok: false, data: null, error: res.error ?? "keystore.create failed" };
+      }
+      const r = res.result as { name: string; family: string; address: string };
+      try {
+        setDefault(chain, name);
+      } catch {
+        // Creation succeeded; a default-pointer failure must not mask it
+        // or trick the caller into retrying (which would hit "already
+        // exists"). The wallet is usable by name regardless.
+      }
+      return { ok: true, data: { name: r.name, family: r.family, address: r.address }, signs: false };
     },
   };
 }

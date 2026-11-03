@@ -610,6 +610,9 @@ async function gatewayCmd(rest: string[]): Promise<number> {  const sub = rest[0
             if (!res.ok) throw new Error(res.error);
             setDefaultWallet(chain, name);
             const r = res.result as { name: string; family: string; address: string; path: string };
+            // Audit trail only: name/chain/address are public identifiers.
+            // The mnemonic never appears here or in the reply.
+            console.log(`Wallet dibuat via Telegram: ${r.name} (${r.family}) ${r.address}`);
             return { name: r.name, family: r.family, address: r.address };
           },
         }).catch(() => null);

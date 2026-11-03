@@ -1,5 +1,5 @@
 import type { Tool } from "./agent.js";
-import { createSignTool, createRejectTool, createListConfirmationsTool } from "./signer/tools.js";
+import { createSignTool, createRejectTool, createListConfirmationsTool, createWalletListTool, createWalletCreateTool } from "./signer/tools.js";
 import { createTrackerTool, createReportTool } from "./tracker/tools.js";
 import { createBAWTool } from "./skills/baw.js";
 import { createScamCheckTool } from "./research/index.js";
@@ -12,13 +12,19 @@ import { McpClient } from "./mcp/client.js";
 // Single wiring for the agent's tool set (B1/M3). The CLI and the TUI both
 // build their Agent from this registry; the SkillsManager registry is a
 // secondary programmatic API, not a second tool set.
-// Gateway tool filter (multi-user safety): the gateway agent must never
-// move money or enumerate the owner's wallets. The baw tool does both
-// (transfer/swap/claim, plus list_wallets/balance reads), so it never
-// reaches the gateway — not even for the owner. Wallet ops stay in
-// TUI/CLI, matching the connect template's promise that signing never
-// happens via the bot. Signing tools are removed too unless the testnet
-// confirm path is explicitly enabled (execution still stays human-only).
+// Gateway tool filter (owner-only safety): the gateway agent must never
+// move money or sign. The baw tool can (transfer/swap/claim, plus
+// list_wallets/balance reads), so it never reaches the gateway, and
+// signing tools are removed too unless the testnet confirm path is
+// explicitly enabled (execution still stays human-only).
+// wallet_list/wallet_create deliberately STAY: they cannot move money
+// or sign, they never return key material, and the gateway itself is
+// owner-only (allowedUsers gate). wallet_list returns registry
+// names+addresses only — public identifiers, never balances (balance
+// reads stay behind the stripped baw tool). The old blanket rule
+// "wallet ops stay in TUI/CLI" was superseded by the owner's explicit
+// order to create wallets via Telegram; fund movement was NOT part of
+// that order and stays out.
 export function stripGatewayUnsafeTools(tools: Map<string, Tool>, opts: { allowConfirm: boolean }): void {
   tools.delete("baw");
   if (!opts.allowConfirm) {
@@ -33,6 +39,8 @@ export function buildAgentTools(): Map<string, Tool> {
     createSignTool(),
     createRejectTool(),
     createListConfirmationsTool(),
+    createWalletListTool(),
+    createWalletCreateTool(),
     createTrackerTool(),
     createReportTool(),
     createBAWTool(),
